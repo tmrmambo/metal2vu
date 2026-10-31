@@ -83,3 +83,6 @@ __pycache__/
 /third_party/_build/
 /out/
 /artifacts/
+
+# CI 取回的产物：含 Apple 二进制的派生分析，不进仓（见 docs/spec/91 第 6 节）
+/ci-evidence/
