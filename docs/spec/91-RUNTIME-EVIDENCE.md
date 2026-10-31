@@ -327,6 +327,72 @@ _GetComputeFunctionId  _GetObjectFunctionId  _GetMeshFunctionId
 
 **一个本地环境的硬事实**：开发机（Windows）**编不了**上游。`cargo check` 止于 `error: linker 'link.exe' not found`，缺 MSVC Build Tools。所以上游与本项目自有 crate 的任何编译验证都只能在 CI 或 Linux/macOS 机器上做。记为 `R-009`。
 
+## 5.7 Lavapipe 在 x86_64 macOS 上可建：已确证
+
+`TESTED(25G76)`。workflow `build-lavapipe-macos.yml`，run `41190532445`。
+
+**这是本项目最大的一处去风险。** `70-BUILD-PACKAGE.md` 第 3.4 节与
+`80-TEST-HARNESS.md` 第 5.4 节都把它登记为风险：arm64 macOS 有成品先例，
+**x86_64 零先例**，而它阻塞 `metal-probe`，而 `metal-probe` 是 T2 的唯一判据。
+
+| 步骤 | 结果 |
+|---|---|
+| Vulkan-Loader 构建 | ✅ |
+| Mesa meson setup | ✅ |
+| Mesa ninja 构建 | ✅ |
+| loader `dlopen` 自检 | ✅ |
+
+环境：macOS 26.6.1 (25G76) x86_64，Mesa `mesa-25.3.2`，Vulkan-Loader
+`v1.4.321`，LLVM **20.1.8**（运行器预装的 `llvm@20`）。
+
+产物（`lavapipe-macos-x86_64.tar.gz`，3,339,354 字节）：
+
+```
+lib/libvulkan_lvp.dylib                     Lavapipe ICD 本体
+share/vulkan/icd.d/lvp_icd.x86_64.json      ICD manifest
+lib/libvulkan.1.4.321.dylib                 Vulkan loader
+loader/vulkan.framework/Versions/A/vulkan   loader 的 framework 形态
+lib/pkgconfig/vulkan.pc
+share/drirc.d/00-mesa-defaults.conf
+```
+
+即 `00-OVERVIEW.md` 组件清单第 5 项（Vulkan loader 与 Lavapipe 的
+macOS x86_64 构建打包）**已经有可用产物**。
+
+### 5.7.1 三个踩到的坑（都在 CI 的两步式结构里，本地连续跑遇不到）
+
+逐条记下来，因为每一条都让一次 job 白跑，而表象都不指向真实原因。
+
+| # | 表象 | 真实原因 |
+|---|---|---|
+| 1 | job 在工具链步骤卡一个多小时不出来 | 写了 `brew install llvm@19`，而 `macos-26-intel` 预装的是 **`llvm@20`**。`llvm@19` 没有 bottle，brew 转去从源码编 LLVM。改为先探测预装的，找不到就立刻失败并打印可用 formula，**绝不退回 `brew install llvm`** |
+| 2 | `meson setup` 失败 | `meson.build:641: ERROR: Program 'glslangValidator' not found`。缺 `glslang`，不是可选项 —— lavapipe 要用它编内部着色器 |
+| 3 | `ninja` 跑到 **758/786** 才挂，exit 127 | `/bin/sh: llvm-ar: command not found`。meson 在配置期把归档器记成裸名 `llvm-ar`（当时 `$LP/bin` 在 PATH 上），而构建步骤是另一个 shell、没 `export` 同样的 PATH |
+
+坑 3 顺带给了一条有价值的信息：挂之前 **lavapipe 自己的全部 `lvp_*.c.o` 都已编译通过**，所以 Lavapipe 的源码在 x86_64 macOS 上本来就没问题，三次失败全部是构建环境问题，不是移植问题。
+
+另记一条无害项：日志里 `-mtls-dialect=gnu2` 与 `-mtls-dialect=desc` 两个探测
+失败（`clang: error: unsupported option '-mtls-dialect=' for target
+'x86_64-apple-macosx16.0.0'`）是正常的，meson 只是记录为不可用。
+
+### 5.7.2 还没做的
+
+`BLOCKED`：**产物只验证到 `dlopen` loader 成功**，没有实际
+`vkCreateInstance` + `vkEnumeratePhysicalDevices` 跑通，所以：
+
+- `43-COVERAGE-REFUSALS.md` 第 3 节那一批「等 `build-lavapipe-macos` 产物」
+  的 `BLOCKED` 行**还不能关**。要关它们需要再跑一轮：加载 ICD、建 instance、
+  枚举设备、读 `VkPhysicalDeviceFeatures` / `VkPhysicalDeviceLimits` /
+  `vkGetPhysicalDeviceFormatProperties`，把 `60`/`43` 要的那些字段全部打出来。
+- `41-IOSURFACE-USERSPACE.md` 的 `S-004`（`minImportedHostPointerAlignment`）
+  与 `S-005`（`B8G8R8A8_UNORM` 的 `linearTilingFeatures` 是否含
+  `COLOR_ATTACHMENT_BIT`）同理 —— 这两条是「上屏零拷贝是否成立」的判据，
+  现在**已经具备测的条件**，只差那个探针程序。
+
+记为 `R-010`：写一个 `lavapipe-probe` 并把它接到本 workflow 的产物上。
+这是下一轮最该做的一件事，因为它一次能关掉 `43`/`41`/`60` 三册里的一批
+`BLOCKED`。
+
 ## 6. 复现方式
 
 ```powershell

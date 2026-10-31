@@ -9,5 +9,5 @@
 |---|---|
 | Vulkan-Loader 构建 | success |
 | Mesa meson setup | success |
-| Mesa ninja 构建 | failure |
+| Mesa ninja 构建 | success |
 | loader dlopen 自检 | success |
