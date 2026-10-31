@@ -91,3 +91,10 @@ __pycache__/
 /upstream/
 *.log
 probe-upstream.txt
+
+ub.txt
+ad*.log
+ad-filtered.txt
+lp-full.log
+last-*.txt
+lp.json

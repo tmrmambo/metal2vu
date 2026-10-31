@@ -23,6 +23,81 @@
 - 命令与 plist 片段按可直接照抄编写。
 - 外部网页内容均为转述，不作连续摘录。**内容已转述以符合许可限制。**
 
+### 0.0 1.1 修订：R2 被低估了，而且素材里有 Apple 自己的安装器内核
+
+> [!IMPORTANT]
+> **本节是 1.0 之后的修订。它推翻了 1.0 对 R2 的两处判断，并新增一条 1.0 完全没看的路径 R6。**
+>
+> **更正 1：R2 不是被磁盘空间挡住的。** 1.0 第 2.4 节说"18.4 GB 装不进运行器，所以 R2 不在运行器上做"。这个推理用错了数：
+>
+> | 字段 | 值 | 含义 |
+> |---|---:|---|
+> | `_DownloadSize` | 18,356,470,215 | 资产下载体积。**不需要落盘**：`71` 第 1.4 节已证 `SharedSupport.dmg` 是未压缩 UDIF、可随机访问，所以能用 HTTP Range 按需取块，峰值磁盘 = 产物本身 |
+> | `InstallationSize` | 15,227,412,107 | 安装后体积，**含两个架构的 cryptex** |
+> | `CryptexSizeInfo[cryptex-system-arm64e]` | 6770（MB） | **我们不需要它** |
+> | `CryptexSizeInfo[cryptex-system-x86_64]` | 2406（MB） | 要 |
+> | `CryptexSizeInfo[cryptex-app]` | 50（MB） | 要 |
+> | **`InstallationSize-Snapshot`** | **5,553,249,931** | **封印快照本身只有 5.55 GB** |
+>
+> 即 **x86_64-only 的安装体积约 8.4 GB**（15.2 − 6.8），不是 1.0 估的 11 到 15 GB。所以第 4.1 节的"虚拟容量 28 到 32 GB"偏大，x86_64-only 的瘦镜像应在 **12 到 16 GB**，这反而回到了 `73` 第 4.6.3 节原本写的区间。**1.0 第 4.1 节给 `73` 的那条修订建议作废。**
+>
+> **更正 2：APFS 写支持在 macOS 之外存在，但做不到我们要的形状。** 1.0 隐含假设"只有 macOS 能写 APFS"。实际有三条，逐条给出它们**具体卡在哪**：
+>
+> | 工具 | 能力 | 卡在哪 |
+> |---|---|---|
+> | `mkapfs`（`apfsprogs`） | 能**创建** APFS | 官方 man page 写明它只建**单个卷**。我们要 4 个卷（System/Data/Preboot/VM）在一个容器里、role 各自正确、System 与 Data 还要组成 volume group |
+> | `linux-apfs-rw`（内核模块，有写支持） | 读写 | 上游 README 自己写着 **"If you make use of the write support, expect data corruption."** |
+> | `apfs-fuse` | 只读 | 而且 README 写明 **firmlinks 不支持** —— firmlink 恰好是 10.15+ 绑定 System 与 Data 的机制 |
+> | Paragon APFS for Linux（付费） | 读写 | **快照限制为只读访问** —— 而封印快照正是全部要点 |
+>
+> `KNOWN`，来源：<https://manpages.ubuntu.com/manpages/noble/man8/mkapfs.8.html>、<https://github.com/linux-apfs/linux-apfs-rw>、<https://github.com/kaisenlinux/apfs-fuse/blob/master/README.md>、<https://recoverit.wondershare.com/harddrive-tips/mount-apfs-linux.html>。内容已转述以符合许可限制。
+>
+> **所以 1.0 的结论"最终装配必须在 macOS 上"仍然成立，但理由要换**：不是"没有 APFS 写工具"，是"**封印 + Preboot + cryptex 的生成只有 Apple 的工具会做**"。Apple 开发者论坛上有人撞过一模一样的墙：能复制一个含 signed system volume 与 data volume 的 volume group，但**复制出来的封印破了，macOS 起不来**（转述自 <https://developer.apple.com/forums/thread/659120>）。
+>
+> **新增 R6：直接驱动素材里的 `UpdateBrain`。**
+>
+> `142-36613 - 26.7.2 macOS Tahoe (25G325)/UpdateBrain.zip`（4,392,999 字节）**就是 Apple 用来 apply 这份 `payloadv2` 资产的东西**。`KNOWN`，本轮用 `tools/peek_updatebrain.py` 解出：
+>
+> | 件 | 字节 |
+> |---|---:|
+> | `AssetData/…UpdateBrainService.xpc/Contents/MacOS/UpdateBrainLibrary.dylib` | 11,717,552 |
+> | `…/MacOS/com.apple.MobileSoftwareUpdate.UpdateBrainService` | 172,544 |
+> | `…/Resources/UpdateBrainService.sb`（沙箱 profile） | 1,849 |
+> | `AssetData/.TrustCache` | 2,740 |
+>
+> 顶层 `Info.plist` 的 `MobileAssetProperties` 是 `Build = 25G325` / `OSVersion = 26.7.2`，**与我们手上这份资产配对**。XPC service 的 `LSMinimumSystemVersion = 11.0`，`DTSDKName = macosx26.7.internal`。
+>
+> `UpdateBrainLibrary.dylib` 的字符串确证它干的正是我们自己造不出来的那几样（`KNOWN`，字符串直接读出）：
+>
+> ```text
+> #A_APFSShouldSealSystemVolume
+> -[LPStaticAPFSVolume createSnapshot:error:] / rootToSnapshot:error: / revertToSnapshot:options:error:
+> -[MSUSFRTargetController prepareTargetVolumeForInstallRevertingToSnapshot:error:]
+> -[MSUSFRTargetController mountTargetVolumeRevertingToSnapshot:error:]
+> Configuring cryptex1 personalization / writing cryptex1 ticket to %@
+> ARV sealing enabled, do not call APFSContainerResizePrepare
+> ```
+>
+> **`MSUSFRTargetController` 是一个面向"目标卷"的控制器类。** 它的方法名直接就是"为安装准备目标卷"。这正是 R2/R6 需要的 API 形状。
+>
+> 沙箱 profile（`UpdateBrainService.sb`）另给两条事实：它 `allow process-exec` 的白名单里有 **`/usr/sbin/bless`，注释写明 `needed for Intel Macs`**，以及 `mount_apfs`、`/usr/libexec/seputil`；而它 `deny dynamic-code-generation` / `deny file-map-executable` 是**自我约束**（注释说"UpdateBrain 历史上不沙箱，所以默认 allow"）。
+>
+> **XPC 那条门我们过不去。** `Info.plist` 的 `XPCService._AllowedClients` 是：
+>
+> ```text
+> anchor apple
+> identifier=com.apple.softwareupdated and anchor apple
+> identifier=com.apple.mobile.softwareupdated and anchor apple
+> ```
+>
+> `anchor apple` 要求调用方是 Apple 签名的，我们自己的二进制满足不了，AMFI 关闭也不改变 `SecCodeCheckValidity` 对 anchor 的判断。`INFERRED`。
+>
+> **但 R6 不需要走 XPC。** `UpdateBrainLibrary.dylib` 是一个普通 dylib；在 SIP 关闭的 root 进程里直接 `dlopen` 它，`_AllowedClients` 与那份沙箱 profile 都不适用（两者都挂在 XPC service 的启动上，不挂在 dylib 本身）。`INFERRED`，这是本修订提出的新路径，**一次都没试过**。
+>
+> **R6 的定位**：它是唯一能同时满足"25G325 保真 + 封印正确 + 不走交互安装器"三条的路径，而且素材已经在手。代价是对一个 11.7 MB 的私有 dylib 做接口逆向。记为 `P-017` 到 `P-020`（第 8 节）。
+>
+> **本修订不改选定路径。** R1（克隆运行器）仍是**先做**的那条，因为它的未知只有三个数（`P-001`/`P-002`/`P-003`）且都能在一次 job 里测掉；R6 的未知是一个逆向工程量。正确顺序是 **R1 先跑通把管线打直，再用 R6 把 build 从 25G76 换成 25G325**。
+
 ### 0.1 八条结论先行
 
 1. **`startosinstall --volume` 这条路不存在了。** 从 macOS 11 起，在一个完整运行的 macOS 上执行安装器里的 `startosinstall`，`--usage` 里**没有** `--volume`（`KNOWN`，见第 2.1 节）。所以"它算不算走原生安装器"这个问题是空的：它不可用。退一步说，就算可用，它的收尾动作是重启本机进安装环境，而 CI job 一重启就结束。
