@@ -172,11 +172,22 @@ jobs:
           echo "---- 配置摘要 ----"
           tail -60 /tmp/meson-setup.log
 
+      # PATH 必须和配置步骤一致。
+      #
+      # 第三次跑在这里失败：ninja 到 758/786 时
+      #   rm -f ... && llvm-ar csrD src/c11/impl/libmesa_util_c11.a ...
+      #   /bin/sh: llvm-ar: command not found      (exit 127)
+      #
+      # meson 在配置期把归档器记成了裸名 `llvm-ar`（当时 $LP/bin 在 PATH 上
+      # 所以找得到），而构建步骤是另一个 shell、没有 export 同样的 PATH。
+      # 这类错误只在「配置与构建分成两个 step」时出现，本地连续跑不会遇到。
       - name: 构建 Mesa
         id: mesabuild
         continue-on-error: true
         run: |
           set -euo pipefail
+          export PATH="${{ steps.llvm.outputs.prefix }}/bin:$PATH"
+          command -v llvm-ar llvm-ranlib llvm-config
           cd /tmp/mesa
           ninja -C build -j"$(sysctl -n hw.ncpu)" 2>&1 | tail -200
           ninja -C build install

@@ -8,6 +8,6 @@
 | 步骤 | 结果 |
 |---|---|
 | Vulkan-Loader 构建 | success |
-| Mesa meson setup | failure |
+| Mesa meson setup | success |
 | Mesa ninja 构建 | failure |
 | loader dlopen 自检 | success |
