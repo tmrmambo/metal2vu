@@ -1,0 +1,15 @@
+[package]
+name = "m2vu-iosurface"
+description = "IOSurface 用户态桥"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish = false
+
+# 规格：docs/spec/41-IOSURFACE-USERSPACE.md
+[dependencies]
+metal2vulkan-runtime.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

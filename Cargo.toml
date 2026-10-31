@@ -1,0 +1,63 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/m2vu-capability",
+    "crates/m2vu-iosurface",
+    "crates/m2vu-objc",
+    "crates/m2vu-compiler-plugin",
+    "crates/harness",
+]
+
+[workspace.package]
+version      = "0.0.0"
+edition      = "2024"
+rust-version = "1.98"
+license      = "GPL-2.0-or-later OR LGPL-3.0-or-later"
+repository   = "https://github.com/tmrmambo/metal2vu"
+
+# ---------------------------------------------------------------------------
+# 上游 metal2vulkan 的吸收方式
+#
+# 决定（见 docs/spec/00-OVERVIEW.md 第 4.6 节）是「吸收并自行维护」，不是
+# 「当外部依赖」。原定做法是 subtree 进本仓库以保留 git 历史。
+#
+# 本轮测量后改了机制，没改意图：
+#   - 上游 worktree 是 1.68 GB，其中 metal2vulkan-validation 占 1,534 MB
+#     （294 个 .jsonl 的私有语料共 1,487 MB）。三个已发布 crate 只有 52.4 MB。
+#   - 把 1.68 GB subtree 进来，换来的只是「文件在本仓库里」，而真正要的
+#     能力是「能改、能 rebase 到上游新版」。
+#   - 所以改为 GitHub fork：tmrmambo/metal2vulkan（fork 自
+#     steelbrain/metal2vulkan，full history，可 rebase）。我们改上游就改
+#     fork，依赖锚在 fork 的 rev 上。
+#
+# rev 必须是精确 SHA，不许用分支名。上游是 0.x，README 自己说 API、命令行、
+# pipeline JSON 与 SPIR-V 都可能变，并要求消费者给缓存产物打版本。
+#
+# 当前 rev 219f0136 已验证：upstream-check.yml run 41182923637 在
+# ubuntu-latest 与 macos-26-intel 上 cargo check --workspace --all-features
+# 全绿，且 --target x86_64-apple-darwin 通过。见 docs/spec/91 第 5.6 节。
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+metal2vulkan = { git = "https://github.com/tmrmambo/metal2vulkan", rev = "219f01365dc4c8eb346816c405b5b17403793764", features = ["serde", "ash"] }
+metal2vulkan-air = { git = "https://github.com/tmrmambo/metal2vulkan", rev = "219f01365dc4c8eb346816c405b5b17403793764" }
+metal2vulkan-runtime = { git = "https://github.com/tmrmambo/metal2vulkan", rev = "219f01365dc4c8eb346816c405b5b17403793764" }
+
+# 本项目自有 crate
+m2vu-capability = { path = "crates/m2vu-capability" }
+m2vu-iosurface  = { path = "crates/m2vu-iosurface" }
+m2vu-objc       = { path = "crates/m2vu-objc" }
+
+# 第三方
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror  = "2"
+tracing    = "0.1"
+
+[profile.release]
+# 研发期保留符号：panic 现场与 kext 侧的符号化都要用（docs/spec/70 第 5 节）
+debug         = 1
+strip         = "none"
+overflow-checks = true
+
+[profile.dev]
+overflow-checks = true

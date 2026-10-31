@@ -1,0 +1,83 @@
+# 本项目自有 workspace 的编译检查。
+#
+# 开发机是 Windows 且没有 MSVC 链接器，所以这件事只能在 CI 上做
+# （docs/spec/91-RUNTIME-EVIDENCE.md 的 R-009）。
+#
+# 目标三元组是 x86_64-apple-darwin：组件 1（Metal plugin bundle）与组件 4
+# （IOSurface 桥）只在 macOS 上有意义，组件 7（harness）跑在 host 侧。
+
+name: check
+
+on:
+  push:
+    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/check.yml']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: cargo check (x86_64-apple-darwin)
+    runs-on: macos-26-intel
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-x86_64-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml') }}
+      - run: rustc --version && cargo --version
+      - name: cargo check
+        run: cargo check --workspace --all-targets
+      - name: cargo clippy
+        continue-on-error: true
+        run: |
+          rustup component add clippy || true
+          cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -60
+      - name: cargo test（只跑不需要 guest 的）
+        continue-on-error: true
+        run: cargo test --workspace 2>&1 | tail -40
+      - name: cargo fmt
+        continue-on-error: true
+        run: |
+          rustup component add rustfmt || true
+          cargo fmt --all --check
+
+  linux:
+    name: cargo check (host tools only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-linux-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml') }}
+      # harness 跑在 host 侧，Linux 上必须能编（L1 的 QEMU 宿主是 Linux）
+      - run: cargo check -p harness --all-targets
+
+  python:
+    name: tools/*.py 自检
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 --version
+      - name: 语法检查
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in $(find tools -name '*.py'); do
+            python3 -m py_compile "$f" || { echo "SYNTAX FAIL: $f"; fail=1; }
+          done
+          exit $fail
+      - name: verify_kernel_patches.py 的 --help 可用
+        run: python3 tools/verify_kernel_patches.py --help > /dev/null

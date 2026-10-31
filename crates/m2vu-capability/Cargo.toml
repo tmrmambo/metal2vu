@@ -1,0 +1,17 @@
+[package]
+name = "m2vu-capability"
+description = "能力矩阵与诚实的能力报告"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish = false
+
+# 规格：docs/spec/60-CAPABILITY-MATRIX.md / 43-COVERAGE-REFUSALS.md
+[dependencies]
+metal2vulkan.workspace = true
+metal2vulkan-runtime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

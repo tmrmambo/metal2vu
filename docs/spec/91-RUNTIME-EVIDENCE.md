@@ -310,6 +310,23 @@ _GetComputeFunctionId  _GetObjectFunctionId  _GetMeshFunctionId
 
 ---
 
+## 5.6 上游 metal2vulkan 的可建性：已确证
+
+`TESTED(25G76)` 与 `TESTED(ubuntu)`。workflow `upstream-check.yml`，run `41182923637`，上游 ref `219f01365dc4c8eb346816c405b5b17403793764`。
+
+| 步骤 | `macos-26-intel`（rustc 1.98.0） | `ubuntu-latest`（rustc 1.99.1） |
+|---|---|---|
+| `cargo metadata` | ✅ | ✅ |
+| `cargo check -p metal2vulkan -p metal2vulkan-air -p metal2vulkan-runtime` | ✅ | ✅ |
+| `cargo check --workspace --all-features` | ✅ | ✅ |
+| `cargo check --target x86_64-apple-darwin` | **✅** | n/a |
+
+**这关掉了吸收 metal2vulkan 之前的唯一技术前提。** 上游六个 crate 合计 1,685,285 行（`metal2vulkan` 561,805 / `metal2vulkan-runtime` 355,326 / `metal2vulkan-validation` 484,598 / `metal2vulkan-conformance` 193,467 / `metal2vulkan-air` 85,531 / `metal2vulkan-devtools` 4,558），在两个平台上零错误通过，且目标三元组 `x86_64-apple-darwin` 也通过。
+
+注意 `rust-toolchain.toml` 把 channel 钉在 `1.98.1`，而 ubuntu runner 报的是 1.99.1 —— 说明 runner 上 rustup 没有按 `rust-toolchain.toml` 切换（`cargo check` 在仓库根目录跑时应当切换）。macOS runner 报 1.98.0，切换生效。**这个不一致本身是一条待查项（`R-008`）**：如果 CI 用的工具链与 `rust-toolchain.toml` 不符，那"一次普通构建就检查 MSRV 承诺"这条上游设计意图在我们的 CI 上不成立。
+
+**一个本地环境的硬事实**：开发机（Windows）**编不了**上游。`cargo check` 止于 `error: linker 'link.exe' not found`，缺 MSVC Build Tools。所以上游与本项目自有 crate 的任何编译验证都只能在 CI 或 Linux/macOS 机器上做。记为 `R-009`。
+
 ## 6. 复现方式
 
 ```powershell

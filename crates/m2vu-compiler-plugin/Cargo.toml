@@ -1,0 +1,19 @@
+[package]
+name = "m2vu-compiler-plugin"
+description = "Metal compiler plugin（cdylib，46 个 C 导出）"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish = false
+
+[lib]
+# Metal.framework 用 dlopen + dlsym 加载它，所以必须是 cdylib。
+crate-type = ["cdylib", "rlib"]
+
+# 规格：docs/spec/32-COMPILER-PLUGIN.md / 30-SHADER-AIR.md / 31-PIPELINE-ARTIFACT.md
+[dependencies]
+metal2vulkan.workspace = true
+metal2vulkan-air.workspace = true
+thiserror.workspace = true

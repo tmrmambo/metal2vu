@@ -1,0 +1,18 @@
+[package]
+name = "m2vu-objc"
+description = "ObjC Metal driver shim"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish = false
+
+# 规格：docs/spec/20-OBJC-DEVICE.md / 21-OBJC-OBJECT-FAMILY.md / 22-OBJC-DESCRIPTORS.md / 42-RUNTIME-MAPPING.md
+[dependencies]
+metal2vulkan.workspace = true
+metal2vulkan-runtime.workspace = true
+m2vu-capability.workspace = true
+m2vu-iosurface.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

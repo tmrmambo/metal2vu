@@ -1,0 +1,77 @@
+# 第三方件的版本清单。
+#
+# 这是 docs/spec/70-BUILD-PACKAGE.md 第 7 节要求的那份清单，也是
+# .github/workflows/build-lavapipe-macos.yml 缓存键挂的那个文件：上游版本
+# 不动就不重编 LLVM / Mesa。
+#
+# 时效性要求（70 第 2.2 节）：x86_64 macOS 的 CI 支持到 2027 年 8 月落日，
+# 所以本清单必须让 CI 消失之后仍可离线重建 —— 每一项都要能由 (url, ref)
+# 唯一确定，并在取得后记下 sha256。
+#
+# 格式：每行 `key = value`，`#` 起注释。sha256 为空表示尚未取得。
+
+# ---------------------------------------------------------------------------
+# 组件 5：Vulkan loader 与 Lavapipe
+# 上游 metal2vulkan-runtime 不链接 Vulkan，运行时才打开 loader，需要一个
+# Vulkan 1.2 设备（上游 README）。所以 loader 与 ICD 都是本项目的交付物。
+# ---------------------------------------------------------------------------
+mesa.url    = https://gitlab.freedesktop.org/mesa/mesa.git
+mesa.ref    = mesa-25.3.2
+mesa.sha256 =
+# meson 配置（与 build-lavapipe-macos.yml 保持一致，改一处必须改两处）
+mesa.opts   = -Dvulkan-drivers=swrast -Dgallium-drivers=llvmpipe -Dplatforms= -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dopengl=false -Dgles1=disabled -Dgles2=disabled -Dllvm=enabled -Dshared-llvm=enabled -Dvideo-codecs= -Dbuild-tests=false
+
+vulkan_loader.url    = https://github.com/KhronosGroup/Vulkan-Loader.git
+vulkan_loader.ref    = v1.4.321
+vulkan_loader.sha256 =
+
+# LLVM 由 Homebrew 提供（Mesa 的 llvmpipe 后端要它）。
+# 固化 formula 版本而不是 "latest"，否则缓存键失效且产物不可复现。
+llvm.source  = homebrew
+llvm.formula = llvm@19
+
+# ---------------------------------------------------------------------------
+# 上游 metal2vulkan
+# 吸收方式见根 Cargo.toml 的注释：fork 到 tmrmambo/metal2vulkan，
+# 依赖锚在精确 SHA 上。
+# ---------------------------------------------------------------------------
+metal2vulkan.url    = https://github.com/tmrmambo/metal2vulkan
+metal2vulkan.parent = https://github.com/steelbrain/metal2vulkan
+metal2vulkan.rev    = 219f01365dc4c8eb346816c405b5b17403793764
+metal2vulkan.verified_by = upstream-check.yml run 41182923637
+
+# ---------------------------------------------------------------------------
+# 组件：引导链（docs/spec/71、72、74）
+# ---------------------------------------------------------------------------
+opencore.url    = https://github.com/acidanthera/OpenCorePkg
+opencore.ref    =
+opencore.note   = RELEASE 与 DEBUG 两套都要留（71 第 2.5 节）
+
+ocbinarydata.url = https://github.com/acidanthera/OcBinaryData
+ocbinarydata.ref =
+
+lilu.url         = https://github.com/acidanthera/Lilu
+lilu.ref         =
+
+virtualsmc.url   = https://github.com/acidanthera/VirtualSMC
+virtualsmc.ref   =
+virtualsmc.note  = AppleMCEReporterDisabler.kext 随该 release 分发
+
+amd_vanilla.url  = https://github.com/AMD-OSX/AMD_Vanilla
+amd_vanilla.ref  =
+amd_vanilla.note = 第 20 条补丁用 74 第 5 节的收紧版，不用 master 版（master 版在 25G325 上误打两处无关代码）
+
+ipsw.url         = https://github.com/blacktop/ipsw
+ipsw.ref         = v3.1.739
+ipsw.note        = 纯 Windows 下还原 BXDIFF50 的 BaseSystem 用（71 第 1.5 节）
+
+# ---------------------------------------------------------------------------
+# 组件 7：测试管线（docs/spec/80）
+# ---------------------------------------------------------------------------
+vnc_rs.crate   = vnc-rs
+vnc_rs.version =
+russh.crate    = russh
+russh.version  =
+rmcp.crate     = rmcp
+rmcp.version   =
+rmcp.note      = MCP 官方 Rust SDK。但 80 第 4.1 节规定 E0 之前不写 MCP 工具面
