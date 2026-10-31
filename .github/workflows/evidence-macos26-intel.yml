@@ -226,6 +226,116 @@ jobs:
           path: out/
           if-no-files-found: warn
 
+  airdump:
+    name: 拦 compiler plugin 入口，dump FlatBuffers descriptor
+    runs-on: macos-26-intel
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      # R-001：上一轮的 find 深度设浅了，没进这两个目录。
+      - name: 全深度定位 compiler plugin
+        run: |
+          set +e
+          echo "---- AppleParavirtGPUMetal.bundle 全树 ----"
+          find /System/Library/Extensions/AppleParavirtGPUMetal.bundle -type f 2>/dev/null
+          echo
+          echo "---- AppleParavirtGPUMetalIOGPUFamily.bundle 全树 ----"
+          find /System/Library/Extensions/AppleParavirtGPUMetalIOGPUFamily.bundle -type f 2>/dev/null
+          echo
+          echo "---- MTLCompiler.framework/Versions/*/Libraries ----"
+          find /System/Library/PrivateFrameworks/MTLCompiler.framework -type f 2>/dev/null
+          echo
+          echo "---- 全盘任意 *Plugin*.dylib ----"
+          find /System -name '*Plugin*.dylib' 2>/dev/null
+
+      - name: 编译语料（复用 metallib job 的 shader）
+        run: |
+          set -euo pipefail
+          mkdir -p out/lib
+          for f in tools/ci/shaders/*.metal; do
+            n=$(basename "$f" .metal)
+            xcrun metal -c "$f" -o "/tmp/$n.air" 2>/dev/null || continue
+            xcrun metallib "/tmp/$n.air" -o "out/lib/$n.metallib" 2>/dev/null || true
+          done
+          ls -la out/lib
+
+      - name: 构建拦截器与驱动程序
+        run: |
+          set -euo pipefail
+          clang -arch x86_64 -dynamiclib -O0 -g \
+                -o /tmp/airdump.dylib tools/ci/airdump/interpose.c
+          codesign -s - -f /tmp/airdump.dylib
+          clang -arch x86_64 -fobjc-arc -O0 \
+                -framework Foundation -framework Metal \
+                -o /tmp/pipeline tools/ci/airdump/pipeline.m
+          codesign -s - -f /tmp/pipeline
+          otool -L /tmp/airdump.dylib | head
+          nm -gU /tmp/airdump.dylib | grep -E 'my_dl|interpos' || true
+
+      - name: 跑起来并采集
+        id: run
+        continue-on-error: true
+        run: |
+          set +e
+          export AIRDUMP_OUT=/tmp/airdump-out
+          mkdir -p "$AIRDUMP_OUT"
+          # SIP 已关（91 第 1 节实测），而且被注入的是我们自己 ad-hoc 签名的
+          # 二进制，不是平台二进制，所以 DYLD_INSERT_LIBRARIES 生效。
+          DYLD_INSERT_LIBRARIES=/tmp/airdump.dylib \
+            /tmp/pipeline out/lib/*.metallib 2>&1 | tail -60
+          echo "---- 采集到的东西 ----"
+          ls -la "$AIRDUMP_OUT" || true
+
+      - name: 对 dump 做结构分析
+        if: always()
+        run: |
+          set +e
+          mkdir -p out/airdump
+          cp -a /tmp/airdump-out/. out/airdump/ 2>/dev/null
+          echo "=== NOTES.txt ==="
+          cat out/airdump/NOTES.txt 2>/dev/null || echo "(没有 NOTES，说明拦截未命中)"
+          echo
+          echo "=== 每个 blob 的头 64 字节 ==="
+          for b in out/airdump/*.bin; do
+            [ -f "$b" ] || continue
+            printf '\n---- %s (%s bytes) ----\n' "$b" "$(stat -f%z "$b")"
+            xxd -l 64 "$b"
+          done
+          echo
+          echo "=== FlatBuffers blob 的 identifier 与 root offset ==="
+          for b in out/airdump/flatbuf-*.bin; do
+            [ -f "$b" ] || continue
+            printf '%s  root_uoffset=%s  identifier=%s\n' "$b" \
+              "$(xxd -p -l 4 "$b")" "$(dd if="$b" bs=1 skip=4 count=4 2>/dev/null)"
+          done
+          shasum -a 256 out/airdump/*.bin > out/airdump/SHA256SUMS 2>/dev/null
+          wc -c out/airdump/*.bin 2>/dev/null | tail -5
+
+      - name: 注记发布边界
+        if: always()
+        run: |
+          cat > out/airdump/README.md <<'EOF'
+          # airdump 产物的性质
+
+          这里的 `*.bin` 是 **Metal.framework 交给 compiler plugin 的输入**，
+          其中 `air-*.bin` 来自**本项目自己写的 shader**
+          （`tools/ci/shaders/*.metal`），不是 Apple 的内容。
+
+          `flatbuf-*.bin` 是 Metal.framework 生成的描述结构。它是 Apple 代码
+          的输出，但不是 Apple 的代码本体，体积在 KB 量级，且它的全部价值在于
+          结构而非内容。按 `.gitignore` 顶部的发布边界，**这些 blob 不进仓库**；
+          进仓库的是从它们推出的 schema 结论（写入 `docs/spec/32-COMPILER-PLUGIN.md`）。
+          EOF
+          cat out/airdump/README.md
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: airdump
+          path: out/airdump/
+          if-no-files-found: warn
+
   metallib:
     name: 真实 metallib 语料与 AIR 格式核对
     runs-on: macos-26-intel

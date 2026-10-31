@@ -1,6 +1,36 @@
 # 21 — ObjC 对象族：APV Metal plugin 的实测实现边界
 
-文档版本：1.0
+文档版本：1.1
+
+> [!IMPORTANT]
+> **1.1 更正：本文有四处类名是编的，已被运行期证伪。**
+>
+> `91-RUNTIME-EVIDENCE.md` 第 2.2 节在真实 macOS 26 x86_64 上做了
+> `objc_getClass` 全量核对（`TESTED(25G76)`）：
+>
+> | 本文写的类名 | 实际 | 正确做法 |
+> |---|---|---|
+> | `_MTLRenderCommandEncoder` | **不存在** | encoder 宿主类由本项目自建，父类取 `NSObject`。`_MTLParallelRenderCommandEncoder` **存在**（size 232 / im 28 / ivar 20），parallel 路径可继承它 |
+> | `_MTLComputeCommandEncoder` | **不存在** | 同上 |
+> | `_MTLBlitCommandEncoder` | **不存在** | 同上 |
+> | `_MTLBuffer` / `_MTLTexture` / `_MTLEvent` | **不存在** | 资源链真实形态是 `MTLIOAccelBuffer -> MTLIOAccelResource -> _MTLResource -> _MTLAllocation -> _MTLObjectWithLabel`，比本文画的多两层 |
+> | `MTLLibraryBuilder` / `MTLLibraryDataWithArchive` | **不存在** | 本文与 `32` 分册都说 metallib 解析在这两个类里，名字是错的 |
+>
+> **直接后果**：encoder 宿主类**没有 Apple 抽象基类可继承**，所以
+> 「`endEncoding` 之后对象进入什么状态」完全由本项目定义，没有既有行为可抄。
+> 处置见 `42-RUNTIME-MAPPING.md` 第 3.2 节的四态状态机。
+>
+> **本文通过的部分**（同一轮核对，22 条断言过 20 条）：`MTLIOAccelDevice`
+> 无前导下划线且 `_MTLDevice` 是其父类、七个 `MTLIOAccel*` 节点全在、
+> `MTLDeviceSPI` 的 427 + 80 = 507、5 个协议外虚方法在 `_MTLDevice` 上且
+> 25 个协议零泄漏、`AppleParavirtDevice` 71 个 IMP、`featureProfile = 10000`、
+> `argumentBuffersSupport = 0`。
+>
+> **第 8.2 节「507 条不逐条抄」已被补齐。** 逐条处置见
+> `23-DEVICE-SPI-DISPOSITION.md`（由运行期转储机械生成）。624 条不同
+> selector 里，第一版必须自己写的只有 **49 条**（必须覆写 20 + 必须实现 29），
+> 507 条可继承基类。
+
 基线：macOS Tahoe 26.7.2 / build 25G325 / **x86_64**
 职责（见 `00-OVERVIEW.md` 第 8 节）：全量 Metal 协议与 selector 清单、required/optional、精确 x86_64 encoding、所有权与线程规则
 

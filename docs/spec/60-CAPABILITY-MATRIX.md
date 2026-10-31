@@ -1,6 +1,58 @@
 # 全量能力矩阵
 
-文档版本：1.0
+文档版本：1.1
+
+> [!IMPORTANT]
+> **1.1 更正：本文是在没有上游一手数据的情况下写的。`43-COVERAGE-REFUSALS.md`
+> 拿到上游工作副本后逐条核实，给出 28 条更正工单。冲突时以 `43` 为准。**
+>
+> **核实通过、不用改的**：`2135 / 958 / 828 / 349` 与 `S145 / M147 / L160 /
+> XL376` 全部正确；第 3 节逐 header 的 56 处计数全部一致；Metal 4 对象族分表
+> 一致。单位已确证为 **macOS 27.0 SDK Metal 头文件的公共条目**（property
+> 1049、method 801、class 153、protocol 79、class method 30、function 21、
+> category 2），**不含 enum 值与常量**。
+>
+> **必须改的四处汇总数**：
+>
+> | 本文位置 | 本文写的 | 正确值 |
+> |---|---|---|
+> | §1.1 / §3.21 / §4.3 | Metal 4 合计 432 项 | 按 header **519**（`MTL4*` 474 + `MTLTensor.h` 45）；按上游工作分组 **455**（`mtl4` 369 + `ml` 18 + `tensor` 68）。其中 **13 项挂在 `MTLDevice` 上、不在 `MTL4*` header 内**，最容易漏 |
+> | §3.14 | ray tracing 265 项 | **303 项**。265 只是五个专属 header 的小计，另 38 项散在普通 encoder 与 device 上，**那 38 项是 ray tracing 的接缝，报 false 时必须一起报** |
+> | §4.3 | `MTLTensor` + ML 63 项 | 口径混用。按 group 是 **86 项**（`tensor` 68 + `ml` 18） |
+> | §3.16 / §4.2 | tessellation 执行缺，every device not implemented | **错**。上游的 patch draw（直接与间接）已建：设备有 `tessellationShader` 时走设备阶段，没有时**模拟**。13 处拒绝是窄形式，reach = `rare` |
+>
+> **三条本文漏掉的重要事实**：
+>
+> 1. **`XL` 的 376 项 100% 是 Metal 4，`L` 的 160 项全部落在已决定不做的
+>    范围。** 所以真正要补的是 `S+M` 的 **292 项**；扣掉已决定不做的
+>    capture 25 / logging 20 / counters 54 之后是 **193 项**。本文 §4.4 把
+>    L 与 XL 混在一起讲「明确不做」，丢掉了这个精确数。
+> 2. **reach = `system` 的拒绝是 7 条，本文只点了 3 条。** 漏了
+>    `SamplerBicubicFilter`、`HostMemory`、`ExtendedRangeBlend`、
+>    `RuntimeGap::Render`，其中三条直接压在 WindowServer 首帧路径上。
+> 3. **上游点名 lavapipe 的 `RuntimeDriverDefect` 共 5 条，本文一条都没有。**
+>    按 `40-RUNTIME-VULKAN.md` §7.4，它们必须进 capability manifest。
+>
+> **第 3 节有一处格式归类错**：`'b3a8'`（`RGB10A8_2P_XR10`）被归进「两 plane
+> YCbCr」一行，但它 `ContainsYCbCr = 0`、`ContainsRGB = 1`，是两 plane
+> **RGB**。见 `41-IOSURFACE-USERSPACE.md` 第 3.5 节的九项判别属性。
+>
+> **第 5 节的 19 项最小集：10 项被 refusal 或 Lavapipe 挡住或强制降级**，
+> 1 项待 Lavapipe 构建。最致命的是第 7 项 `RGB10A8_2P_XR10` ——
+> `ExtendedRangeBlend` 在每台设备上拒绝、算术已强制 shadow、Lavapipe 的
+> input-attachment fetch 还要再加 scratch，三条成本叠在同一张登录屏
+> attachment 上。
+>
+> **`supportsFamily:` 的最终答案是 20 个值全部 false**，而且根因不是本文
+> 认定的 `PointSizeRange`，是 `Linear textures` 与 `Fast resource loading`
+> 两条无条件 gap。与 `91-RUNTIME-EVIDENCE.md` 实测 APV 对 `Mac2` / `Apple9` /
+> `Metal3` / `Metal4` 全部返回 false 一致。
+>
+> 一条**好消息**：Lavapipe 的 framebuffer fetch 走 **input attachment 形式，
+> 是精确形式不是降级**。代价是我们交给 runtime 的 image 必须带 input
+> attachment usage，否则 fetch pass 会另开 scratch 并在 `Load`/`Store`
+> 两侧各拷一次。
+
 基线：macOS Tahoe 26.7.2 build 25G325，**x86_64**
 上游锚定：metal2vulkan `219f01365dc4c8eb346816c405b5b17403793764`（2026-10-29，`Re-pin the runtime sources at the landing tip`）
 状态：有效。按 `00-OVERVIEW.md` 第 4.7 节，本文按**全量能力**编写，能力分档只用于排期与报告，不用于裁剪规格。
