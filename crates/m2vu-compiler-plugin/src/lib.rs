@@ -61,7 +61,7 @@ pub const PIPELINE_STATISTICS_BYTES: usize = 40;
 
 /// # Safety
 /// 由 `MTLCompiler.framework` 通过 `dlsym` 调用，ABI 由 `32` 第 3 节规定。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn MTLCompilerCreate() -> *mut core::ffi::c_void {
     // TODO(32 §3): 建编译上下文。
     todo!("docs/spec/32-COMPILER-PLUGIN.md 第 3 节")
@@ -69,7 +69,7 @@ pub unsafe extern "C" fn MTLCompilerCreate() -> *mut core::ffi::c_void {
 
 /// # Safety
 /// 同上。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn MTLCompilerDelete(_ctx: *mut core::ffi::c_void) {
     todo!("docs/spec/32-COMPILER-PLUGIN.md 第 3 节")
 }
@@ -83,7 +83,7 @@ pub unsafe extern "C" fn MTLCompilerDelete(_ctx: *mut core::ffi::c_void) {
 ///
 /// # Safety
 /// `bitcode` 必须指向 `len` 字节可读内存。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn MTLCompilerBuildRequestWithSerializedBitcode(
     _ctx: *mut core::ffi::c_void,
     _bitcode: *const core::ffi::c_void,
@@ -94,7 +94,7 @@ pub unsafe extern "C" fn MTLCompilerBuildRequestWithSerializedBitcode(
 
 /// # Safety
 /// 同上。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn MTLCompilerReleaseReply(_reply: *mut core::ffi::c_void) {
     todo!("docs/spec/32-COMPILER-PLUGIN.md 第 3 节")
 }

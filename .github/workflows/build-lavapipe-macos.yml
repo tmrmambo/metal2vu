@@ -43,30 +43,49 @@ jobs:
           sysctl -n hw.ncpu
           clang --version | head -3
 
-      - name: 工具链
-        run: |
-          set -euo pipefail
-          brew update --quiet || true
-          brew install meson ninja cmake pkg-config python@3.13 || true
-          brew install llvm@19 || brew install llvm || true
-          meson --version
-          ninja --version
-          cmake --version | head -1
-          echo "---- llvm prefix ----"
-          brew --prefix llvm@19 2>/dev/null || brew --prefix llvm
-
-      - name: 记录 LLVM 事实（决定 Mesa 能不能链上）
+      # 关键：只用运行器**预装**的 LLVM，绝不让 brew 从源码编。
+      #
+      # 第一次跑这条 workflow 时写的是 `brew install llvm@19`，而
+      # macos-26-intel 镜像预装的是 llvm@20（见 runner-images 的
+      # macos-26-Readme.md：「Clang/LLVM (Homebrew) 20.1.8 - available on
+      # $(brew --prefix llvm@20)/bin/clang」）。llvm@19 没有 bottle，brew
+      # 转去从源码编 LLVM，整个 job 在这一步卡了一个多小时还没出来。
+      #
+      # 所以这里**先探测再决定**，并且在找不到可用 llvm-config 时直接失败，
+      # 而不是退回 `brew install llvm`（那又会从源码编）。
+      - name: 探测预装的 LLVM
         id: llvm
         run: |
           set -euo pipefail
-          LP=$(brew --prefix llvm@19 2>/dev/null || brew --prefix llvm)
+          LP=""
+          for cand in llvm@20 llvm@21 llvm; do
+            p=$(brew --prefix "$cand" 2>/dev/null || true)
+            if [ -n "$p" ] && [ -x "$p/bin/llvm-config" ]; then LP="$p"; break; fi
+          done
+          if [ -z "$LP" ]; then
+            echo "::error::运行器上没有预装可用的 llvm-config。"
+            echo "不从源码编 LLVM —— 那会让 job 超时。"
+            echo "可用的 brew LLVM formula："
+            brew list --formula 2>/dev/null | grep -i llvm || echo "  (none)"
+            exit 1
+          fi
           echo "prefix=$LP" >> "$GITHUB_OUTPUT"
+          echo "LLVM prefix: $LP"
           "$LP/bin/llvm-config" --version
           "$LP/bin/llvm-config" --host-target
-          echo "---- 静态库是否存在（Mesa 偏好静态链接 LLVM）----"
-          ls "$LP/lib" | grep -c '^libLLVM.*\.a$' || echo "0 static archives"
-          ls "$LP/lib" | grep '^libLLVM' | head -5
+          echo "---- Mesa 的 llvmpipe 需要的组件 ----"
+          "$LP/bin/llvm-config" --components | tr ' ' '\n' | grep -E '^(x86|native|mcjit|orcjit|engine|analysis|bitwriter|ipo|instrumentation)$' || true
+          echo "---- 共享还是静态 ----"
+          ls "$LP/lib" | grep -E '^libLLVM' | head -5
           file "$LP/bin/llvm-config"
+
+      - name: 其余工具链（全部有 bottle，不会编源码）
+        run: |
+          set -euo pipefail
+          brew install --quiet meson ninja pkg-config bison flex || true
+          meson --version
+          ninja --version
+          cmake --version | head -1
 
       # ---------------- Vulkan loader ----------------
       - name: 取 Vulkan-Loader
