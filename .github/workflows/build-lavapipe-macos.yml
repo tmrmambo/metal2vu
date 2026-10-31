@@ -79,13 +79,31 @@ jobs:
           ls "$LP/lib" | grep -E '^libLLVM' | head -5
           file "$LP/bin/llvm-config"
 
+      # glslang 提供 glslangValidator。Mesa 的 meson.build:641 无条件要它
+      # （第一次跑在这里失败：`ERROR: Program 'glslangValidator' not found`）。
+      # 它不是可选项，lavapipe 要用它编内部着色器。
       - name: 其余工具链（全部有 bottle，不会编源码）
         run: |
           set -euo pipefail
-          brew install --quiet meson ninja pkg-config bison flex || true
+          brew install --quiet meson ninja pkg-config bison flex glslang || true
           meson --version
           ninja --version
           cmake --version | head -1
+          echo "---- glslangValidator ----"
+          command -v glslangValidator && glslangValidator --version | head -3
+
+      - name: 确认 Mesa 要的外部程序都在
+        run: |
+          set -euo pipefail
+          miss=0
+          for p in glslangValidator meson ninja pkg-config bison flex python3; do
+            if command -v "$p" > /dev/null; then
+              printf 'ok   %s -> %s\n' "$p" "$(command -v "$p")"
+            else
+              printf 'MISS %s\n' "$p"; miss=1
+            fi
+          done
+          exit $miss
 
       # ---------------- Vulkan loader ----------------
       - name: 取 Vulkan-Loader
