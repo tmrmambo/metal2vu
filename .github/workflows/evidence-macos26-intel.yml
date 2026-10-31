@@ -66,6 +66,9 @@ jobs:
             find /System/Library/PrivateFrameworks/$f.framework /System/Library/Frameworks/$f.framework -maxdepth 3 2>/dev/null
           done
 
+          # 纯诊断步骤：set +e 只关 errexit，步骤退出码仍取最后一条命令。
+          # find /System 碰到权限错误就返回非零，会让整个 job 报 failure。
+          exit 0
       - name: dyld shared cache 的位置与清单
         run: |
           set +e
@@ -76,6 +79,9 @@ jobs:
             ls -la "$d" 2>/dev/null || echo "  absent"
           done
 
+          # 纯诊断步骤：set +e 只关 errexit，步骤退出码仍取最后一条命令。
+          # find /System 碰到权限错误就返回非零，会让整个 job 报 failure。
+          exit 0
       - name: 收集普查输出
         if: always()
         run: |
@@ -101,10 +107,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ipsw 只用于从 shared cache 抽 dylib。抽不到不影响本 job 的其余部分
+      # （磁盘上的那些 plugin 不需要它），所以装不上就继续。
       - name: 装 ipsw
+        id: ipsw
+        continue-on-error: true
         run: |
+          set +e
           brew install blacktop/tap/ipsw || brew install ipsw
           ipsw version
+          exit 0
 
       - name: 探明 ipsw 的 dyld 子命令
         run: ipsw dyld --help 2>&1 | head -40
@@ -138,6 +150,9 @@ jobs:
           echo "---- what we got ----"
           find /tmp/ex -type f | head -50
 
+          # 纯诊断步骤：set +e 只关 errexit，步骤退出码仍取最后一条命令。
+          # find /System 碰到权限错误就返回非零，会让整个 job 报 failure。
+          exit 0
       - name: 磁盘上与 cache 内目标的派生分析
         if: always()
         run: |
@@ -170,6 +185,9 @@ jobs:
           echo "---- out/ ----"
           ls -la out/
 
+          # 纯诊断步骤：set +e 只关 errexit，步骤退出码仍取最后一条命令。
+          # find /System 碰到权限错误就返回非零，会让整个 job 报 failure。
+          exit 0
       - name: 针对 32 分册的定向检索
         if: always()
         run: |
@@ -195,6 +213,9 @@ jobs:
 
           wc -l out/32-*.txt
 
+          # 纯诊断步骤：set +e 只关 errexit，步骤退出码仍取最后一条命令。
+          # find /System 碰到权限错误就返回非零，会让整个 job 报 failure。
+          exit 0
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -249,6 +270,9 @@ jobs:
           echo "---- 全盘任意 *Plugin*.dylib ----"
           find /System -name '*Plugin*.dylib' 2>/dev/null
 
+          # 纯诊断步骤：set +e 只关 errexit，步骤退出码仍取最后一条命令。
+          # find /System 碰到权限错误就返回非零，会让整个 job 报 failure。
+          exit 0
       - name: 编译语料（复用 metallib job 的 shader）
         run: |
           set -euo pipefail
@@ -287,6 +311,9 @@ jobs:
           echo "---- 采集到的东西 ----"
           ls -la "$AIRDUMP_OUT" || true
 
+          # 纯诊断步骤：set +e 只关 errexit，步骤退出码仍取最后一条命令。
+          # find /System 碰到权限错误就返回非零，会让整个 job 报 failure。
+          exit 0
       - name: 对 dump 做结构分析
         if: always()
         run: |
@@ -312,6 +339,9 @@ jobs:
           shasum -a 256 out/airdump/*.bin > out/airdump/SHA256SUMS 2>/dev/null
           wc -c out/airdump/*.bin 2>/dev/null | tail -5
 
+          # 纯诊断步骤：set +e 只关 errexit，步骤退出码仍取最后一条命令。
+          # find /System 碰到权限错误就返回非零，会让整个 job 报 failure。
+          exit 0
       - name: 注记发布边界
         if: always()
         run: |
@@ -375,6 +405,9 @@ jobs:
           # 只上传我们自己写的 shader 产生的产物，这些是本项目自有内容
           shasum -a 256 out/air/*.air out/lib/*.metallib > out/corpus-hashes.txt 2>&1
 
+          # 纯诊断步骤：set +e 只关 errexit，步骤退出码仍取最后一条命令。
+          # find /System 碰到权限错误就返回非零，会让整个 job 报 failure。
+          exit 0
       - uses: actions/upload-artifact@v4
         if: always()
         with:
