@@ -1,0 +1,749 @@
+# 规格: docs/spec/75-IMAGE-PREBAKE.md
+#
+# 在 macos-26-intel 运行器上预烘一块已配好 SSH/VNC 的 macOS 系统盘。
+# 不运行原生安装器：用 asr 克隆运行器自身那套封印完好的 macOS。
+#
+# 两个 job，刻意分开（75 §6.1）：
+#   probe  只读诊断，关掉 75 §8 里能一次测清的编号。预期通过，每步以 exit 0 结尾。
+#   bake   真正烘镜像。预期失败，直到 P-001 / P-002 / P-003 关闭。默认不跑。
+#
+# 产物通道（75 §3.4）：镜像本体【不走 artifact】，artifact 配额按账户计
+# （Free 500 MB / Pro 1 GB / Team 2 GB / Enterprise Cloud 50 GB）。
+# 镜像只经 secret IMAGE_PUT_URL 指向的预签名 PUT 流出。
+
+name: bake-macos-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_bake:
+        description: '是否执行 bake job（默认只跑 probe）'
+        type: boolean
+        default: false
+      image_size_gb:
+        description: '镜像虚拟容量 GB（75 §4.1 推荐 32，下限 28）'
+        type: string
+        default: '32'
+      min_free_gb:
+        description: 'container 可用空间门禁 GB（75 §3.1 判定线 30）'
+        type: string
+        default: '30'
+      free_xcode:
+        description: '删掉 /Applications/Xcode*.app 以腾空间'
+        type: boolean
+        default: true
+      target_user:
+        description: '预建的管理员短名'
+        type: string
+        default: 'harness'
+      vnc_password:
+        description: 'VNC 口令（只前 8 字节有效，留空则不配 VNC）'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bake-macos-image
+  cancel-in-progress: false
+
+jobs:
+
+  # ===========================================================================
+  # probe —— 只读诊断。关掉 P-001 P-003 P-006 P-007 P-009 P-010 P-011，
+  #          并把第 5.4/5.5 节要照抄的 Label 与权限掩码从运行器上抄下来。
+  #          每个步骤末尾 exit 0：91 的 R-004，set +e 只关 errexit，
+  #          步骤退出码仍取最后一条命令。
+  # ===========================================================================
+  probe:
+    name: probe (read-only, expected to pass)
+    runs-on: macos-26-intel
+    timeout-minutes: 40
+    steps:
+
+      - name: tools present
+        run: |
+          set +e
+          echo "::group::required tools"
+          for t in hdiutil diskutil asr bless plutil dscl sw_vers python3 sqlite3 \
+                   /usr/libexec/PlistBuddy; do
+            p=$(command -v "$t" 2>/dev/null || echo "$t")
+            if [ -x "$p" ]; then echo "OK   $t -> $p"; else echo "MISS $t"; fi
+          done
+          echo "::endgroup::"
+          echo "::group::optional tools"
+          for t in zstd rclone jq; do
+            command -v "$t" >/dev/null 2>&1 && echo "OK   $t" || echo "MISS $t (optional)"
+          done
+          echo "::endgroup::"
+          exit 0
+
+      - name: P-001 disk and virtualisation
+        run: |
+          set +e
+          mkdir -p probe
+          {
+            echo "### df -h /"
+            df -h /
+            echo
+            echo "### diskutil apfs list"
+            diskutil apfs list
+            echo
+            echo "### diskutil info -plist / (container size/free)"
+            diskutil info -plist / | plutil -p -
+            echo
+            echo "### reclaimable"
+            du -sh /Applications/Xcode*.app 2>/dev/null
+            du -sh "$HOME/Library/Developer/CoreSimulator" 2>/dev/null
+            du -sh /Library/Developer/CoreSimulator 2>/dev/null
+            echo
+            echo "### nested virtualisation"
+            sysctl -n kern.hv_support 2>/dev/null || echo "kern.hv_support absent"
+            sysctl -n kern.hv_vmm_present 2>/dev/null || echo "kern.hv_vmm_present absent"
+          } | tee probe/P-001-disk.txt
+          echo "::notice::P-001 判定线是 container 可用 >= 30 GB（75 §3.1）"
+          exit 0
+
+      - name: P-003 seal and SIP
+        run: |
+          set +e
+          mkdir -p probe
+          {
+            echo "### csrutil"
+            csrutil status
+            csrutil authenticated-root status
+            csrutil allow-research-guests status 2>/dev/null
+            echo
+            echo "### root device"
+            diskutil info -plist / | plutil -p - | \
+              grep -Ei 'DeviceIdentifier|APFSSnapshot|VolumeName|Sealed|ReadOnly'
+            echo
+            echo "### sealed snapshot on the system volume"
+            ROOTDEV=$(diskutil info -plist / | plutil -extract DeviceIdentifier raw -o - -)
+            echo "root dev = $ROOTDEV"
+            SYSVOL=$(echo "$ROOTDEV" | sed -E 's/^(disk[0-9]+s[0-9]+)s[0-9]+$/\1/')
+            echo "system volume = $SYSVOL"
+            diskutil apfs listsnapshots "$SYSVOL"
+            diskutil apfs listVolumeGroups
+          } | tee probe/P-003-seal.txt
+          echo "::notice::P-003 要求 listsnapshots 恰好一个 com.apple.os.update-*"
+          exit 0
+
+      - name: P-006 firmlinks and volume membership
+        run: |
+          set +e
+          mkdir -p probe
+          {
+            echo "### /usr/share/firmlinks"
+            cat /usr/share/firmlinks 2>/dev/null
+            echo
+            echo "### st_dev per path (same number = same volume)"
+            stat -f '%d %N' /System/Library /private/var /Users /Library \
+                            /private/etc /private/etc/ssh /usr/local 2>/dev/null
+            echo
+            echo "### Data volume templates (75 §2.3.4)"
+            ls -la /System/Library/Templates/Data 2>/dev/null || echo "no Templates/Data"
+          } | tee probe/P-006-firmlinks.txt
+          exit 0
+
+      - name: P-007 platform identity
+        run: |
+          set +e
+          mkdir -p probe
+          {
+            sw_vers
+            uname -a
+            echo
+            echo "### board-id"
+            ioreg -l -p IODeviceTree -n / -r -d 1 2>/dev/null | grep -i board-id
+            nvram 4D1EDE05-38C7-4A6A-9CC6-4BCCA8B38C14:HW_BID 2>/dev/null
+            echo
+            echo "### SMBIOS"
+            system_profiler SPHardwareDataType 2>/dev/null | \
+              grep -Ei 'Model (Name|Identifier)|Chip|Processor|Serial|Hardware UUID'
+            echo
+            echo "### PlatformSupport of the running OS (compare with 71 §4.1)"
+            plutil -p /System/Library/CoreServices/PlatformSupport.plist 2>/dev/null
+          } | tee probe/P-007-platform.txt
+          echo "::notice::P-007 期望 board-id 是 VMM-x86_64（在 25G325 的受支持清单里）"
+          exit 0
+
+      - name: P-009 P-010 installer surface
+        run: |
+          set +e
+          mkdir -p probe
+          {
+            echo "### softwareupdate --list-full-installers"
+            softwareupdate --list-full-installers 2>&1 | sed -n '1,60p'
+            echo
+            echo "### installer apps present on the runner"
+            ls -d /Applications/Install\ macOS*.app 2>/dev/null || echo "none"
+            for app in /Applications/Install\ macOS*.app; do
+              [ -d "$app" ] || continue
+              echo "--- $app"
+              "$app/Contents/Resources/startosinstall" --usage 2>&1 | sed -n '1,60p'
+            done
+          } | tee probe/P-009-installer.txt
+          echo "::notice::P-009 看参数表里有没有 --volume（75 §2.1 断言它没有）"
+          exit 0
+
+      - name: launchd labels to copy verbatim (75 §5.4 §5.5)
+        run: |
+          set +e
+          mkdir -p probe
+          {
+            for p in /System/Library/LaunchDaemons/ssh.plist \
+                     /System/Library/LaunchDaemons/com.apple.screensharing.plist \
+                     /System/Library/LaunchDaemons/com.apple.screensharing.agent.plist; do
+              echo "--- $p"
+              [ -f "$p" ] || { echo "absent"; continue; }
+              /usr/libexec/PlistBuddy -c 'Print :Label'    "$p" 2>/dev/null
+              /usr/libexec/PlistBuddy -c 'Print :Disabled' "$p" 2>/dev/null || echo "(no Disabled key)"
+            done
+            echo
+            echo "### current overrides"
+            plutil -p /private/var/db/com.apple.xpc.launchd/disabled.plist 2>/dev/null \
+              || echo "no disabled.plist"
+          } | tee probe/labels.txt
+          exit 0
+
+      - name: ARD privilege mask, generated by Apple's own tool (75 §5.5)
+        run: |
+          set +e
+          mkdir -p probe
+          KS='/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart'
+          {
+            echo "### before"
+            plutil -p /Library/Preferences/com.apple.RemoteManagement.plist 2>/dev/null \
+              || echo "absent"
+            echo
+            echo "### kickstart -configure -allowAccessFor -allUsers -privs -all"
+            sudo "$KS" -configure -allowAccessFor -allUsers -privs -all 2>&1
+            echo
+            echo "### after  <-- 把这些键值照抄进 75 §5.5 的 plist"
+            plutil -p /Library/Preferences/com.apple.RemoteManagement.plist 2>/dev/null
+            echo
+            echo "### screensharingd listening?"
+            sudo "$KS" -activate 2>&1
+            sleep 3
+            nc -z localhost 5900 && echo "5900 open" || echo "5900 closed"
+            log show --predicate 'process == "screensharingd"' --last 3m 2>/dev/null | tail -40
+          } | tee probe/P-008-ard.txt
+          exit 0
+
+      - name: Preboot and cryptex layout (closes two BLOCKED of 75 §2.4)
+        run: |
+          set +e
+          mkdir -p probe
+          {
+            echo "### Preboot tree"
+            sudo find /System/Volumes/Preboot -maxdepth 4 -print 2>/dev/null | sed -n '1,200p'
+            echo
+            echo "### cryptex dirs"
+            sudo find /System/Volumes/Preboot -maxdepth 6 -name 'cryptex*' -print 2>/dev/null
+            echo
+            echo "### mounted cryptexes"
+            mount | grep -i cryptex
+            echo
+            echo "### P-011 physical store key path"
+            diskutil info -plist / | plutil -p - | grep -A4 APFSPhysicalStores
+          } | tee probe/preboot.txt
+          exit 0
+
+      - name: upload probe report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-report
+          path: probe/
+          retention-days: 30
+          if-no-files-found: warn
+
+  # ===========================================================================
+  # bake —— 真正烘镜像。75 §6.3 的 12 个失败点逐一对应一个步骤。
+  #         预期失败，直到 P-001 / P-002 / P-003 关闭。
+  # ===========================================================================
+  bake:
+    name: bake (expected to fail until P-001/P-002/P-003 close)
+    needs: probe
+    if: inputs.run_bake
+    runs-on: macos-26-intel
+    timeout-minutes: 340          # job 硬上限是 6 小时（75 §3.4）
+    env:
+      IMAGE_SIZE_GB: ${{ inputs.image_size_gb }}
+      MIN_FREE_GB: ${{ inputs.min_free_gb }}
+      TARGET_USER: ${{ inputs.target_user }}
+      VNC_PASSWORD: ${{ inputs.vnc_password }}
+      FREE_XCODE: ${{ inputs.free_xcode }}
+      SSH_PUBKEY: ${{ secrets.HARNESS_SSH_PUBKEY }}
+      IMAGE_PUT_URL: ${{ secrets.IMAGE_PUT_URL }}
+    steps:
+
+      # 需要仓库内容：首启三件套的脚本来自 scripts/
+      - uses: actions/checkout@v4
+
+      # --- 失败点 0：依赖自检。坑 2 的对策（91 §5.7.1） -----------------------
+      - name: gate 0 - tools
+        run: |
+          set -euo pipefail
+          miss=0
+          for t in hdiutil diskutil asr bless plutil dscl python3 /usr/libexec/PlistBuddy; do
+            p=$(command -v "$t" 2>/dev/null || echo "$t")
+            if [ -x "$p" ]; then echo "OK   $t"; else echo "MISS $t"; miss=1; fi
+          done
+          [ "$miss" = 0 ] || { echo "::error::缺必需工具，见上"; exit 1; }
+          # 坑 1 的对策：只探测，绝不 brew install 带版本号的 formula
+          if command -v zstd >/dev/null 2>&1; then
+            echo "COMPRESS=zstd" >> "$GITHUB_ENV"
+          elif brew list zstd >/dev/null 2>&1; then
+            echo "COMPRESS=zstd" >> "$GITHUB_ENV"
+          else
+            echo "::warning::zstd 不在位，退回 gzip（压缩比差，但预装且不会触发源码构建）"
+            echo "COMPRESS=gzip" >> "$GITHUB_ENV"
+          fi
+
+      # --- 失败点 1：空间门禁（P-001） ---------------------------------------
+      - name: gate 1 - free space (P-001)
+        run: |
+          set -euo pipefail
+          free_b=$(diskutil info -plist / | plutil -extract APFSContainerFree raw -o - -)
+          size_b=$(diskutil info -plist / | plutil -extract APFSContainerSize raw -o - -)
+          free_gb=$(( free_b / 1000000000 ))
+          size_gb=$(( size_b / 1000000000 ))
+          echo "container size=${size_gb} GB  free=${free_gb} GB  need=${MIN_FREE_GB} GB"
+          df -h /
+          if [ "$free_gb" -lt "$MIN_FREE_GB" ] && [ "$FREE_XCODE" != "true" ]; then
+            echo "::error::可用 ${free_gb} GB < ${MIN_FREE_GB} GB，且未允许删 Xcode。走 75 §7 替代 A"
+            exit 1
+          fi
+          echo "FREE_GB_BEFORE=${free_gb}" >> "$GITHUB_ENV"
+
+      # --- 失败点 3：腾空间。必须允许部分失败 --------------------------------
+      - name: reclaim space (tolerant)
+        if: env.FREE_XCODE == 'true'
+        run: |
+          set -uo pipefail
+          sudo rm -rf /Applications/Xcode*.app || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes || true
+          sudo rm -rf "$HOME/Library/Developer/CoreSimulator" || true
+          sudo rm -rf /Users/runner/Library/Caches || true
+          brew cleanup --prune=all >/dev/null 2>&1 || true
+          free_b=$(diskutil info -plist / | plutil -extract APFSContainerFree raw -o - -)
+          free_gb=$(( free_b / 1000000000 ))
+          echo "free after reclaim = ${free_gb} GB (was ${FREE_GB_BEFORE} GB)"
+          if [ "$free_gb" -lt "$MIN_FREE_GB" ]; then
+            echo "::error::腾完仍只有 ${free_gb} GB < ${MIN_FREE_GB} GB。走 75 §7 替代 A"
+            exit 1
+          fi
+
+      # --- 失败点 2：封印门禁（P-003） ---------------------------------------
+      - name: gate 2 - source seal (P-003)
+        run: |
+          set -euo pipefail
+          csrutil status || true
+          AR=$(csrutil authenticated-root status 2>/dev/null || echo "unknown")
+          echo "authenticated-root: $AR"
+
+          ROOTDEV=$(diskutil info -plist / | plutil -extract DeviceIdentifier raw -o - -)
+          SYSVOL=$(echo "$ROOTDEV" | sed -E 's/^(disk[0-9]+s[0-9]+)s[0-9]+$/\1/')
+          echo "root dev=$ROOTDEV  system volume=$SYSVOL"
+          diskutil info "$SYSVOL" | sed -n '1,40p'
+
+          diskutil apfs listsnapshots "$SYSVOL" | tee /tmp/snaps.txt
+          n=$(grep -c 'com\.apple\.os\.update-' /tmp/snaps.txt || true)
+          if [ "$n" -ne 1 ]; then
+            echo "::error::期望恰好 1 个 com.apple.os.update-* 快照，实得 ${n}。源封印可能已破，asr 会拒绝"
+            exit 1
+          fi
+          SNAP=$(diskutil apfs listsnapshots -plist "$SYSVOL" \
+                 | plutil -extract Snapshots.0.SnapshotUUID raw -o - -)
+          echo "sealed snapshot = $SNAP"
+          echo "SRC_SYSVOL=$SYSVOL" >> "$GITHUB_ENV"
+          echo "SRC_SNAP=$SNAP"     >> "$GITHUB_ENV"
+          echo "SRC_BUILD=$(sw_vers -buildVersion)"   >> "$GITHUB_ENV"
+          echo "SRC_VERSION=$(sw_vers -productVersion)" >> "$GITHUB_ENV"
+
+      # --- 失败点 4：建镜像并 attach ------------------------------------------
+      - name: create sparse raw image and attach
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/bake"; mkdir -p "$WORK"
+          IMG="$WORK/macos-apfs.raw"
+          BYTES=$(( IMAGE_SIZE_GB * 1024 * 1024 * 1024 ))
+          # APFS 上这样建出来的文件是稀疏的：只占实际写入的块
+          dd if=/dev/zero of="$IMG" bs=1 count=0 seek="$BYTES"
+          ls -l "$IMG"; du -h "$IMG"
+          # 扩展名不是 .dmg/.img 时 CRawDiskImage 这个 imagekey 是必须的
+          OUT=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount "$IMG")
+          echo "$OUT"
+          DEV=$(echo "$OUT" | head -1 | awk '{print $1}')
+          [ -n "$DEV" ] || { echo "::error::attach 没拿到 device"; exit 1; }
+          echo "attached at $DEV"
+          echo "IMG=$IMG" >> "$GITHUB_ENV"
+          echo "DEV=$DEV" >> "$GITHUB_ENV"
+
+      # --- 失败点 6：asr restore ---------------------------------------------
+      - name: asr restore the sealed system volume (P-002 的实际消费点)
+        run: |
+          set -euo pipefail
+          echo "src=/dev/$SRC_SYSVOL  snap=$SRC_SNAP  dst=$DEV"
+          diskutil mount "$SRC_SYSVOL" || true
+          # Intel 上【不要】加 --no-personalization（那是 Apple Silicon 专用）
+          # --noprompt 对 APFS erase 确认是否生效未实测，所以同时喂 y
+          printf 'y\n' | sudo asr restore \
+            --source "/dev/$SRC_SYSVOL" \
+            --target "$DEV" \
+            --toSnapshot "$SRC_SNAP" \
+            --erase --noprompt --verbose 2>&1 | tee /tmp/asr.log
+          grep -qi 'Restore completed successfully' /tmp/asr.log \
+            || { echo "::error::asr 没报成功。broken seal 看 P-003，权限错看 P-004"; exit 1; }
+
+      # --- 失败点 7：验证目标容器是不是"有效系统" -----------------------------
+      #     按 role 解析，不按卷名解析：卷名可能是 asr 的临时名，role 不会变。
+      - name: verify target container (Preboot + Recovery must exist)
+        run: |
+          set -euo pipefail
+          diskutil list                  > /tmp/tgt-list.txt   2>&1 || true
+          diskutil apfs list             > /tmp/tgt-apfs.txt   2>&1 || true
+          diskutil apfs listVolumeGroups > /tmp/tgt-groups.txt 2>&1 || true
+          cat /tmp/tgt-apfs.txt
+
+          # 我们这块盘上的 APFS container 是哪个 synthesized disk
+          BASE=$(basename "$DEV")
+          CNT=$(awk -v b="$BASE" '
+            /^\+-- Container/ { c = $3 }
+            $0 ~ ("Physical Store " b) { print c; exit }' /tmp/tgt-apfs.txt)
+          [ -n "$CNT" ] || { echo "::error::找不到建在 ${DEV} 上的 APFS container"; exit 1; }
+          echo "container = $CNT"
+          diskutil apfs list "$CNT" > /tmp/cnt.txt
+          cat /tmp/cnt.txt
+
+          # role_dev <Role> -> diskNsM
+          role_dev() {
+            awk -v r="($1)" '
+              /APFS Volume Disk \(Role\)/ && index($0, r) { print $(NF-1); exit }' /tmp/cnt.txt
+          }
+          TGT_SYS=$(role_dev System)
+          TGT_PRE=$(role_dev Preboot)
+          TGT_REC=$(role_dev Recovery)
+          echo "system=$TGT_SYS preboot=$TGT_PRE recovery=$TGT_REC"
+          for pair in "System:$TGT_SYS" "Preboot:$TGT_PRE" "Recovery:$TGT_REC"; do
+            n=${pair%%:*}; v=${pair#*:}
+            [ -n "$v" ] || {
+              echo "::error::目标容器里没有 ${n} 角色的卷。asr 没把源当成 valid system（P-002）"
+              exit 1
+            }
+          done
+          echo "TGT_CNT=$CNT"     >> "$GITHUB_ENV"
+          echo "TGT_SYS=$TGT_SYS" >> "$GITHUB_ENV"
+
+      # --- 失败点 8：Data volume（P-005 决定必做还是必跳） --------------------
+      - name: ensure a paired Data volume (P-005)
+        run: |
+          set -euo pipefail
+          diskutil apfs list "$TGT_CNT" > /tmp/cnt.txt
+          role_dev() {
+            awk -v r="($1)" '
+              /APFS Volume Disk \(Role\)/ && index($0, r) { print $(NF-1); exit }' /tmp/cnt.txt
+          }
+          TGT_DATA=$(role_dev Data)
+          if [ -n "$TGT_DATA" ]; then
+            echo "asr 已带来配对 Data volume ($TGT_DATA)，跳过创建（P-005 = 会）"
+          else
+            echo "自建 Data volume 并与 $TGT_SYS 组 group"
+            sudo diskutil apfs addVolume "$TGT_CNT" APFS "Macintosh HD - Data" \
+              -role D -groupWith "$TGT_SYS" -nomount
+            diskutil apfs list "$TGT_CNT" > /tmp/cnt.txt
+            TGT_DATA=$(role_dev Data)
+            [ -n "$TGT_DATA" ] || { echo "::error::addVolume 之后仍找不到 Data role 的卷"; exit 1; }
+            # 骨架播种（75 §2.3.4）。Templates/Data 不存在就只能失败，别装作没事
+            sudo mkdir -p /Volumes/TGTDATA
+            sudo diskutil mount -mountPoint /Volumes/TGTDATA "$TGT_DATA"
+            if [ -d /System/Library/Templates/Data ]; then
+              sudo ditto /System/Library/Templates/Data /Volumes/TGTDATA
+            else
+              echo "::error::没有 /System/Library/Templates/Data，空 Data volume 的骨架无从播种"
+              exit 1
+            fi
+            sudo diskutil unmount /Volumes/TGTDATA || true
+          fi
+          echo "TGT_DATA=$TGT_DATA" >> "$GITHUB_ENV"
+
+      # --- 失败点 9：离线预配。75 §5 的 13 项清单 -----------------------------
+      - name: offline pre-configuration (75 §5)
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /Volumes/TGTDATA
+          sudo diskutil mount -mountPoint /Volumes/TGTDATA "$TGT_DATA"
+          mount | grep TGTDATA
+
+          cat > "$RUNNER_TEMP/preconfig.sh" <<'SCRIPT'
+          #!/bin/bash
+          # 规格: docs/spec/75-IMAGE-PREBAKE.md 第 5 节
+          set -euo pipefail
+          VOL=/Volumes/TGTDATA
+          U="$1"; PUBKEY="$2"; VNCPW="$3"; BUILD="$4"; OSVER="$5"
+          UID_N=501
+
+          echo "== 1/6  Setup Assistant 标记 (75 §5.2) =="
+          mkdir -p "$VOL/private/var/db"
+          touch "$VOL/private/var/db/.AppleSetupDone"
+          touch "$VOL/private/var/db/.AppleDiagnosticsSetupDone"
+          chown root:wheel "$VOL/private/var/db/.AppleSetupDone" \
+                           "$VOL/private/var/db/.AppleDiagnosticsSetupDone"
+          chmod 644 "$VOL/private/var/db/.AppleSetupDone" \
+                    "$VOL/private/var/db/.AppleDiagnosticsSetupDone"
+
+          echo "== 2/6  管理员账号 (75 §5.3) =="
+          NODE="$VOL/private/var/db/dslocal/nodes/Default"
+          [ -d "$NODE" ] || { echo "ERROR: 目标卷上没有 dslocal 节点: $NODE"; exit 1; }
+          if dscl -f "$NODE" localhost -read "/Local/Default/Users/$U" >/dev/null 2>&1; then
+            echo "用户 $U 已存在（克隆带来的），只改口令与公钥"
+          else
+            # UniqueID 冲突检查（75 §5.3 说明 2）
+            if dscl -f "$NODE" localhost -list /Local/Default/Users UniqueID \
+               | awk '{print $2}' | grep -qx "$UID_N"; then
+              echo "ERROR: UniqueID $UID_N 已被占用，改一个再来"; exit 1
+            fi
+            dscl -f "$NODE" localhost -create "/Local/Default/Users/$U"
+            dscl -f "$NODE" localhost -create "/Local/Default/Users/$U" UserShell /bin/zsh
+            dscl -f "$NODE" localhost -create "/Local/Default/Users/$U" RealName "$U"
+            dscl -f "$NODE" localhost -create "/Local/Default/Users/$U" UniqueID "$UID_N"
+            dscl -f "$NODE" localhost -create "/Local/Default/Users/$U" PrimaryGroupID 20
+            dscl -f "$NODE" localhost -create "/Local/Default/Users/$U" \
+                 NFSHomeDirectory "/Users/$U"
+            dscl -f "$NODE" localhost -append "/Local/Default/Groups/admin" GroupMembership "$U"
+          fi
+          # 一次性随机口令：只配公钥，口令丢弃（75 §5.3 说明 3 的推荐做法）
+          dscl -f "$NODE" localhost -passwd "/Local/Default/Users/$U" \
+               "$(openssl rand -base64 24)"
+
+          echo "== 3/6  authorized_keys (75 §5.4) =="
+          H="$VOL/Users/$U"
+          mkdir -p "$H/.ssh"
+          if [ -n "$PUBKEY" ]; then
+            printf '%s\n' "$PUBKEY" > "$H/.ssh/authorized_keys"
+          else
+            echo "WARNING: 没给公钥，authorized_keys 留空，镜像起来登不进去"
+            : > "$H/.ssh/authorized_keys"
+          fi
+          chown -R "${UID_N}:20" "$H"
+          chmod 700 "$H" "$H/.ssh"
+          chmod 600 "$H/.ssh/authorized_keys"
+
+          echo "== 4/6  launchd overrides: sshd + screensharing (75 §5.4 §5.5) =="
+          D="$VOL/private/var/db/com.apple.xpc.launchd/disabled.plist"
+          mkdir -p "$(dirname "$D")"
+          if [ ! -f "$D" ]; then
+            printf '%s\n' \
+              '<?xml version="1.0" encoding="UTF-8"?>' \
+              '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+              '<plist version="1.0"><dict/></plist>' > "$D"
+          fi
+          plutil -convert xml1 "$D"
+          for L in com.openssh.sshd com.apple.screensharing; do
+            /usr/libexec/PlistBuddy -c "Delete :$L"         "$D" 2>/dev/null || true
+            /usr/libexec/PlistBuddy -c "Add :$L bool false" "$D"
+          done
+          chown root:wheel "$D"; chmod 644 "$D"
+          plutil -p "$D"
+
+          echo "== 5/6  Setup Assistant 面板标记 (75 §5.2 第二层) =="
+          P="$H/Library/Preferences/com.apple.SetupAssistant.plist"
+          mkdir -p "$(dirname "$P")"
+          [ -f "$P" ] || printf '%s\n' \
+            '<?xml version="1.0" encoding="UTF-8"?>' \
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+            '<plist version="1.0"><dict/></plist>' > "$P"
+          for K in DidSeeApplePaySetup DidSeeAvatarSetup DidSeeCloudSetup \
+                   DidSeeiCloudLoginForStorageServices DidSeePrivacy DidSeeSiriSetup \
+                   DidSeeSyncSetup DidSeeSyncSetup2 DidSeeTouchIDSetup \
+                   DidSeeAppearanceSetup DidSeeTrueTone DidSeeActivationLock \
+                   DidSeeScreenTime DidSeeAccessibility DidSeeAppStore; do
+            /usr/libexec/PlistBuddy -c "Delete :$K"        "$P" 2>/dev/null || true
+            /usr/libexec/PlistBuddy -c "Add :$K bool true" "$P"
+          done
+          /usr/libexec/PlistBuddy -c "Delete :LastSeenBuddyBuildVersion" "$P" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :LastSeenBuddyBuildVersion string $BUILD" "$P"
+          for K in LastSeenCloudProductVersion LastSeeniCloudStorageServicesProductVersion \
+                   LastSeenSyncProductVersion LastSeenDiagnosticsProductVersion \
+                   LastSeenSiriProductVersion; do
+            /usr/libexec/PlistBuddy -c "Delete :$K" "$P" 2>/dev/null || true
+            /usr/libexec/PlistBuddy -c "Add :$K string $OSVER" "$P"
+          done
+          chown -R "${UID_N}:20" "$H/Library"
+
+          echo "== 6/6  VNC (75 §5.5) =="
+          if [ -z "$VNCPW" ]; then
+            echo "没给 VNC 口令，跳过 VNC 预配"
+          else
+            # 路径受 P-006 影响：/private/etc 可能在 system volume 上
+            if [ -d "$VOL/private/etc" ]; then
+              printf 'enabled' > "$VOL/private/etc/RemoteManagement.launchd"
+              chown root:wheel "$VOL/private/etc/RemoteManagement.launchd"
+              chmod 644        "$VOL/private/etc/RemoteManagement.launchd"
+            else
+              echo "WARNING: 目标 Data volume 上没有 private/etc，见 P-006。"
+              echo "WARNING: RemoteManagement.launchd 没写，VNC server 可能不起来"
+            fi
+            RM="$VOL/Library/Preferences/com.apple.RemoteManagement.plist"
+            mkdir -p "$(dirname "$RM")"
+            cat > "$RM" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>ARD_AllLocalUsers</key>             <true/>
+            <key>ARD_AllLocalUsersPrivs</key>        <integer>-1073741569</integer>
+            <key>VNCLegacyConnectionsEnabled</key>   <true/>
+            <key>VNCOnlyLocalConnections</key>       <true/>
+            <key>ScreenSharingReqPermEnabled</key>   <false/>
+            <key>LoadRemoteManagementMenuExtra</key> <false/>
+          </dict>
+          </plist>
+          PLIST
+            chown root:wheel "$RM"; chmod 644 "$RM"; plutil -lint "$RM"
+            # 口令：前 8 字节与固定 XOR 密钥逐字节异或，大写十六进制，无换行
+            python3 - "$VNCPW" > "$VOL/Library/Preferences/com.apple.VNCSettings.txt" <<'PY'
+          import sys
+          key = bytes.fromhex('1734516E8BA8C5E2FF1C39567390ADCA')
+          pw  = sys.argv[1].encode()[:8].ljust(8, b'\x00')
+          sys.stdout.write(''.join('%02X' % (p ^ k) for p, k in zip(pw, key)))
+          PY
+            chown root:wheel "$VOL/Library/Preferences/com.apple.VNCSettings.txt"
+            chmod 600        "$VOL/Library/Preferences/com.apple.VNCSettings.txt"
+          fi
+
+          echo "== done =="
+          SCRIPT
+
+          chmod +x "$RUNNER_TEMP/preconfig.sh"
+          sudo "$RUNNER_TEMP/preconfig.sh" \
+            "$TARGET_USER" "${SSH_PUBKEY:-}" "${VNC_PASSWORD:-}" \
+            "$SRC_BUILD" "$SRC_VERSION"
+
+      # --- 首启三件套（75 §4.4）。三者的正文不在本 workflow 里：
+      #     firstboot-expand  见 73 §4.6.2
+      #     cpudisp-confirm   见 74 §4.6   ← 缺它会让 74 §4 的候选阶梯把每次成功判成失败
+      #     firstboot-probe   见 71 §10.1
+      #     缺件时本步骤只告警，不终止：让流水线走到底，产出一块可检查但【不可部署】的镜像。
+      - name: install first-boot LaunchDaemons (75 section 4.4)
+        run: |
+          set -uo pipefail
+          sudo mkdir -p /Volumes/TGTDATA/Library/LaunchDaemons
+          sudo mkdir -p /Volumes/TGTDATA/usr/local/libexec
+          missing=""
+          for s in firstboot-expand cpudisp-confirm firstboot-probe; do
+            SH="scripts/$s.sh"; PL="scripts/net.metal2vu.$s.plist"
+            if [ -f "$SH" ] && [ -f "$PL" ]; then
+              sudo ditto "$SH" "/Volumes/TGTDATA/usr/local/libexec/$s.sh"
+              sudo chmod 755  "/Volumes/TGTDATA/usr/local/libexec/$s.sh"
+              sudo ditto "$PL" "/Volumes/TGTDATA/Library/LaunchDaemons/net.metal2vu.$s.plist"
+              sudo chown root:wheel "/Volumes/TGTDATA/Library/LaunchDaemons/net.metal2vu.$s.plist"
+              sudo chmod 644        "/Volumes/TGTDATA/Library/LaunchDaemons/net.metal2vu.$s.plist"
+              echo "installed $s"
+            else
+              echo "::warning::缺 $SH 或 $PL，未安装 $s"
+              missing="${missing}${s} "
+            fi
+          done
+          echo "MISSING_FIRSTBOOT=${missing}" >> "$GITHUB_ENV"
+          if [ -n "$missing" ]; then
+            echo "::warning::产物不可部署，缺: ${missing}"
+          fi
+
+      # --- 失败点 10：bless。在 CI 里不可验证 ---------------------------------
+      - name: bless the cloned system volume (verifiable only on L1)
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /Volumes/TGTSYS
+          sudo diskutil mount -mountPoint /Volumes/TGTSYS "$TGT_SYS"
+          # 【不要】加 --setBoot：那会改运行器自己的固件偏好。
+          # 目标机的引导由 OpenCore 接管（71 §6）。
+          sudo bless --folder "/Volumes/TGTSYS/System/Library/CoreServices" \
+                     --bootefi --verbose 2>&1 | tee /tmp/bless.log
+          echo "::warning::bless 的充分性在 CI 里无法验证（P-002）。"
+          echo "::warning::必须在 L1 的 QEMU 里按 71 §8.2.4 启动一次才算关掉。"
+          sudo diskutil unmount /Volumes/TGTSYS || true
+
+      # --- 失败点 11：detach，并量实占 ---------------------------------------
+      - name: detach and measure
+        run: |
+          set -euo pipefail
+          diskutil apfs list "$DEV" | tee /tmp/final-apfs.txt
+          sudo diskutil unmountDisk "$DEV" || true
+          sudo hdiutil detach "$DEV" || sudo hdiutil detach -force "$DEV"
+          ls -l "$IMG"
+          echo "apparent size: $(stat -f '%z' "$IMG") bytes"
+          echo "actual blocks: $(du -k "$IMG" | awk '{print $1*1024}') bytes"
+          mkdir -p out
+          python3 - "$IMG" "$SRC_BUILD" "$SRC_VERSION" "$SRC_SNAP" "$IMAGE_SIZE_GB" \
+                   "${MISSING_FIRSTBOOT:-}" > out/image-manifest.json <<'PY'
+          import hashlib, json, os, sys
+          img, build, ver, snap, size_gb, missing = sys.argv[1:7]
+          h = hashlib.sha256()
+          with open(img, 'rb') as f:
+              for chunk in iter(lambda: f.read(8 << 20), b''):
+                  h.update(chunk)
+          st = os.stat(img)
+          missing = missing.split()
+          json.dump({
+              "spec": "docs/spec/75-IMAGE-PREBAKE.md",
+              "form": "bare APFS container image, no partition table",
+              "virtual_bytes": st.st_size,
+              "actual_bytes": st.st_blocks * 512,
+              "virtual_gb_requested": int(size_gb),
+              "sha256": h.hexdigest().upper(),
+              "source_build": build,
+              "source_version": ver,
+              "source_sealed_snapshot": snap,
+              "missing_firstboot_daemons": missing,
+              "deployable": not missing,
+              "evidence_label": "TESTED(%s) only; NOT 25G325 (see 75 section 2.3.6)" % build,
+              "next_step": "assemble GPT on Linux per 75 section 4.3",
+          }, sys.stdout, indent=2, sort_keys=True)
+          PY
+          cat out/image-manifest.json
+
+      # --- 失败点 12：导出。没有 IMAGE_PUT_URL 时跳过而不是失败 ---------------
+      - name: stream the image to object storage (not artifact, see 75 section 3.4)
+        run: |
+          set -euo pipefail
+          if [ -z "${IMAGE_PUT_URL:-}" ]; then
+            echo "::warning::没配 secret IMAGE_PUT_URL，跳过导出。"
+            echo "::warning::镜像【不能】走 artifact：配额 Free 500 MB / Pro 1 GB / Team 2 GB。"
+            exit 0
+          fi
+          if [ "$COMPRESS" = zstd ]; then
+            CT=application/zstd; CMD="zstd -T0 -3 -c"
+          else
+            CT=application/gzip; CMD="gzip -3 -c"
+          fi
+          echo "compressing with: $CMD"
+          # shellcheck disable=SC2086
+          $CMD < "$IMG" | curl -fsS --retry 3 --retry-connrefused \
+              -X PUT --upload-file - -H "Content-Type: $CT" "$IMAGE_PUT_URL"
+          echo "uploaded"
+
+      - name: collect diagnostics
+        if: always()
+        run: |
+          set +e
+          mkdir -p out
+          for f in /tmp/asr.log /tmp/bless.log /tmp/snaps.txt /tmp/tgt-list.txt \
+                   /tmp/tgt-apfs.txt /tmp/tgt-groups.txt /tmp/final-apfs.txt; do
+            [ -f "$f" ] && cp "$f" out/
+          done
+          { diskutil list; diskutil apfs list; df -h /; } > out/final-state.txt 2>&1
+          hdiutil info > out/hdiutil-info.txt 2>&1
+          exit 0
+
+      - name: upload logs and manifest (small only)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bake-logs
+          path: out/
+          retention-days: 30
+          if-no-files-found: warn
