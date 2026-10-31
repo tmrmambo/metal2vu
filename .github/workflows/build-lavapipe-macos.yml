@@ -1,0 +1,223 @@
+# 在 macos-26-intel 上构建 Vulkan loader + Mesa/Lavapipe（x86_64）。
+#
+# 这是 docs/spec/70-BUILD-PACKAGE.md 第 3.4 节与 80-TEST-HARNESS.md 第 5.4 节
+# 登记的风险："Lavapipe 在 x86_64 macOS 上的可建性尚未验证"。存在 arm64 macOS
+# 的成功先例，x86_64 没有。它阻塞 metal-probe，而 metal-probe 是 T2 的唯一判据。
+#
+# metal2vulkan-runtime 不链接 Vulkan，运行时才打开 loader（上游 README）。
+# 所以 loader 与 ICD 都是本项目自己的交付物，这个 workflow 就是那条产线。
+#
+# 发布边界：这里构建的全部是上游开源件（Mesa 是 MIT，Vulkan-Loader 是 Apache-2.0），
+# 产物可以作为 artifact 上传。不涉及任何 Apple 二进制。
+
+name: build-lavapipe-macos
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_ref:
+        description: Mesa 的 git ref
+        default: mesa-25.3.2
+      loader_ref:
+        description: Vulkan-Loader 的 git ref
+        default: v1.4.321
+
+permissions:
+  contents: read
+
+env:
+  MESA_REF: ${{ github.event.inputs.mesa_ref || 'mesa-25.3.2' }}
+  LOADER_REF: ${{ github.event.inputs.loader_ref || 'v1.4.321' }}
+
+jobs:
+  build:
+    name: Vulkan loader + Lavapipe (x86_64)
+    runs-on: macos-26-intel
+    timeout-minutes: 150
+    steps:
+      - name: 环境
+        run: |
+          set -x
+          sw_vers
+          uname -m
+          sysctl -n hw.ncpu
+          clang --version | head -3
+
+      - name: 工具链
+        run: |
+          set -euo pipefail
+          brew update --quiet || true
+          brew install meson ninja cmake pkg-config python@3.13 || true
+          brew install llvm@19 || brew install llvm || true
+          meson --version
+          ninja --version
+          cmake --version | head -1
+          echo "---- llvm prefix ----"
+          brew --prefix llvm@19 2>/dev/null || brew --prefix llvm
+
+      - name: 记录 LLVM 事实（决定 Mesa 能不能链上）
+        id: llvm
+        run: |
+          set -euo pipefail
+          LP=$(brew --prefix llvm@19 2>/dev/null || brew --prefix llvm)
+          echo "prefix=$LP" >> "$GITHUB_OUTPUT"
+          "$LP/bin/llvm-config" --version
+          "$LP/bin/llvm-config" --host-target
+          echo "---- 静态库是否存在（Mesa 偏好静态链接 LLVM）----"
+          ls "$LP/lib" | grep -c '^libLLVM.*\.a$' || echo "0 static archives"
+          ls "$LP/lib" | grep '^libLLVM' | head -5
+          file "$LP/bin/llvm-config"
+
+      # ---------------- Vulkan loader ----------------
+      - name: 取 Vulkan-Loader
+        run: git clone --depth 1 --branch "$LOADER_REF" https://github.com/KhronosGroup/Vulkan-Loader.git /tmp/loader
+
+      - name: 构建 Vulkan-Loader
+        id: buildloader
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cd /tmp/loader
+          python3 scripts/update_deps.py --dir external --arch x64 --config release
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DCMAKE_INSTALL_PREFIX=/tmp/stage \
+            -DVULKAN_HEADERS_INSTALL_DIR="$(pwd)/external/Vulkan-Headers/build/install" \
+            -DBUILD_TESTS=OFF
+          ninja -C build -j"$(sysctl -n hw.ncpu)"
+          ninja -C build install
+          echo "---- 产物 ----"
+          find /tmp/stage -name 'libvulkan*' -maxdepth 3
+          otool -L /tmp/stage/lib/libvulkan.dylib | head -20
+
+      # ---------------- Mesa / Lavapipe ----------------
+      - name: 取 Mesa
+        run: |
+          git clone --depth 1 --branch "$MESA_REF" https://gitlab.freedesktop.org/mesa/mesa.git /tmp/mesa \
+            || git clone --depth 1 https://gitlab.freedesktop.org/mesa/mesa.git /tmp/mesa
+          git -C /tmp/mesa log --oneline -1
+
+      - name: Mesa 构建依赖
+        run: |
+          set -euo pipefail
+          python3 -m pip install --break-system-packages --quiet mako pyyaml packaging || \
+          python3 -m pip install --quiet mako pyyaml packaging
+          python3 -c 'import mako; print("mako", mako.__version__)'
+
+      - name: 配置 Mesa（lavapipe，仅 x86_64）
+        id: mesaconf
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          LP="${{ steps.llvm.outputs.prefix }}"
+          export PATH="$LP/bin:$PATH"
+          export CC=clang CXX=clang++
+          export LLVM_CONFIG="$LP/bin/llvm-config"
+          cd /tmp/mesa
+          meson setup build \
+            --prefix=/tmp/stage \
+            --buildtype=release \
+            -Dvulkan-drivers=swrast \
+            -Dgallium-drivers=llvmpipe \
+            -Dplatforms= \
+            -Dglx=disabled \
+            -Degl=disabled \
+            -Dgbm=disabled \
+            -Dopengl=false \
+            -Dgles1=disabled \
+            -Dgles2=disabled \
+            -Dllvm=enabled \
+            -Dshared-llvm=enabled \
+            -Dvideo-codecs= \
+            -Dbuild-tests=false \
+            2>&1 | tee /tmp/meson-setup.log
+          echo "---- 配置摘要 ----"
+          tail -60 /tmp/meson-setup.log
+
+      - name: 构建 Mesa
+        id: mesabuild
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cd /tmp/mesa
+          ninja -C build -j"$(sysctl -n hw.ncpu)" 2>&1 | tail -200
+          ninja -C build install
+          echo "---- 产物 ----"
+          find /tmp/stage -name '*lvp*' -o -name '*lavapipe*' | head
+          find /tmp/stage -name '*.json' | head
+
+      # ---------------- 验证 ----------------
+      - name: 跑一次 vulkaninfo 式自检
+        id: smoke
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          export VK_ICD_FILENAMES=$(find /tmp/stage -name 'lvp_icd*.json' | head -1)
+          export DYLD_LIBRARY_PATH=/tmp/stage/lib
+          echo "ICD=$VK_ICD_FILENAMES"
+          cat "$VK_ICD_FILENAMES" || true
+          cat > /tmp/probe.c <<'EOF'
+          #include <stdio.h>
+          #include <string.h>
+          #include <dlfcn.h>
+          #include <stdint.h>
+          typedef struct { uint32_t apiVersion, driverVersion, vendorID, deviceID, deviceType;
+                           char deviceName[256]; } PropsHead;
+          int main(void) {
+            void *h = dlopen("/tmp/stage/lib/libvulkan.dylib", RTLD_NOW);
+            if (!h) { printf("dlopen loader FAILED: %s\n", dlerror()); return 1; }
+            printf("loader opened OK\n");
+            void *gipa = dlsym(h, "vkGetInstanceProcAddr");
+            printf("vkGetInstanceProcAddr = %p\n", gipa);
+            void *ci = dlsym(h, "vkCreateInstance");
+            printf("vkCreateInstance = %p\n", ci);
+            return (gipa && ci) ? 0 : 2;
+          }
+          EOF
+          clang -arch x86_64 -o /tmp/probe /tmp/probe.c
+          /tmp/probe
+
+      - name: 汇总结论
+        if: always()
+        run: |
+          mkdir -p out
+          {
+            echo "# Lavapipe on x86_64 macOS — 构建结论"
+            echo
+            echo "- runner: $(sw_vers -productVersion) ($(sw_vers -buildVersion)), $(uname -m)"
+            echo "- mesa ref: $MESA_REF"
+            echo "- loader ref: $LOADER_REF"
+            echo "- llvm: $("${{ steps.llvm.outputs.prefix }}/bin/llvm-config" --version 2>/dev/null || echo unknown)"
+            echo
+            echo "| 步骤 | 结果 |"
+            echo "|---|---|"
+            echo "| Vulkan-Loader 构建 | ${{ steps.buildloader.outcome }} |"
+            echo "| Mesa meson setup | ${{ steps.mesaconf.outcome }} |"
+            echo "| Mesa ninja 构建 | ${{ steps.mesabuild.outcome }} |"
+            echo "| loader dlopen 自检 | ${{ steps.smoke.outcome }} |"
+          } > out/CONCLUSION.md
+          cat out/CONCLUSION.md
+          cp /tmp/meson-setup.log out/ 2>/dev/null || true
+          find /tmp/stage -type f 2>/dev/null | sed 's|/tmp/stage/||' > out/stage-manifest.txt || true
+          find /tmp/mesa/build -name '*.json' 2>/dev/null | head -20 >> out/stage-manifest.txt || true
+          wc -l out/stage-manifest.txt || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lavapipe-build-report
+          path: out/
+          if-no-files-found: warn
+
+      - name: 打包产物（构建成功时）
+        if: steps.mesabuild.outcome == 'success'
+        run: |
+          cd /tmp && tar czf lavapipe-macos-x86_64.tar.gz stage
+          ls -la /tmp/lavapipe-macos-x86_64.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        if: steps.mesabuild.outcome == 'success'
+        with:
+          name: lavapipe-macos-x86_64
+          path: /tmp/lavapipe-macos-x86_64.tar.gz

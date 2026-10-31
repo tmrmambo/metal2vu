@@ -1,0 +1,141 @@
+# 上游 metal2vulkan 能不能编，以及它的实际规模。
+#
+# 开发机是 Windows 且没有 MSVC 链接器（70 分册第 1.4 节的环境现状），
+# 本地 `cargo check` 止于 `linker link.exe not found`。所以"上游能不能编"
+# 这个问题只能在 CI 上回答。
+#
+# 两个目标平台：
+#   - ubuntu-latest  : 便宜、快，回答"这一百万行 Rust 本身是否自洽"
+#   - macos-26-intel : 真正的目标平台，回答"在 x86_64 macOS 上是否自洽"
+#
+# 这里不 vendor 上游代码进本仓库，只在 CI 里按 ref clone。吸收（fork 成
+# workspace 内 crate）是在这一步通过之后才做的事。
+
+name: upstream-check
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: metal2vulkan 的 git ref
+        default: 219f01365dc4c8eb346816c405b5b17403793764
+
+permissions:
+  contents: read
+
+env:
+  M2V_REF: ${{ github.event.inputs.ref || '219f01365dc4c8eb346816c405b5b17403793764' }}
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-26-intel]
+    name: cargo check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - name: 取上游
+        run: |
+          set -euo pipefail
+          git clone https://github.com/steelbrain/metal2vulkan.git /tmp/m2v
+          cd /tmp/m2v
+          git checkout --detach "$M2V_REF"
+          git log --oneline -1
+
+      - name: 规模普查
+        run: |
+          set -euo pipefail
+          cd /tmp/m2v
+          echo "| crate | .rs | lines |"
+          echo "|---|---:|---:|"
+          for d in crates/*/; do
+            n=$(find "$d" -name '*.rs' | wc -l | tr -d ' ')
+            l=$(find "$d" -name '*.rs' -exec cat {} + | wc -l | tr -d ' ')
+            printf '| %s | %s | %s |\n' "$(basename "$d")" "$n" "$l"
+          done
+          echo
+          echo "---- docs ----"
+          ls -la docs/
+          echo "---- toolchain ----"
+          cat rust-toolchain.toml
+          echo "---- workspace members ----"
+          grep -A30 '^\[workspace\]' Cargo.toml | head -40
+
+      - name: 装 rust-toolchain.toml 指定的工具链
+        run: |
+          set -euo pipefail
+          cd /tmp/m2v
+          rustup show active-toolchain || true
+          rustc --version
+          cargo --version
+
+      - name: cargo metadata（依赖是否可解析）
+        id: meta
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cd /tmp/m2v
+          cargo metadata --format-version 1 --no-deps > /tmp/meta.json
+          python3 - <<'PY'
+          import json
+          m = json.load(open('/tmp/meta.json'))
+          print("workspace packages:")
+          for p in m['packages']:
+              print(f"  {p['name']:30} {p['version']:10} edition={p.get('edition')} "
+                    f"rust-version={p.get('rust_version')}")
+          PY
+
+      - name: cargo check（三个已发布 crate，默认 feature）
+        id: check_pub
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cd /tmp/m2v
+          cargo check -p metal2vulkan -p metal2vulkan-air -p metal2vulkan-runtime 2>&1 | tail -80
+
+      - name: cargo check（整个 workspace，全 feature）
+        id: check_all
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cd /tmp/m2v
+          cargo check --workspace --all-features 2>&1 | tail -120
+
+      - name: 交叉编译到 x86_64-apple-darwin（仅 macOS runner）
+        id: check_x86
+        if: startsWith(matrix.os, 'macos')
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cd /tmp/m2v
+          rustup target add x86_64-apple-darwin
+          cargo check -p metal2vulkan-runtime --target x86_64-apple-darwin 2>&1 | tail -60
+
+      - name: 结论
+        if: always()
+        run: |
+          mkdir -p out
+          {
+            echo "# upstream metal2vulkan 可建性 — ${{ matrix.os }}"
+            echo
+            echo "- ref: $M2V_REF"
+            echo "- rustc: $(rustc --version)"
+            echo
+            echo "| 步骤 | 结果 |"
+            echo "|---|---|"
+            echo "| cargo metadata | ${{ steps.meta.outcome }} |"
+            echo "| cargo check（3 个已发布 crate） | ${{ steps.check_pub.outcome }} |"
+            echo "| cargo check --workspace --all-features | ${{ steps.check_all.outcome }} |"
+            echo "| cargo check --target x86_64-apple-darwin | ${{ steps.check_x86.outcome || 'n/a' }} |"
+          } > out/CONCLUSION-${{ matrix.os }}.md
+          cat out/CONCLUSION-${{ matrix.os }}.md
+          cp /tmp/meta.json out/ 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: upstream-check-${{ matrix.os }}
+          path: out/
+          if-no-files-found: warn
