@@ -1,0 +1,273 @@
+# 在 macos-26-intel 运行器上采集证据。
+#
+# 这是本项目第一次在真实 macOS 26 x86_64 上执行代码。目标是关闭
+# docs/spec/32-COMPILER-PLUGIN.md 与 20/21/22 分册里那批 BLOCKED 项。
+#
+# ============================ 发布边界 ============================
+# 本仓库是公开仓库，artifact 对任何能看到仓库的人可见。
+# 因此本 workflow **只上传派生的文本分析结果**（符号表、字符串、
+# 反汇编片段、类/方法清单、哈希），**绝不上传 Apple 的二进制本体**。
+# 这与 .gitignore 顶部的边界是同一条规则。
+# =================================================================
+
+name: evidence-macos26-intel
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/evidence-macos26-intel.yml'
+      - 'tools/ci/**'
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    name: 环境普查与目标定位
+    runs-on: macos-26-intel
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 运行器身份
+        run: |
+          set -x
+          sw_vers
+          uname -a
+          uname -m
+          sysctl -n machdep.cpu.brand_string
+          sysctl -n hw.optional.avx512f || true
+          csrutil status || true
+          xcode-select -p
+          xcrun metal --version 2>&1 | head -20 || true
+          xcrun metal-nm --version 2>&1 | head -5 || true
+
+      - name: Metal 相关框架与 bundle 是否在磁盘上
+        run: |
+          set +e
+          echo "---- /System/Library/Extensions 下的 Paravirt 相关 ----"
+          ls -la /System/Library/Extensions/ | grep -i -E 'paravirt|AGX|Radeon|Intel.*Graphics' || echo "NONE"
+          echo
+          echo "---- APV Metal bundle 的 Resources ----"
+          for b in AppleParavirtGPUMetal.bundle AppleParavirtGPUMetalIOGPUFamily.bundle; do
+            echo "== $b =="
+            find "/System/Library/Extensions/$b" -type f 2>/dev/null | head -40 || echo "  not present"
+          done
+          echo
+          echo "---- 全盘搜 compiler plugin ----"
+          find /System -name 'lib*CompilerPlugin*.dylib' 2>/dev/null || echo "NONE on disk"
+          echo
+          echo "---- MTLCompiler.framework ----"
+          find /System/Library/PrivateFrameworks/MTLCompiler.framework -maxdepth 4 2>/dev/null || echo "NONE"
+          echo
+          echo "---- IOGPU / IOSurface / IOAccelerator 框架 ----"
+          for f in IOGPU IOSurface IOAccelerator; do
+            find /System/Library/PrivateFrameworks/$f.framework /System/Library/Frameworks/$f.framework -maxdepth 3 2>/dev/null
+          done
+
+      - name: dyld shared cache 的位置与清单
+        run: |
+          set +e
+          for d in /System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld \
+                   /System/Library/dyld \
+                   /private/preboot/Cryptexes/OS/System/Library/dyld ; do
+            echo "== $d =="
+            ls -la "$d" 2>/dev/null || echo "  absent"
+          done
+
+      - name: 收集普查输出
+        if: always()
+        run: |
+          mkdir -p out
+          { sw_vers; echo; uname -a; echo; sysctl -n machdep.cpu.brand_string; } > out/runner-identity.txt
+          csrutil status >> out/runner-identity.txt 2>&1 || true
+          xcrun metal --version > out/metal-toolchain.txt 2>&1 || true
+          ls -la /System/Library/Extensions/ > out/extensions-listing.txt 2>&1 || true
+          find /System -name 'lib*CompilerPlugin*.dylib' > out/compilerplugin-ondisk.txt 2>&1 || true
+          find /System/Library/PrivateFrameworks/MTLCompiler.framework > out/mtlcompiler-tree.txt 2>&1 || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: census
+          path: out/
+          if-no-files-found: warn
+
+  symbols:
+    name: 目标二进制的符号与字符串分析
+    runs-on: macos-26-intel
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装 ipsw
+        run: |
+          brew install blacktop/tap/ipsw || brew install ipsw
+          ipsw version
+
+      - name: 探明 ipsw 的 dyld 子命令
+        run: ipsw dyld --help 2>&1 | head -40
+
+      - name: 从 shared cache 抽出目标 dylib 到临时目录（不上传本体）
+        id: extract
+        run: |
+          set +e
+          mkdir -p /tmp/ex
+          CACHE=""
+          for c in /System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64h \
+                   /System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_x86_64 \
+                   /System/Library/dyld/dyld_shared_cache_x86_64h \
+                   /System/Library/dyld/dyld_shared_cache_x86_64 ; do
+            [ -f "$c" ] && CACHE="$c" && break
+          done
+          echo "CACHE=$CACHE"
+          echo "cache=$CACHE" >> "$GITHUB_OUTPUT"
+          [ -z "$CACHE" ] && { echo "no cache found"; exit 0; }
+
+          for t in \
+            /System/Library/PrivateFrameworks/MTLCompiler.framework/Versions/A/MTLCompiler \
+            /System/Library/PrivateFrameworks/MTLCompiler.framework/MTLCompiler \
+            /System/Library/PrivateFrameworks/IOGPU.framework/Versions/A/IOGPU \
+            /System/Library/Frameworks/IOSurface.framework/Versions/A/IOSurface \
+            /System/Library/PrivateFrameworks/IOAccelerator.framework/Versions/A/IOAccelerator \
+            /System/Library/Frameworks/Metal.framework/Versions/A/Metal ; do
+            echo "=== extracting $t"
+            ipsw dyld extract "$CACHE" "$t" --output /tmp/ex 2>&1 | tail -5
+          done
+          echo "---- what we got ----"
+          find /tmp/ex -type f | head -50
+
+      - name: 磁盘上与 cache 内目标的派生分析
+        if: always()
+        run: |
+          set +e
+          mkdir -p out
+          analyse() {   # $1 = binary path, $2 = label
+            local b="$1" n="$2"
+            [ -f "$b" ] || { echo "ABSENT: $b" >> out/missing.txt; return; }
+            echo "=== $n : $b" >> out/inventory.txt
+            shasum -a 256 "$b" >> out/inventory.txt 2>&1
+            file "$b" >> out/inventory.txt 2>&1
+            dwarfdump --uuid "$b" >> out/inventory.txt 2>&1
+            nm -gU   "$b" > "out/$n.exports.txt"      2>&1
+            nm -gu   "$b" > "out/$n.undefined.txt"    2>&1
+            otool -L "$b" > "out/$n.linked.txt"       2>&1
+            otool -l "$b" > "out/$n.loadcmds.txt"     2>&1
+            strings -a -n 5 "$b" | sort -u > "out/$n.strings.txt" 2>&1
+          }
+
+          # 1) 磁盘上的 APV compiler plugin（若存在，这是首选来源）
+          for p in $(find /System -name 'lib*CompilerPlugin*.dylib' 2>/dev/null); do
+            analyse "$p" "ondisk-$(basename "$p" .dylib)"
+          done
+
+          # 2) 从 cache 抽出来的
+          for p in $(find /tmp/ex -type f 2>/dev/null); do
+            analyse "$p" "cache-$(basename "$p")"
+          done
+
+          echo "---- out/ ----"
+          ls -la out/
+
+      - name: 针对 32 分册的定向检索
+        if: always()
+        run: |
+          set +e
+          mkdir -p out
+          echo "=== AIRNT* 与 MTLCompiler* 导出符号（32 分册第 3 节的 40 个符号）===" > out/32-symbols.txt
+          for f in out/*.exports.txt; do
+            echo "---- $f" >> out/32-symbols.txt
+            grep -E ' _(AIRNT|MTLCompiler)' "$f" >> out/32-symbols.txt 2>&1
+          done
+
+          echo "=== FlatBuffers identifier 与命名空间（32 分册第 8 节的空白）===" > out/32-flatbuffers.txt
+          for f in out/*.strings.txt; do
+            echo "---- $f" >> out/32-flatbuffers.txt
+            grep -E '^(AIRF|AIRP)$|Air\.|Mtl4\.|flatbuffers|FlatBuffer' "$f" >> out/32-flatbuffers.txt 2>&1
+          done
+
+          echo "=== llvmVersion / 版本门（32 分册的 32023 / 3802 / 3902 / 32024）===" > out/32-versions.txt
+          for f in out/*.strings.txt; do
+            echo "---- $f" >> out/32-versions.txt
+            grep -E '32023|32024|3802|3902|llvmVersion|air\.(vertex|fragment|kernel|patch)' "$f" >> out/32-versions.txt 2>&1
+          done
+
+          wc -l out/32-*.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: symbols
+          path: out/
+          if-no-files-found: warn
+
+  objc:
+    name: Metal.framework 的 ObjC 运行期转储
+    runs-on: macos-26-intel
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 编译并运行转储器
+        run: |
+          mkdir -p out
+          clang -arch x86_64 -fobjc-arc -O0 -Wno-deprecated-declarations \
+                -framework Foundation -framework Metal -lobjc \
+                -o /tmp/objcdump tools/ci/objc_dump.m 2>&1 | tail -40
+          /tmp/objcdump > out/objc-dump.json 2> out/objc-dump.stderr || true
+          head -c 2000 out/objc-dump.json
+          wc -c out/objc-dump.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: objc-dump
+          path: out/
+          if-no-files-found: warn
+
+  metallib:
+    name: 真实 metallib 语料与 AIR 格式核对
+    runs-on: macos-26-intel
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 编译语料并解析容器
+        run: |
+          set +e
+          mkdir -p out/lib out/air
+          for f in tools/ci/shaders/*.metal; do
+            n=$(basename "$f" .metal)
+            echo "=== $n"
+            xcrun metal -c "$f" -o "out/air/$n.air" 2> "out/air/$n.log"
+            xcrun metallib "out/air/$n.air" -o "out/lib/$n.metallib" 2>> "out/air/$n.log"
+          done
+          echo "---- 产物 ----"
+          ls -la out/air out/lib
+          echo "---- 容器头部（32 字节十六进制）与大小，用于核对 30 分册第 2 节的 MTLB 头 ----"
+          for m in out/lib/*.metallib; do
+            printf '%s  %s bytes\n' "$m" "$(stat -f%z "$m")"
+            xxd -l 128 "$m"
+          done > out/metallib-headers.txt 2>&1
+          cat out/metallib-headers.txt
+          echo "---- metal-nm / metal-objdump 可用性 ----"
+          for m in out/lib/*.metallib; do
+            echo "== $m"
+            xcrun metal-nm "$m" 2>&1 | head -20
+          done > out/metallib-nm.txt 2>&1
+          # AIR 本体是 LLVM bitcode；记录头 4 字节与命名 metadata 名
+          for a in out/air/*.air; do
+            printf '%s  %s bytes  ' "$a" "$(stat -f%z "$a")"
+            xxd -l 8 -p "$a"
+          done > out/air-headers.txt 2>&1
+          cat out/air-headers.txt
+          # 只上传我们自己写的 shader 产生的产物，这些是本项目自有内容
+          shasum -a 256 out/air/*.air out/lib/*.metallib > out/corpus-hashes.txt 2>&1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: metallib-corpus
+          path: out/
+          if-no-files-found: warn
