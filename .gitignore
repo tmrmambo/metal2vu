@@ -1,0 +1,78 @@
+# ============================================================
+# 发布边界
+#
+# 本工作区混放着两类东西：
+#   (a) 本项目自己写的规格、脚本与源码；
+#   (b) 从 Apple 的 macOS 安装介质里解出的二进制、plist，
+#       以及基于它们建立的 IDA 数据库。
+#
+# (b) 是 Apple 二进制的衍生物，不得进入公开仓库。这与本项目
+# 自身采用什么开源许可无关，是两套彼此独立的约束。
+#
+# 策略是白名单：默认 ignore 一切，再逐类放行本项目自有的文本。
+# 这样新解出来的 Apple 文件不会因为忘了加规则而被意外提交。
+# 证据的可复现性由各 MANIFEST.md 里记录的 SHA-256 保证，
+# 不靠把样本本身塞进仓库。
+# ============================================================
+
+# ---- 默认排除一切 ----
+*
+
+# ---- 放行目录本身，否则无法递归到里面的白名单文件 ----
+!*/
+
+# ---- 放行本项目自有的文本产物 ----
+!.gitignore
+!.gitattributes
+!*.md
+!*.toml
+!*.lock
+!*.yml
+!*.yaml
+!*.rs
+!*.py
+!*.sh
+!*.ps1
+!*.plist.in
+!*.json.in
+
+# ---- 但以下子树整体不进仓：全部是 Apple 衍生物 ----
+/142-36613*/
+/temp_payload/
+/metal_drivers/
+/deprecated/MyVirtualMTLDriver/
+/analysis/idb/*/analysis-input/
+/analysis/idb/*/raw/
+/analysis/idb/*/plugin-plists/
+/analysis/binaries/*/plists/
+/analysis/binaries/*/payload*/
+
+# ---- 兜底：按类型排除，防止白名单扩展时漏网 ----
+*.dmg
+*.pkg
+*.i64
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.kc
+*.dylib
+*.bundle
+*.kext
+*.zip
+*.tsv
+*.map
+# metal-objc.json 是 Apple ObjC 元数据的整体转储，属衍生物
+metal-objc.json
+dyld_shared_cache*
+
+# ---- 工具与构建产物 ----
+.kiro/
+__pycache__/
+*.pyc
+/target/
+/third_party/_install/
+/third_party/_build/
+/out/
+/artifacts/
