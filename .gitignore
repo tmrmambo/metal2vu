@@ -35,6 +35,10 @@
 !*.ps1
 !*.plist.in
 !*.json.in
+# 我们自己写的 entitlements（codesign -s - --entitlements 的输入）。
+# 只放行 tools/ 下的：analysis/ 里如果出现同名文件，那会是从 Apple 二进制
+# dump 出来的权限清单，属衍生物，仍然应当默认排除。
+!tools/**/*.entitlements
 !*.m
 !*.mm
 !*.c

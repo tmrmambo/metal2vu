@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    Hypervisor.framework 的准入 entitlement。
+
+    它是**公开**的（不在 com.apple.private.* 命名空间里），所以 ad-hoc 签名
+    （codesign -s -）就能带上。这一点与 fs_snapshot_create 要的
+    com.apple.private.vfs.snapshot 不同 —— 后者是 restricted，
+    AMFI 开着时自签名会被直接拒（78 §A.10.2d-bis 的实测结论）。
+  -->
+  <key>com.apple.security.hypervisor</key>
+  <true/>
+</dict>
+</plist>
