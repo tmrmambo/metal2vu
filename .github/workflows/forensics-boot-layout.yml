@@ -1794,6 +1794,15 @@ jobs:
             diskutil info "${DEV2}s1" 2>&1 | grep -iE 'Mounted|Mount Point|Volume Name'
 
             echo
+            echo "########## 暂存目录必须落在被转换的那个卷上 ##########"
+            # 挂载之后 convert 又前进了一步，报的是
+            #   -69508: An APFS Preboot Volume staging path must be located on
+            #           the volume to be converted
+            # 所以 $STAGE 不能在 $RUNNER_TEMP，必须在 HFS+ 卷里面。
+            STAGE="$HM/preboot-stage"
+            sudo rm -rf "$STAGE"; sudo mkdir -p "$STAGE"
+            sudo chown "$(id -u):$(id -g)" "$STAGE"
+            echo "   STAGE = $STAGE"
             echo "########## 暂存目录（给之前是空的）##########"
             ls -lahO@R "$STAGE" 2>&1
 

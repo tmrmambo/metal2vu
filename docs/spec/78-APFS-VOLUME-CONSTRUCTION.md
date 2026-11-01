@@ -2491,8 +2491,21 @@ exit "$FAIL"
 
 **这个实验的产出是本 workflow 最值得期待的一项**，因为它不是「观察一个已经装好的系统」，而是「让 Apple 的工具在一块空盘上从零做一次 Preboot」。两者的差别正是第 A.6.3 节那张表里「现在能写出规格吗」一列的全部缺口。
 
-**1.1 进展：参数顺序修好之后 `convert` 正确解析了，但还差一步。** `TESTED(25G76)`，
-run `41278014136`。它回显了自己的完整意图 —— 这一句本身就是一条证据：
+**1.1 进展：三个前置条件被逐个发现，第四轮已逼到最后一个。** `TESTED(25G76)`。
+`convert` 的报错一轮推进一个：
+
+| 轮 | 错误 | 原因 | 修法 |
+|---|---|---|---|
+| 1、2 | `Could not find disk for -dryrun` | 参数顺序。`diskutil` 把第一个非选项参数当磁盘 | `convert <disk> [选项…]` |
+| 3 | `-69854: A disk with a mount point is required` | 源 HFS+ 卷必须已挂载 | `diskutil mount -mountPoint` |
+| 4 | **`-69508: An APFS Preboot Volume staging path must be located on the volume to be converted`** | **暂存目录必须落在被转换的那个卷上**，不能在 `$RUNNER_TEMP` | `STAGE="$HM/preboot-stage"` |
+
+**第三条是一条规格级的事实，不只是 CI 的小毛病：** `-prebootSource` 要的不是
+「任意一个可写目录」，而是**源卷自己内部的一个目录** —— 这与手册里
+「你的目录通常应当可写，因为转换之前会自动往里加件，而且转换完不会删掉它们」
+对上了：转换完它还在，是因为它跟着源卷一起变成了 APFS 卷的一部分。
+
+它回显的完整意图（第二轮起就正确了）—— 这一句本身就是一条证据：
 
 ```text
 Rehearsing the conversion of the volume on disk4s1 to an APFS Volume on an APFS
