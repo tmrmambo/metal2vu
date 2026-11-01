@@ -241,18 +241,65 @@ jobs:
           cp /usr/share/OVMF/OVMF_VARS_4M.fd "$W/vars.fd"
           chmod +w "$W/vars.fd"
 
-          # -cpu 行照 71 §5.2，但去掉两处，各有理由：
-          #   kvm=on      默认就是 on，显式写没有坏处但也没有信息量
-          #   check       默认就是 true（QEMU 的 X86CPU 属性），写了是冗余；
-          #               绝对不要换成 enforce —— EPYC 上缺 Intel 专属特征会直接拒绝启动
-          # 加一处：migratable=off。+invtsc 只有在给过 TSC 频率或关掉 migratable 时
-          # 才真的透给 guest，否则会被静默过滤并只留一行 warning（QEMU 的
-          # x86_cpu_filter_features）。macOS 的计时依赖 invariant TSC，所以这一条要坐实。
-          CPU='Skylake-Server-v4,-hle,-rtm,vendor=GenuineIntel,+invtsc,migratable=off'
-          CPU="$CPU,vmware-cpuid-freq=on,+ssse3,+sse4.2,+popcnt,+avx,+aes,+xsave,+xsaveopt"
-          echo "-cpu $CPU"
-
           OSK='ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc'
+
+          # ---- -cpu 行：逐条试，记下哪条成立 --------------------------------
+          # 规格（71 §5.2）写定的是 KVM 版那一条，但它有两个问题，而且第二个
+          # 上一轮直接让 QEMU 拒绝启动：
+          #   kvm=on          默认就是 on，写了没有信息量
+          #   check           默认就是 true，写了冗余；**绝不能换成 enforce** ——
+          #                   EPYC 上缺 Intel 专属特征（pcid / spec-ctrl）会直接拒绝启动
+          #   migratable=off  **命名模型上没有这个属性**，只有 host / max 有。
+          #                   上一轮（run 41307695997）就是死在这里：
+          #                   "can't apply global Skylake-Server-v4-x86_64-cpu.migratable=off:
+          #                    Property ... not found"，QEMU 0 秒退出，
+          #                   于是三条证据通道全空而没有任何解释。
+          #
+          # 所以不猜，试。候选按「离规格最近」排序，第一条能起来的就用，
+          # 并把结果记进 verdict —— 规格里 HVF/KVM 侧的 CPU 模型本来就缺这一格
+          # （71 §8.2.4 只有 KVM 版，且没人验过 EPYC 上成不成立）。
+          BASE='-hle,-rtm,vendor=GenuineIntel,+ssse3,+sse4.2,+popcnt,+avx,+aes,+xsave,+xsaveopt'
+          CANDIDATES=(
+            "Skylake-Server-v4,${BASE},+invtsc,vmware-cpuid-freq=on"
+            "Skylake-Server-v4,${BASE},vmware-cpuid-freq=on"
+            "Skylake-Client-v4,${BASE},+invtsc,vmware-cpuid-freq=on"
+            "host,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,migratable=off"
+          )
+
+          # 用 -S（建好机器但不放 vCPU 跑）做准入测试：CPU 串不合法时 QEMU 会
+          # 在建机器阶段就退出，合法则挂住等指令。两者 2 秒内就能分开。
+          try_cpu() {
+            local c="$1" err="$W/try.err"
+            : > "$err"
+            qemu-system-x86_64 -machine q35,accel=kvm -cpu "$c" \
+                -m 1024 -display none -nodefaults -S \
+                -qmp unix:"$W/try.sock",server=on,wait=off 2> "$err" &
+            local p=$!
+            sleep 2
+            if kill -0 "$p" 2>/dev/null; then
+              kill -9 "$p" 2>/dev/null; wait "$p" 2>/dev/null
+              rm -f "$W/try.sock"
+              return 0
+            fi
+            wait "$p" 2>/dev/null
+            rm -f "$W/try.sock"
+            return 1
+          }
+
+          CPU=""
+          : > out/cpu-candidates.txt
+          for c in "${CANDIDATES[@]}"; do
+            if try_cpu "$c"; then
+              echo "  [ok]   $c" | tee -a out/cpu-candidates.txt
+              [ -z "$CPU" ] && CPU="$c"
+            else
+              echo "  [拒]   $c" | tee -a out/cpu-candidates.txt
+              sed 's/^/           /' "$W/try.err" | head -3 | tee -a out/cpu-candidates.txt
+            fi
+          done
+          [ -n "$CPU" ] || { echo "::error::四条 -cpu 候选全部被拒"; exit 1; }
+          echo "选用 -cpu $CPU"
+          echo "$CPU" > out/cpu-used.txt
 
           qemu-system-x86_64 \
             -machine q35,accel=kvm \
@@ -277,6 +324,19 @@ jobs:
             -name oc-boot > "$W/qemu.out" 2> "$W/qemu.err" &
           QPID=$!
           echo "qemu pid=$QPID"
+
+          # 先确认它真的活着。上一轮 QEMU 0 秒退出，而等待循环的 kill -0 立刻
+          # break，于是三条证据全空、判定只说「没拿到」—— 分不清「没启动」与
+          # 「启动了但没输出」。这两件事的排查方向完全不同，必须当场分开。
+          sleep 3
+          if ! kill -0 "$QPID" 2>/dev/null; then
+            echo "::error::QEMU 启动后 3 秒内就退出了。stderr："
+            sed 's/^/    /' "$W/qemu.err"
+            cp "$W/qemu.err" out/ 2>/dev/null
+            echo "QEMU_DIED=yes" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "QEMU 活着，开始等 picker"
 
           # 等 picker。OpenCore 的 banner 形如 `OC: OpenCore DBG-xxx is loading`。
           i=0
@@ -327,6 +387,22 @@ jobs:
           [ -s out/picker.png ] && have_png=yes
           ls out/opencore*.txt >/dev/null 2>&1 && have_eflog=yes
 
+          if [ "${QEMU_DIED:-no}" = yes ]; then
+            echo ">>> **QEMU 没启动起来**，所以三条证据全空是预期的，不是 OpenCore 的问题。"
+            echo "    stderr："
+            sed 's/^/      /' out/qemu.err 2>/dev/null
+            {
+              echo "# oc-boot 判定（run ${GITHUB_RUN_ID}）"
+              echo "- 结论: QEMU 未启动，本轮不产生关于 OpenCore 的证据"
+            } > out/verdict.md
+            exit 0
+          fi
+
+          echo "---- 选用的 -cpu ----"
+          cat out/cpu-used.txt 2>/dev/null
+          echo "---- 四条候选的试探结果 ----"
+          cat out/cpu-candidates.txt 2>/dev/null
+          echo
           echo "---- 三条独立证据 ----"
           printf '  %-34s %s\n' \
             '串口里有 OpenCore banner'   "$have_serial" \
