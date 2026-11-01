@@ -809,8 +809,9 @@ def apply_picker(c, profile='visible'):
 │      OpenCore + 74 的 shim 与 5 份候选 config + 73 的状态文件
 │      + 选择器资源 + Alpine 的 kernel/initramfs/modloop/apkovl
 │      详见 3.2
-├─ p2  Apple APFS 或 Apple HFS      见下方「类型 GUID 怎么定」
+├─ p2  Apple APFS  7C3457EF-0000-11AA-AA11-00306543ECAC   ← L-007 已关闭，见第 7 节
 │      1600 MiB, 卷名 "macOS Base System"
+│      内容取自 DMG 的**第 3 个分区**（Apple_APFS，1,396,506,624 字节），不是整个 DMG
 │      内容 = 71 §1.5 还原出的 x86_64BaseSystem.dmg 的卷镜像
 │      1,464,270,504 字节, SHA-256 642E6148288527C51639D1B08C7F0B5A8CB4A68AEC2AC6DA3C78CF1723C5119A
 └─ p3  Apple APFS                   7C3457EF-0000-11AA-AA11-00306543ECAC
@@ -2595,7 +2596,7 @@ if ($LASTEXITCODE -ne 0) { throw 'EFI 树与 config.plist 不一致' }
 | **L-004** | `OC_ATTR_USE_MINIMAL_UI`（去掉关机/重启按钮）是否更接近 Intel Mac 的 Startup Manager | `INFERRED` | L1 上 `screendump` 两张图（`0xD3` 与 `0x93`），与真机 Startup Manager 的截图对比 | 否（要 L1） | 纯视觉保真度。两个取值都能正常启动 |
 | **L-005** | `Alpine.icns` 怎么产出 | `INFERRED` | 构建机上 `apt install icnsutils` 后用 `png2icns`，在 L1 上看 OpenCanopy 能不能解析 | **是** | 纯外观。缺它时 flavour 串退到 `HardDrive.icns`，功能不受影响 |
 | **L-006** | OpenCanopy 的指针在 OVMF + `usb-tablet` 下能不能用，要不要开 `UEFI/Input/PointerSupport` | `INFERRED` | L1 上先试 `PointerSupport = false`，鼠标不动再改 `true` | 否（要 L1） | 纯交互便利。自动化路径不用指针 |
-| **L-007** | 还原出的 `x86_64BaseSystem.dmg` 的卷是 APFS 还是 HFS+ | `INFERRED` | `71` 第 8.2.3 节的命令：`dd if=... bs=1 skip=32 count=4 \| xxd`，看 `NXSB` 还是 `H+` | **是，一条十五秒的命令** | **决定 p2 的分区类型 GUID（3.1 节）。造第一个镜像之前必须做掉** |
+| ~~**L-007**~~ | 还原出的 `x86_64BaseSystem.dmg` 的卷是 APFS 还是 HFS+ | **`TESTED`，已关闭** | **`32-COMPILER-PLUGIN.md` 第 1 节与第 3 节早就答过了，本册没引到。** 那一轮实际跑了 `ipsw disk dmg -p 3`，取出的是一个 **`Apple_APFS`** 分区原始镜像，**1,396,506,624 字节**；样本表里 `S-BASESYS` 的容器类型一栏记的就是 `UDIF / Apple_APFS` | 已完成 | **p2 的类型 GUID = `7C3457EF-0000-11AA-AA11-00306543ECAC`。** 连带关掉 `71` 的 `I-022`：那个 DMG **是带 GPT 的磁盘镜像**，不是裸卷镜像，要写进 p2 的是它**第 3 个分区**的内容 |
 | **L-008** | Alpine `virt` flavour 的内核是否含 `VIRTIO_BLK` / `VFAT_FS` / `SQUASHFS` / `EFI_STUB` | `INFERRED` | 下载 `config-6.12.114-0-virt`（146 KB，与三件套同目录）并 grep 这四个符号 | **是，纯下载** | 决定方案 A 可行性。不行就换 `lts`（ESP 要 1 GiB）或退方案 B（3.3.4 节） |
 | **L-009** | `OcBinaryData` 的 Font + Label + GoldenGate 实际占多少 | `INFERRED`（预算 20 MiB） | 2.3 节脚本第 5 步会打印 | **是，跑一次脚本** | 只影响 ESP 容量预算。512 MiB 有足够余量 |
 | **L-010** | 谁在 SSH 不可达时去重启机器 | 设计缺口 | 在 `80` 的 `Detector` 里加一条规则（6.4 节 80-A） | **是，写进 `80`** | **这是本文第 4 节机制的唯一硬外部依赖。** 没有它，一台卡住的机器永远不会前进到下一次判定 |
