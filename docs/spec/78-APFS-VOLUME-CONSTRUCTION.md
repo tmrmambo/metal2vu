@@ -32,7 +32,18 @@ x86_64 / SIP disabled / `Apple Paravirtual device`）。**结果是四条规格�
 `V-030`（新增，`gpt` EPERM 的根因）。
 
 **仍未关闭：** `V-002`、`V-004`、`V-005`、`V-008`、`V-011`…`V-013`、`V-015`（部分）、
-`V-018`、`V-019`、`V-020`、`V-022`、`V-023`、`V-028`、`V-031`。逐条见第 E 节的表。
+`V-018`、`V-019`、`V-020`、`V-022`（部分）、`V-023`（部分）、`V-028`、`V-031`、`V-032`。
+逐条见第 E 节的表。
+
+**三轮取证之间自己踩的坑，一并记在这里，因为它们各自浪费了一整轮：**
+
+| 坑 | 表现 | 教训（已写进第 C 节纪律） |
+|---|---|---|
+| 护栏用 `${VAR%%s*}` 取「整盘标识」 | `disk3s1` 与 `disk1s5s1` 都被截成 `di`，于是「同一块物理盘」恒成立，bless 实验**连续两轮**被自己挡住 | 问 `diskutil` 的 `Part of Whole`，不要用 shell 的后缀删除 |
+| 提前退出的分支不落文件 | 产物里既没有 `C0-bless-experiment.txt` 也没有任何解释，从 artifact 上分不清「没跑」与「跑了但被挡」 | **每一条 `exit` 路径都要写一个说明文件** |
+| `diskutil apfs convert` 的参数顺序 | 写成 `convert -dryrun -prebootSource DIR DISK`，`diskutil` 把第一个非选项参数当磁盘，报 `Could not find disk for -dryrun`。这个实验**两轮都没真正跑过** | `diskutil` 的动词一律 `<动词> <磁盘> [选项…]` |
+| `bless` 要求 `<UUID>/` 目录已存在 | `No valid group or volume UUID folder` + 退出码 2，而且**它一个文件都没写**（bless 前后 Preboot 全树 diff 为空） | 第 B 节步 11 必须在步 12 之前，而且 `mkdir -p` 是前置条件不是兜底 |
+| `diskutil` 的 `-69854` | `convert` 与 `listSnapshots` 都对**未挂载**的卷返回 `A disk with a mount point is required` | 凡是要读卷内容的 `diskutil` 动词，先 `diskutil mount` |
 
 ## 0. 本文作用与前提
 
@@ -547,7 +558,44 @@ upper case sets a flag; clear clears all flags; 0 is ignored.
 - **不是 role D 本身被禁**：用法串里 `D` 在允许集合内，而 `-role S` 在同一容器上成功。
 - **不是卷名冲突**：容器里当时只有 `Macintosh HD` 一个卷。
 
-**六条待试变体，下一轮取证逐个跑（workflow 里的 `V-031` 阶梯）：**
+**第二轮（run `41278014136`）把五条变体跑完了，结果把问题缩小了一格。** 全部 `TESTED(25G76)`：
+
+| 变体 | 命令 | 结果 |
+|---|---|---|
+| D1 | `addVolume … -role D -groupWith $SYS -nomount` | `-69624` |
+| D2 | `addVolume … -groupWith $SYS -nomount`（不给 role） | `-69624` |
+| D3 | `addVolume … -role D -group $SYS -nomount` | `-69624` |
+| D4 | `addVolume … -role D -sibling $SYS -nomount` | `-69624` |
+| D5 | `addVolume … -role D -nomount`（**不成组**） | **成功**，`Created new APFS Volume disk3s2`，但 `listVolumeGroups` 回报 `No Volume Groups among 1 Volume` |
+
+**结论：`-role D` 本身没问题，被拒的是「成组」这个动作。** 而且四种拼法
+（`-groupWith` / `-group` / `-sibling` / 不给 role）全部同一个错误码，
+说明拒绝发生在 `diskutil` 把请求交给 `apfsd` 之后，不是参数解析层面。
+失败时容器的状态（`TESTED(25G76)`）：
+
+```text
++-- Container disk3  3757027328 B (3.8 GB)，99.6% free
+    +-< Physical Store disk2s2
+    +-> Volume disk3s1  (Role: System)
+        Name: Macintosh HD (Case-insensitive)      ← 顺带确认 V-006
+        Mount Point: Not Mounted
+        Sealed: No        FileVault: No
++-- Container disk3
+    +-> No Volume Groups among 1 Volume
+```
+
+**容器剩余空间不是原因**（99.6% 空闲），**卷名不是原因**（容器里只有一个卷）。
+
+**第三轮缩到两个假设 + 一条直接问 `apfsd` 的探针（已写进 workflow）：**
+
+| # | 假设 / 探针 | 为什么 |
+|---|---|---|
+| **E0** | 复现 D1，然后 `log show --start <T0>` 捞 `apfsd` / `diskutil` 那一段 | `-69624` 是 `diskutil` 的通用错误码。**真正的原因只可能在 `apfsd` 那一侧**，而统一日志是唯一能看到它的地方。这是本轮最高价值的一条 |
+| **H1**（E1/E2） | 成组要求 sibling 卷**已挂载**。前两轮一律给了 `-nomount` | 成组要写 firmlink 相关的卷元数据，`apfsd` 可能需要先能读到系统卷 |
+| **H2**（E3） | **组的锚必须是 Data 那一侧**：先建 Data（`-role D`），再 `addVolume "Macintosh HD" -role S -groupWith <data>` | Apple 自己的卷组里 Data 卷是 `disk1s5s1` 的「Data Partition」（`bless --info` 的用词），语义上 System 是挂在 Data 组里的那一个 |
+| **H3**（E4/E5） | 容器要用 `diskutil apfs create <分区> <卷名>`（容器 + 第一个卷一次建）而不是 `createContainer`（空容器）+ `addVolume` | `create` 是 Apple 文档里「建一个带一个卷的新容器」的那条路；它建出来的第一个卷可能带上了 `addVolume` 给不了的某种元数据 |
+
+**六条原始变体（第二轮之前写的，D6/D7 当时没实现，已并入上表的 H2/E0）：**
 
 | # | 变体 | 为什么可能 |
 |---|---|---|
@@ -998,7 +1046,17 @@ Preboot 卷根
 
 | 问题 | 为什么重要 |
 |---|---|
-| Preboot 卷根下 `Cryptexes/` 的完整目录结构 | 它是 2.4 GB 量级的内容，占 Preboot 卷的绝大部分。`76` 第 1.2 节引的「Preboot 约 350 MB」是 Big Sur 时代的数，**macOS 26 上它要大一个数量级** |
+| Preboot 卷根下 `Cryptexes/` 的完整目录结构 | 它是 2.4 GB 量级的内容，占 Preboot 卷的绝大部分。`76` 第 1.2 节引的「Preboot 约 350 MB」是 Big Sur 时代的数，**macOS 26 上它要大一个数量级 —— 已实测：2,809,421,824 B（2.8 GB）**，见下 |
+
+**1.1 实测的三个卷实占（`TESTED(25G76)`，`diskutil apfs list` 在运行器自己的容器上）：**
+
+| 卷 | role | 实占 | 对我们的意义 |
+|---|---|---|---|
+| `Preboot` | B | **2,809,421,824 B（2.8 GB）** | 把 `76` 第 1.2 节的 350 MB 这个数废掉。**容器尺寸预算要给 Preboot 留 3 GB**，第 A.4.5 节按这个数改 |
+| `Recovery` | R | 1,460,121,600 B（1.5 GB） | 我们**不建**它（第 A.7 节），所以这 1.5 GB 是省下来的 |
+| `Macintosh HD - Data` | D | 185,662,193,664 B（185.7 GB） | 这是运行器被 CI 塞满的结果，不是基线。我们自己那块盘上 Data 卷初始只有模板树（第 A.5.1 节的 1.05 GB） |
+
+容器层面：`Size (Capacity Ceiling) 348,622,118,912 B`，`Capacity In Use By Volumes 202.7 GB (58.1%)`。
 | cryptex 是以什么形态存在：目录树、还是 sealed DMG | `INFERRED`：是 sealed DMG。转述自 <https://eclecticlight.co/2022/11/16/cryptex-how-a-custom-iphone-is-changing-macos-updates/>：实践中一个 cryptex 是一个**封印的磁盘镜像**，内含自己的文件系统，在启动过程中被挂载到根文件系统内一个**随机选定的位置** |
 | manifest / ticket 的文件名与格式 | `77` 第 D.3 节已记录 `writing cryptex1 ticket to %@`（RVA `0x2d2cec`）在 `_ramrod_splat_write_personalized_ticket`（RVA `0x12473c`）里把 ticket 写到目标。**ticket 的来源是 `AMAuthInstallBundlePersonalize`，那一步可能联网**（`77` 的 `U-001`） |
 | 「随机选定的位置」如何在我们自建的盘上成立 | 若挂载点是启动期随机选的，那它不是我们要铺的东西；若它记在某个 plist 里，那它是 |
@@ -1012,6 +1070,31 @@ Preboot 卷根
 **但有一条可以现在就写下来的缓解事实：** `77` 第 D.3 节记录 `_personalize_boot_bundle`（RVA `0x27a5f`）开头有一条逃生门 —— `if (ctx[+12056] != 0)` 就只 `symlink target/boot` 然后成功返回，完全不进 AuthInstall。配合本节事实 1（payload 里 `System/Cryptexes/{App,ExclaveOS,OS}` **本来就是符号链接**），`INFERRED`：**存在一条「cryptex 只是三个符号链接 + 被链接的内容在 Preboot 卷上」的形态，而建立符号链接不需要任何签名。** 如果取证确认这三个链接的目标是 `/System/Volumes/Preboot/Cryptexes/{App,ExclaveOS,OS}`，那我们要做的就是把 2.4 GB 的 x86_64 cryptex 内容铺到 Preboot 卷的那个位置、建好三个链接，**而 ticket 这一步靠 `csr-active-config` 的 bit 11 与 `SecureBootModel = Disabled` 跳过**。这条推测的查清方法就是第 D 节的 `readlink /System/Cryptexes/*` 加 Preboot 全树清单，**一轮 CI 就能定死**。
 
 #### A.6.6 Preboot 层可照抄的部分
+
+> [!IMPORTANT]
+> **一条硬顺序约束，1.1 实测得出：`bless` 不会自己建 `<UUID>/` 目录，它要求那个目录已经在。**
+> 在一个 Preboot 卷只有 `.fseventsd/` 的空容器上跑
+> `bless --folder <sysvol>/System/Library/CoreServices --bootefi --create-snapshot --label … --verbose`
+> 的输出是（`TESTED(25G76)`，run `41278014136`）：
+>
+> ```text
+> No valid group or volume UUID folder for disk3s1
+> Error looking up UUID folder in preboot
+> Couldn't check if volume /…/ms is ARV
+>    退出码 = 2
+> ```
+>
+> 而 bless 之后 Preboot 全树与之前**逐字节相同**（diff 为空）—— 它一个文件都没写。
+>
+> **所以本节这段脚本（第 B 节第 11 步）必须在 `bless`（第 12 步）之前跑，而且它的
+> 第一条 `mkdir -p "$PBCS"` 不是「兜底」，是 `bless` 的前置条件。**
+> 1.0 的步骤顺序本来就是 11 在 12 之前，所以顺序不用改；要改的是注释里对
+> `mkdir` 的定性，以及第 C.1 节要加一条门禁：**第 12 步之前断言
+> `$PREROOT/$VG/System/Library/CoreServices` 存在。**
+>
+> 顺带读出 `bless` 的两个内部概念（对排障有用）：**ARV = Authenticated Root Volume**；
+> 它还会判断是不是「Pre-SSV to SSV」的迁移情形（我们不是，日志里是
+> `Non-Data-role volume, so not considered Data-Given-Pre-SSV-to-SSV case`）。
 
 **现在能写出的部分（第 B 节第 11 步）：**
 
@@ -1397,6 +1480,63 @@ SYS_DISK=$(whole_of "$SYSROOT"); ROOT_DISK=$(whole_of /)
 > 否则从产物上分不清「没跑」与「跑了但被挡」。
 
 `77` 第 E.2 节记录 UpdateBrain 自己也有同类护栏（`should_prepare_to_snapshot`，RVA `0x3dc7b`，目标 `mountPoint == "/"` 直接报错 1127）。**Apple 自己都加了这道检查，我们没有理由不加。**
+
+#### A.10.2a 1.1 实测：`bless --info` 的字段名，以及 `updatePreboot` 在空卷上的表现
+
+`TESTED(25G76)`，run `41278014136` 的 `C0-bless-experiment.txt`。
+
+**（1）`bless --info <卷> --plist` 的结构（`V-022` 的字段名部分关闭）：**
+
+```xml
+<dict>
+  <key>Auxiliary Partitions</key> <array/>
+  <key>Bless Info</key>
+  <array>
+    <dict><key>Directory ID</key><integer>0</integer>
+          <key>Path</key><string></string>
+          <key>Relative Path</key><string></string></dict>
+    <dict>… 同构的第二项 …</dict>
+  </array>
+  <key>Data Partitions</key>  <array><string>disk3s1</string></array>
+  <key>Preboot Volumes</key>  <array><string>disk3s2</string></array>
+  <key>System Partitions</key><array><string>disk0s1</string></array>
+</dict>
+```
+
+四条读出来的事实：
+
+1. **blessed 信息存在 `Bless Info` 这个两元数组里**，两项分别对应
+   blessed folder 与 blessed file，各自三个键：**`Directory ID`（APFS inode 号）、
+   `Path`、`Relative Path`**。一块没 bless 过的盘上三者分别是 `0` / 空串 / 空串，
+   而运行器自己那块盘上是 `12884902198` / `12884902278` 加完整路径（第 A.6.7 节）。
+   **所以第 C.1 节「这块盘 bless 过没有」的离线判据就是 `Directory ID != 0`。**
+2. `"System Partitions"` 这一项给的是 **ESP**（`disk0s1`），而且在对一块 scratch 盘
+   做 `--info` 时它仍然报运行器自己的 ESP —— 说明这一项来自**固件/系统层面**，
+   不是被问的那个卷的属性。**离线判据不能用它。**
+3. `"Data Partitions"` 这一项给的是**被问的那个卷本身**（我们的 role S 卷 `disk3s1`），
+   不是 Data role 的卷。`bless` 的用词和 `diskutil` 的 role 命名不是一套。
+4. 一个刚建出来的 role S 卷：`"Sealed" => "No"`、`"APFSSnapshot" => false`、
+   `No snapshots for disk3s1`。这是第 A.9 节封印前的基线。
+
+**（2）`diskutil apfs updatePreboot <空的非启动卷>` 失败，错误码已知（`V-023` 部分关闭）：**
+
+```text
+Started APFS operation
+Error: -69808: Some information was unavailable during an internal lookup
+   退出码 = 1
+```
+
+**这个失败是预期的，而且它印证了第 A.6.2 节事实 2 的那条顺序约束。**
+`updatePreboot` 的工作是「把目标卷的 APFS 加密用户与 Open Directory 用户对应起来，
+再用这些信息更新 Preboot」。一块只有三个文件、没有 `var/db/dslocal` 的卷上
+没有任何可对应的东西，所以它在内部查找阶段就返回了。
+
+**对第 B 节的含义：第 10 步（`updatePreboot`）必须在预配用户（`75` 第 5 节往
+Data 卷的 `dslocal` 写用户）之后，而且要带 `-od <DATA挂载点>/private/var/db/dslocal/nodes/Default`。**
+1.0 的脚本本来就是这个顺序、也本来就带 `-od`，所以不用改；要改的是把它从
+「best-effort，失败打 WARN」升级为**「在用户已预配的前提下失败就是真错误」**：
+现在我们知道「没有用户时它一定失败」，所以如果用户已经写进去了它还失败，
+那就是别的问题，不该被 WARN 吞掉。
 
 #### A.10.3 它到底写了什么
 
@@ -2036,6 +2176,32 @@ exit "$FAIL"
 
 **这个实验的产出是本 workflow 最值得期待的一项**，因为它不是「观察一个已经装好的系统」，而是「让 Apple 的工具在一块空盘上从零做一次 Preboot」。两者的差别正是第 A.6.3 节那张表里「现在能写出规格吗」一列的全部缺口。
 
+**1.1 进展：参数顺序修好之后 `convert` 正确解析了，但还差一步。** `TESTED(25G76)`，
+run `41278014136`。它回显了自己的完整意图 —— 这一句本身就是一条证据：
+
+```text
+Rehearsing the conversion of the volume on disk4s1 to an APFS Volume on an APFS
+Container with the addition of a new APFS Preboot Volume based on items at
+/…/preboot-stage plus DiskManagement-gathered crypto items
+Started APFS operation on disk4s1
+Dry run of HFS Volume conversion to an APFS Container with a single APFS Volume
+Exiting conversion operations with error code -69854
+Error: -69854: A disk with a mount point is required
+```
+
+两条读出来的事实：
+
+1. **`-prebootSource` 的语义被 `diskutil` 自己说清了：我们给的件 + 「DiskManagement
+   自己搜集的 crypto 件」。** 这与第 A.6.2 节事实 3 里「自动添加 cryptographic 与
+   EFI rendering 两类件」对上，而且点明了 crypto 那一类是 **DiskManagement 框架**
+   自己凑的，不需要我们提供。
+2. **`-69854`（`A disk with a mount point is required`）：`convert` 要求源 HFS+ 卷
+   处于已挂载状态。** 同一个错误码在同一轮里还出现过一次 —— `diskutil apfs
+   listSnapshots <未挂载的卷>`。**所以这是 `diskutil` 的一类通用前置条件，
+   不是这个动词特有的**，第 C 节的纪律里加一条：凡是要读卷内容的 `diskutil`
+   动词，先 `diskutil mount`。修法就是在 `newfs_hfs` 之后加一条
+   `sudo diskutil mount -mountPoint "$HM" "${DEV2}s1"`，已写进 workflow。
+
 `INFERRED`，三条风险（workflow 里对它们都做 `continue-on-error`）：
 
 | 风险 | 表现 | 退路 |
@@ -2181,6 +2347,9 @@ for path in sys.argv[1:]:
 |---|---|---|---|---|---|
 | **V-031**（新，**现在的第一优先**） | `addVolume … -role D -groupWith <sysvol>` 报 `Error: -69624`，而同一容器上 `-role S`/`-role B`/`-role V` 全成。到底是 role、是成组、还是两者的组合被拒 | `TESTED(25G76)` 现象；`BLOCKED` 原因 | 第 A.3.3a 节的 D2..D7 六条变体阶梯，已写进 `tooling` job | **是**（`tooling`） | **整条装配链。** 没有成组的 Data 卷，firmlink 建不起来（第 A.5.2 节），启动停在早期用户态 |
 | **V-032**（新） | Preboot 卷根上那个 16 字节的 `com.apple.BootInfo` xattr 是什么、谁写的 | `BLOCKED` | `xattr -px com.apple.BootInfo /System/Volumes/Preboot` 的 16 字节原文；与 volume group UUID 比对 | **是**（`preboot`，下一轮加一条） | 不阻塞（我们不写它）。若它是启动链的输入，缺它的表现会是「选择器里没有 macOS」 |
+| **V-020** | `--bootefi` 的「拷贝 boot objects」语义在 `--snapshotname` 下是否同样启用 | `BLOCKED` | 前两轮都没跑到（护栏 bug + 缺 `<UUID>/` 目录）。第三轮的 workflow 里已经是「建目录 → bless → 若失败去掉 `--create-snapshot` → 再试 `--snapshotname`」三段 | **是**（`tooling`） | 不阻塞（第 A.9.3 节用合并的那一条） |
+| **V-021** | `bless` 确切往 Preboot 写了哪些**文件** | **部分关闭**（清单已由第 A.6.7 节给出）；生成行为仍 `BLOCKED` | 已知的新前置条件：`<UUID>/` 目录必须先存在（第 A.6.6 节的 IMPORTANT 块）。第三轮据此重跑 | **是**（`tooling`） | 它决定第 A.6.7 节那张「谁铺什么」净表里 A 类与 B 类的分界线对不对 |
+| **V-023** | `updatePreboot` 在非启动卷上能不能成功 | **部分关闭**：空卷上必然失败（`-69808`，见第 A.10.2a 节）。**预配用户之后能不能成功仍未知** | 第 B 节步 10 的顺序已确认正确；要在一块已预配用户的盘上再跑一次 | 否（要先铺完 Data 卷） | 它决定 Preboot 的登录 UI 与用户元数据那一半能不能铺 |
 | **V-001** | `diskutil apfs createContainer` 会不会替我们把分区类型 GUID 改成 `7C3457EF-…` | ~~`INFERRED`~~ **已关闭，见 E.3.0** | 建完容器 `gpt show <rdisk>` 看 p2 类型。不一致就 `gpt remove` + `gpt add -t …` 重写 | **是**（`tooling`） | 类型不对 OpenCore 可能扫不到 p2。表现是「选择器里没有 macOS」 |
 | **V-002** | `75` §0.0.1（两分区）与 `76` §3.1（三分区）的最终分区数 | 设计冲突 | 由 `75` 或 `76` 下一轮修订定版。**本文第 A.1.1 节已论证这个选择对本文零影响** | 否（文档工作） | 不阻塞本文。影响的是 BaseSystem 恢复环境在不在盘上 |
 | **V-003** | `diskutil info -plist <分区>` 里取容器引用 disk 号的键名是不是 `APFSContainerReference` | `INFERRED` | `diskutil info -plist` 全文落盘后读键名 | **是**（`volumes`） | 不阻塞。第 A.2 节已给确定可用的退路（抓 `createContainer` 的 stdout） |

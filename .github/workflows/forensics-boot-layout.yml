@@ -1340,27 +1340,50 @@ jobs:
             echo "# 上一轮 \`-role D -groupWith \$SYS\` 报 Error: -69624，而同一容器上"
             echo "# -role S / -role B / -role V 三条全成。78 §A.3.3a 列了六条待试变体，"
             echo "# 这里逐条跑，第一条成功的就是生产路径。每条失败后把卷删掉再试下一条。"
+            # 第三轮。第二轮的结果（run 41278014136）已经把问题缩小了一格：
+            #   D1 -role D -groupWith $SYS -nomount  → -69624
+            #   D2            -groupWith $SYS -nomount  → -69624
+            #   D3 -role D -group     $SYS -nomount  → -69624
+            #   D4 -role D -sibling   $SYS -nomount  → -69624
+            #   D5 -role D                 -nomount  → 成功，但不在任何 group 里
+            # 即：role D 本身没问题，**被拒的是成组这个动作**。
+            # 本轮的新变体围绕两个假设，外加一条直接问 apfsd 的探针：
+            #   H1  成组要求 sibling 卷处于**已挂载**状态（前两轮一律给了 -nomount）
+            #   H2  组的锚必须是 Data 那一侧（先建 Data，再把 System 成组到它）
+            #   E0  把失败那一刻 diskutil / apfsd 的统一日志捞出来 —— -69624 是
+            #       diskutil 的通用错误码，真正的原因只可能在 apfsd 那一侧
             DATA=""; DATA_WINNER=""
+            wipe_vols() {   # 清空容器里的全部卷，回到刚 createContainer 的状态
+              local v
+              for v in $(diskutil list "$CNT" 2>/dev/null \
+                         | awk '/APFS Volume/{print $NF}'); do
+                sudo diskutil apfs deleteVolume "$v" >/dev/null 2>&1
+              done
+              return 0
+            }
             drop_data() {
               local d
-              d=$(vol_of "Macintosh HD - Data")
-              [ -n "$d" ] && sudo diskutil apfs deleteVolume "$d" >/dev/null 2>&1
-              d=$(vol_of "Data")
-              [ -n "$d" ] && sudo diskutil apfs deleteVolume "$d" >/dev/null 2>&1
+              for d in $(diskutil list "$CNT" 2>/dev/null \
+                         | awk '/APFS Volume .*Data/{print $NF}'); do
+                sudo diskutil apfs deleteVolume "$d" >/dev/null 2>&1
+              done
               return 0
+            }
+            grouped() {  # grouped <卷> → 该卷在不在某个 volume group 里
+              [ -n "$1" ] || return 1
+              diskutil apfs listVolumeGroups "$CNT" 2>/dev/null | grep -qF "$1"
             }
             try_data() {  # try_data <标签> <addVolume 之后的参数...>
               local tag="$1"; shift
               [ -n "$DATA_WINNER" ] && return 0
-              echo "---- $tag: diskutil apfs addVolume $CNT APFS 'Macintosh HD - Data' $* ----"
+              echo "---- $tag: addVolume $CNT APFS 'Macintosh HD - Data' $* ----"
               sudo diskutil apfs addVolume "$CNT" APFS "Macintosh HD - Data" "$@" 2>&1
-              local rc=$?
-              echo "     退出码 = $rc"
+              echo "     退出码 = $?"
               local d; d=$(vol_of "Macintosh HD - Data")
               if [ -n "$d" ]; then
                 echo "     建出来了：$d"
-                if diskutil apfs listVolumeGroups "$CNT" 2>/dev/null | grep -qF "$d"; then
-                  echo "     ✓ 而且和 $SYS 同组 → 这条可用"
+                if grouped "$d"; then
+                  echo "     OK 而且和 $SYS 同组 → 这条就是生产路径"
                   DATA="$d"; DATA_WINNER="$tag"; return 0
                 fi
                 echo "     × 建出来了但不在任何 volume group 里，不算成功，删掉重试"
@@ -1368,24 +1391,77 @@ jobs:
               fi
               return 0
             }
-            try_data D1 -role D -groupWith "$SYS" -nomount
-            try_data D2            -groupWith "$SYS" -nomount
-            try_data D3 -role D -group     "$SYS" -nomount
-            try_data D4 -role D -sibling   "$SYS" -nomount
-            try_data D5 -role D -nomount
-            if [ -n "$DATA" ] && [ "$DATA_WINNER" = "D5" ]; then
-              echo "---- D5 建出来了但没成组，试 changeVolumeRole + 事后成组 ----"
-              sudo diskutil apfs changeVolumeRole "$DATA" D 2>&1
-              echo "     changeVolumeRole 退出码 = $?"
+
+            echo "---- E0：先复现 D1，然后把统一日志里 diskutil/apfsd 那一段捞出来 ----"
+            T0=$(date -u '+%Y-%m-%d %H:%M:%S')
+            sudo diskutil apfs addVolume "$CNT" APFS "Macintosh HD - Data" \
+                 -role D -groupWith "$SYS" -nomount 2>&1
+            echo "     退出码 = $?（期望 1 / -69624）"
+            drop_data
+            echo "     ---- log show 从 $T0 起，只取 apfs / diskutil / 卷组相关 ----"
+            sudo log show --style compact --start "$T0" 2>/dev/null \
+              | grep -iE 'apfs|diskutil|volume *group|groupWith|69624|addVolume' \
+              | grep -viE 'fseventsd|mds|Spotlight' \
+              | tail -60
+            echo "     ---- 若上面为空，退一步看全部 error 级 ----"
+            sudo log show --style compact --start "$T0" --predicate \
+                 'messageType == 16 OR messageType == 17' 2>/dev/null | tail -30
+
+            echo
+            echo "---- H1：把 sibling 卷挂起来再成组 ----"
+            MSH1="$RUNNER_TEMP/h1"; mkdir -p "$MSH1"
+            sudo mount -o nobrowse -t apfs "/dev/$SYS" "$MSH1" 2>&1
+            echo "     挂载退出码 = $?；mount 回读："
+            mount | grep -F "$SYS" || echo "     （没挂上）"
+            try_data E1 -role D -groupWith "$SYS" -nomount
+            try_data E2 -role D -groupWith "$SYS"
+            sudo diskutil unmount force "$MSH1" 2>/dev/null
+
+            echo
+            echo "---- H2：倒过来 —— 先建 Data，再把 System 成组到它 ----"
+            if [ -z "$DATA_WINNER" ]; then
+              wipe_vols
+              diskutil apfs list "$CNT" 2>&1 | head -20
+              sudo diskutil apfs addVolume "$CNT" APFS "Macintosh HD - Data" \
+                   -role D -nomount 2>&1
+              D2V=$(vol_of "Macintosh HD - Data"); echo "     Data = $D2V"
+              sudo diskutil apfs addVolume "$CNT" APFS "Macintosh HD" \
+                   -role S -groupWith "$D2V" -nomount 2>&1
+              echo "     E3 退出码 = $?"
+              S2V=$(vol_of "Macintosh HD")
+              echo "     System = $S2V"
               diskutil apfs listVolumeGroups "$CNT" 2>&1
+              if grouped "$S2V" && grouped "$D2V"; then
+                echo "     OK E3 成了：组的锚必须是 Data 那一侧"
+                DATA="$D2V"; SYS="$S2V"; DATA_WINNER="E3"
+              fi
             fi
+
+            echo
+            echo "---- H3：容器用 \`diskutil apfs create\`（容器+一个卷）而不是 createContainer ----"
+            if [ -z "$DATA_WINNER" ]; then
+              wipe_vols
+              sudo diskutil apfs deleteContainer "$CNT" 2>&1
+              echo "     deleteContainer 退出码 = $?"
+              sudo diskutil apfs create "${DEV}s2" "Macintosh HD" 2>&1
+              echo "     apfs create 退出码 = $?"
+              CNT=$(container_of "$DEV"); echo "     新 CNT = $CNT"
+              SYS=$(vol_of "Macintosh HD"); echo "     SYS = $SYS"
+              diskutil info "$SYS" 2>&1 | grep -iE 'Role|Group|Case|Sealed'
+              try_data E4 -role D -groupWith "$SYS" -nomount
+              try_data E5            -groupWith "$SYS" -nomount
+            fi
+
+            echo
             echo "DATA_LADDER_WINNER=${DATA_WINNER:-NONE}"
             echo "DATA_VOL=${DATA:-}"
             if [ -z "$DATA_WINNER" ]; then
-              echo "---- 六条全败，留一份诊断：容器与组的当前状态 ----"
+              echo "---- 全败，留一份诊断：容器、组、卷 info 的当前状态 ----"
               diskutil apfs list "$CNT" 2>&1
               diskutil apfs listVolumeGroups "$CNT" 2>&1
-              diskutil info "$SYS" 2>&1 | grep -iE 'Role|Group|Case|Sealed|Filesystem'
+              diskutil info "$SYS" 2>&1 | grep -iE 'Role|Group|Case|Sealed|Filesystem|Owner'
+              echo "---- 运行器自己那个组长什么样（对照）----"
+              diskutil apfs listVolumeGroups 2>&1 | head -30
             fi
 
             echo
@@ -1524,12 +1600,64 @@ jobs:
             sudo find "$MP" 2>/dev/null | sort | tee "$RUNNER_TEMP/pre-before.txt"
 
             echo
-            echo "########## bless --folder … --bootefi --create-snapshot --label … --verbose ##########"
+            echo "########## 第一次 bless：Preboot 里**没有** UUID 目录 ##########"
+            echo "# 上一轮（run 41278014136）这一次的输出是："
+            echo "#     No valid group or volume UUID folder for disk3s1"
+            echo "#     Error looking up UUID folder in preboot"
+            echo "#     Couldn't check if volume … is ARV        → 退出码 2"
+            echo "# 即 bless **不会自己建**那个 <UUID>/ 目录，它要求目录已经在。"
+            echo "# 所以这一次照跑，作为「缺目录时的表现」的基线；真正的实验是第二次。"
             echo "###### 禁止：--setBoot / --mount / --personalize（78 §A.10.2）######"
             sudo bless --folder "$MS/System/Library/CoreServices" \
                        --bootefi --create-snapshot \
                        --label "forensics-scratch" --verbose 2>&1
-            echo "   bless 退出码 = $?"
+            echo "   第一次 bless 退出码 = $?"
+
+            echo
+            echo "########## 建出 bless 要的那个 <UUID>/ 目录，再 bless 一次 ##########"
+            # UUID 取哪一个：bless 的报错说的是「group or volume UUID」。
+            # 有 volume group 就用组 UUID，没有就用系统卷自己的 UUID。两个都打出来。
+            VGU=$(diskutil apfs listVolumeGroups -plist "$CNT" 2>/dev/null \
+                  | plutil -extract Containers.0.VolumeGroups.0.APFSVolumeGroupUUID raw -o - - 2>/dev/null)
+            [ -n "$VGU" ] || VGU=$(diskutil info "$SYS" 2>/dev/null \
+                  | awk -F': *' '/Volume Group UUID/{gsub(/[ \t]+$/,"",$2); print $2; exit}')
+            VOLU=$(diskutil info "$SYS" 2>/dev/null \
+                  | awk -F': *' '/^ *Volume UUID/{gsub(/[ \t]+$/,"",$2); print $2; exit}')
+            echo "   组 UUID = '${VGU:-（无组）}'"
+            echo "   卷 UUID = '${VOLU:-}'"
+            UUID_DIR="${VGU:-$VOLU}"
+            if [ -n "$UUID_DIR" ] && [ -d "$MP" ]; then
+              sudo mkdir -p "$MP/$UUID_DIR/System/Library/CoreServices"
+              echo "   已建 $MP/$UUID_DIR/System/Library/CoreServices"
+              sudo find "$MP" 2>/dev/null | sort > "$RUNNER_TEMP/pre-mid.txt"
+              echo "   ---- 建完目录之后、第二次 bless 之前的 Preboot 全树 ----"
+              cat "$RUNNER_TEMP/pre-mid.txt"
+              echo
+              echo "   ---- 第二次 bless（这一次才是 V-020 / V-021 的真实验）----"
+              sudo bless --folder "$MS/System/Library/CoreServices" \
+                         --bootefi --create-snapshot \
+                         --label "forensics-scratch" --verbose 2>&1
+              echo "   第二次 bless 退出码 = $?"
+              echo
+              echo "   ---- 若仍失败，退一步：只 --folder --bootefi，不要 --create-snapshot ----"
+              if ! sudo find "$MP/$UUID_DIR" -name boot.efi 2>/dev/null | grep -q .; then
+                sudo bless --folder "$MS/System/Library/CoreServices" \
+                           --bootefi --verbose 2>&1
+                echo "   不带 --create-snapshot 的退出码 = $?"
+              fi
+              echo
+              echo "   ---- 再退一步：V-020 的那一半 —— 用 --snapshotname 而不是 --create-snapshot ----"
+              SNAPN=$(diskutil apfs listSnapshots "$MS" 2>/dev/null \
+                      | awk -F': *' '/Snapshot Name/{print $2; exit}')
+              echo "   现有快照名 = '${SNAPN:-（无）}'"
+              if [ -n "$SNAPN" ]; then
+                sudo bless --folder "$MS/System/Library/CoreServices" \
+                           --bootefi --snapshotname "$SNAPN" --verbose 2>&1
+                echo "   --snapshotname 的退出码 = $?"
+              fi
+            else
+              echo "   取不到 UUID 或 Preboot 没挂上，第二次 bless 跳过"
+            fi
 
             echo
             echo "########## V-021：bless 之后的 Preboot 全树 ##########"
@@ -1615,6 +1743,17 @@ jobs:
             diskutil info "${DEV2}s1" 2>&1 | grep -iE 'Type \(Bundle\)|Name|Mounted|Mount Point'
 
             echo
+            echo "########## 把 HFS+ 卷挂起来 —— convert 要求它有挂载点 ##########"
+            # 上一轮（run 41278014136）参数顺序修好之后，convert 已经正确解析并回显了
+            # 它的完整意图，但接着报 -69854: A disk with a mount point is required。
+            # 同一个错误码上一轮也出现在 `listSnapshots <未挂载的卷>` 上。
+            HM="$RUNNER_TEMP/hfsmnt"; mkdir -p "$HM"
+            sudo diskutil mount -mountPoint "$HM" "${DEV2}s1" 2>&1
+            echo "   diskutil mount 退出码 = $?"
+            mount | grep -F "${DEV2#/dev/}s1" || echo "   （没挂上，下面的 convert 会再报 -69854）"
+            diskutil info "${DEV2}s1" 2>&1 | grep -iE 'Mounted|Mount Point|Volume Name'
+
+            echo
             echo "########## 暂存目录（给之前是空的）##########"
             ls -lahO@R "$STAGE" 2>&1
 
@@ -1649,6 +1788,7 @@ jobs:
               diskutil apfs list 2>&1 | sed -n '1,80p'
             fi
 
+            sudo diskutil unmount force "$HM" 2>/dev/null
             hdiutil detach "$DEV2" 2>/dev/null
           ) > out/C1-prebootsource.txt 2>&1
           cat out/C1-prebootsource.txt
