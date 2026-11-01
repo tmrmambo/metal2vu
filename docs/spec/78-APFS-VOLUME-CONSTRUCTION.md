@@ -34,8 +34,28 @@ x86_64 / SIP disabled / `Apple Paravirtual device`）。**结果是四条规格�
 `V-030`（新增，`gpt` EPERM 的根因）。
 
 **仍未关闭：** `V-002`、`V-004`、`V-005`、`V-008`、`V-011`…`V-013`、`V-015`（部分）、
-`V-018`、`V-019`、`V-020`、`V-022`（部分）、`V-023`（部分）、`V-028`、`V-031`、`V-032`。
-逐条见第 E 节的表。
+`V-018`、`V-019`、`V-022`（部分）、`V-023`（部分）、`V-028`、`V-032`、`V-033`、
+**`V-034`（新，现在的第一优先）**。逐条见第 E 节的表。
+
+> [!CAUTION]
+> **1.1 的最后一轮取证（run `41279550835`）发现了一条改变路径优先级的硬限制：**
+> **`bless --create-snapshot` 要求目标卷已经是 ARV（Authenticated Root Volume），
+> 所以 `bless` 封不了第一次印。**
+>
+> ```text
+> Can't use snapshot options on non ARV volume
+> Snapshot manipulation failed
+>    退出码 = 2
+> ```
+>
+> 不带快照选项的 `bless` 则**退出码 0**，并把三个文件正确铺进 Preboot
+> （`boot.efi` + `.disk_label` + `.disk_label_2x`，第 A.10.2c 节有逐字节清单）。
+>
+> **即：第 A 节的十层里，现在只有「封印」这一层没有已验证的自建手段。**
+> 三条候选解（`asr` 克隆 / 自己调 `fs_snapshot` / 干脆不要 ARV 靠
+> `CSR_ALLOW_UNAUTHENTICATED_ROOT`）在第 A.10.2c 节逐条给出。
+> 这也把 `75` 的 R1（`asr` 克隆运行器）从「先做的那条」升级为
+> **「唯一已知能产出 ARV 的那条」**。
 
 **三轮取证之间自己踩的坑，一并记在这里，因为它们各自浪费了一整轮：**
 
@@ -1029,6 +1049,13 @@ ESP:\EFI\OC\OpenCore.efi
 
 `bless(8)` 的 Mount Mode 一节对 `--bootefi` 的说明是一句话：**当给了 `--create-snapshot` 或 `--last-sealed-snapshot` 时，它启用「拷贝所需的 boot objects」**。Folder Mode 一节对同一选项的说明是另一件事：在被 bless 的目录里用给定的源文件创建一个 `boot.efi`，不给源文件时用默认源（**按相对于被 bless 的挂载点的路径**），并说明这是为了确保用的 `boot.efi` 与目标卷上的 OS 兼容。
 
+> [!CAUTION]
+> **1.1 实测：下面这条「一条命令做四件事」的结论只在目标卷已经是 ARV 时成立。**
+> 在一块从零建出来的卷上，`--create-snapshot` 被直接拒绝
+> （`Can't use snapshot options on non ARV volume`，退出码 2），
+> 而**去掉快照选项的那一半照常工作**（退出码 0，三个文件正确铺进 Preboot）。
+> 详见第 A.10.2c 节与 `V-034`。所以下面的第 3 项（封印）**要从这条命令里拆出去**。
+
 **合起来读出的结论（`INFERRED`，但两段手册互相印证）：`bless --folder <sysvol>/System/Library/CoreServices --bootefi --create-snapshot` 这一条命令同时做四件事：**
 
 1. 把 `boot.efi` 从默认源（相对挂载点的路径，即 `<sysvol>/usr/standalone/i386/boot.efi`，见第 A.6.4 节）拷到位；
@@ -1420,8 +1447,8 @@ The blessed volume in this APFS container is /dev/disk1s5, which is not mounted.
 
 | 类 | 件 | 谁铺 |
 |---|---|---|
-| **A. `bless` 铺** | `boot.efi`、`.disk_label`、`.disk_label_2x`、`.disk_label.contentDetails`、`.root_uuid`、blessed 记录 | `bless --folder … --bootefi --create-snapshot --label …`（第 A.10 节） |
-| **B. 我们铺** | `SystemVersion.plist`、`PlatformSupport.plist`、`BridgeVersion.{bin,plist}`、`boot/System/Library/KernelCollections/BootKernelExtensions.kc`、`System/Library/Caches/com.apple.corestorage/EFILoginLocalizations/` | 第 A.6.6 节的脚本。**1.0 漏了 `BridgeVersion.*` 与 BKC 副本这两项** |
+| **A. `bless` 铺** | **只有三个**：`boot.efi`、`.disk_label`（941 B、`UF_HIDDEN`）、`.disk_label_2x`（3773 B、`UF_HIDDEN`），外加 blessed 记录。**`TESTED(25G76)`，见第 A.10.2c 节** | `bless --folder … --bootefi --label …`（**不带** `--create-snapshot`，理由见 A.10.2c） |
+| **B. 我们铺** | `SystemVersion.plist`、`PlatformSupport.plist`、`BridgeVersion.{bin,plist}`、`boot/System/Library/KernelCollections/BootKernelExtensions.kc`、`System/Library/Caches/com.apple.corestorage/EFILoginLocalizations/`、**`.disk_label.contentDetails`**、**`.root_uuid`** | 第 A.6.6 节的脚本。**1.0 漏了 `BridgeVersion.*` 与 BKC 副本；1.1 第一版又错把后两项算进 A 类** |
 | **C. 不铺** | 全部 `*.im4m`（8×N 份票据）、`Firmware/`、`restore/`、`PreLoginData/`、`var/db/*Info.plist`、`com.apple.BootInfo` xattr | 票据在 SIP/AMFI 全关 + `SecureBootModel = Disabled` 下不被校验（第 0.2 节）；`PreLoginData` 是运行期产物；`var/db/*Info.plist` 由 `updatePreboot` 生成 |
 | **D. 待定** | `Cryptexes/`（Preboot 卷根下）、`cryptex1/current/` | `V-015`。**第 A.6.6 节第 5 步继续留空** |
 
@@ -1700,14 +1727,107 @@ Couldn't bless the APFS preboot volume for volume mounted at …: No such file o
 所以 `bless` 被指向一个没有 system role 的卷。`vol_of` 已修成精确匹配，
 **下一轮才是 `V-021` 的最终答案**。
 
+#### A.10.2c `V-021` 的最终答案，以及一条新的硬限制：`bless` 封不了第一次印
+
+`TESTED(25G76)`，run `41279550835`。这一轮四个卷的 role 与分组都对、Preboot 的
+`<VG_UUID>/System/Library/CoreServices` 事先建好、`boot.efi` 事先铺好。两个结果：
+
+**（1）不带快照选项的 `bless` 成功（退出码 0），而且它写进 Preboot 的东西**
+**只有三个文件**（`V-021` 关闭）：
+
+```text
+<VG_UUID>/System/Library/CoreServices/.disk_label       941 字节  0644 root:wheel  flags=0x8000
+<VG_UUID>/System/Library/CoreServices/.disk_label_2x   3773 字节  0644 root:wheel  flags=0x8000
+<VG_UUID>/System/Library/CoreServices/boot.efi       723512 字节  0644 root:wheel  flags=0
+```
+
+`0x8000` = `UF_HIDDEN`。两个 label 文件在系统卷那一侧还额外带一个 32 字节的
+`com.apple.FinderInfo` xattr（`ls -lahO@` 可见），Preboot 那一侧没有。
+
+**`bless` 没有写的（这一条比写了什么更重要）：**
+
+| 第 A.6.7 节清单里的件 | `bless` 写吗 | 那谁写 |
+|---|---|---|
+| `.disk_label`、`.disk_label_2x`、`boot.efi` | **写** | — |
+| **`.disk_label.contentDetails`** | **不写** | 待查。最可能是 `updatePreboot`，否则就得我们自己写（它是纯文本） |
+| **`.root_uuid`** | **不写** | 同上。名字自明，内容应当是系统卷的 Volume UUID，**我们自己写得出来** |
+| `SystemVersion.plist`、`PlatformSupport.plist` | **不写** | **我们自己铺**（第 A.6.6 节第 1 步，本来就是这么写的） |
+| `BridgeVersion.bin`、`BridgeVersion.plist` | **不写** | 我们自己铺 |
+| `boot/System/Library/KernelCollections/BootKernelExtensions.kc` | **不写** | 我们自己铺 |
+| `System/Library/Caches/com.apple.corestorage/EFILoginLocalizations/` | **不写** | 我们自己铺，或 `updatePreboot` |
+
+**所以第 A.6.7 节那张「谁铺什么」净表要改一处：A 类从 6 项缩到 3 项，
+`.disk_label.contentDetails` 与 `.root_uuid` 移到 B 类（我们铺）。**
+
+`bless --info --plist` 在成功之后的回读（`V-022` 的字段语义进一步明确）：
+
+```xml
+<key>Bless Info</key>
+<array>
+  <dict><key>Directory ID</key><integer>24</integer>
+        <key>Path</key><string>/…/mp/9BF59C23-…/System/Library/CoreServices/boot.efi</string>
+        <key>Relative Path</key><string>/9BF59C23-…/System/Library/CoreServices/boot.efi</string></dict>
+  <dict><key>Directory ID</key><integer>21</integer>
+        <key>Path</key><string>/…/mp/9BF59C23-…/System/Library/CoreServices</string>
+        <key>Relative Path</key><string>/9BF59C23-…/System/Library/CoreServices</string></dict>
+</array>
+```
+
+**`Relative Path` 是相对 Preboot 卷根的路径** —— 这是第 C.1 节最好用的那条离线判据：
+`Bless Info` 的两项 `Directory ID` 都非 0，且 `Relative Path` 以 `/<VG_UUID>/` 开头。
+另外 `diskutil info -plist <系统卷>` 里的键名是 **`APFSVolumeGroupID`**，值与 Data 卷的
+Volume UUID 相同（第 A.3.3a 节）。
+
+**（2）带 `--create-snapshot` 的 `bless` 失败，而且失败原因是一条此前完全没有的限制：**
+
+```text
+Can't use snapshot options on non ARV volume
+Snapshot manipulation failed
+Couldn't bless the APFS preboot volume for volume mounted at …: No such file or directory
+   退出码 = 2
+```
+
+> [!CAUTION]
+> **`bless --create-snapshot` 要求目标卷**已经**是 ARV（Authenticated Root Volume）。
+> 一个刚建出来、从未封印过的 APFS 卷不是 ARV，所以 `bless` 封不了第一次印。**
+>
+> 这解释了为什么第 0.2 节引的 OCLP 那条命令能用：**OCLP 操作的是一块已经是 ARV 的盘**
+> —— 它只是在一个已封印的卷上**再**造一个（破封的）快照。
+> 「从零建卷 → 铺内容 → `bless --create-snapshot` 封印」这条路**在 `bless` 这一层走不通**。
+>
+> 登记为 **`V-034`，它取代 `V-031` 成为现在的第一优先。**
+
+**`V-034` 的三条候选解，按可行性：**
+
+| # | 做法 | 为什么可能 | 代价 |
+|---|---|---|---|
+| **S1** | **`asr restore --toSnapshot <源的封印快照 UUID> --erase`**，即 `75` 的 R1 路径 | `75` 第 2.3.2 节已引手册：目标是分区且带 `--erase` 时，**被恢复的卷连同 Preboot/Recovery 一起从源复制**。源是一块已封印的 ARV 卷，**ARV 这个属性随块级复制一起过来** —— 这正是「第一次印」的来源 | 产出的 build 是源那一版（运行器的 25G76，不是 25G325）。**但它不需要我们自己封印** |
+| **S2** | 自己调 `fs_snapshot` 系统调用：`fs_snapshot_create` 之后 `fs_snapshot_root` | `77` 第 D.3 节已证 UpdateBrain 的封印就是 `-[LPStaticAPFSVolume createSnapshot:error:]`（RVA `0x145024`）里一条 `fs_snapshot_create(2)`，**不签名不联网**。`fs_snapshot` 的 op 里有 `SNAPSHOT_OP_ROOT`，正是「把某个快照设成卷的 root snapshot」 | 要写一个几十行的 C 程序。**而且 `fs_snapshot_create` 能不能在一个非 ARV 卷上把它变成 ARV，未知** —— 这是 S2 的核心风险 |
+| **S3** | 不要 ARV：让 `boot.efi` 直接从卷（而不是快照）启动，靠 `csr-active-config` 的 bit 11（`CSR_ALLOW_UNAUTHENTICATED_ROOT`）放行 | 第 0.2 节的研发期设定本来就是 SIP/AMFI 全关。而 bit 11 的用途正是「允许启动一个未经认证的根」。Catalina 之前的 macOS 本来就是从卷启动的 | **只能启动才知道**，与 `V-025` 同级。若成立，整条封印问题消失；若不成立，表现是禁止符号 |
+
+**三条之间不互斥，而且第一块盘的正解很可能是 S1 + S3 并行验证：**
+走 R1（`asr`）拿到一块必然能启动的盘作为基线，同时在同一轮里造一块 S3 形态（无快照）的盘，
+对照启动结果。这把「ARV 到底是不是必须的」这个问题用一次 E0-L1 同时答掉。
+
+**这一条对 `75`/`77` 的影响，必须写清：**
+
+- **`75` 的 R1（`asr` 克隆运行器）从「先做的那条」升级为「唯一已知能产出 ARV 的那条」。**
+  它不再只是「简单」，而是**承载了第一次封印**。
+- **`77` 的 R6（UpdateBrain）价值上升：** 它是唯一能既产出 25G325、又自带封印的路径。
+  原来的判断是「R6 的价值只在 build 保真」，现在要加一句「以及它自己会封印」。
+- **`78` 第 A.9 节（快照层）的规格不变**（它描述的是封印后的状态），
+  但第 A.10.1 节那条「`bless --folder … --bootefi --create-snapshot` 一条命令做四件事」
+  要加限定：**只在目标已是 ARV 时成立。**
+
 #### A.10.3 它到底写了什么
 
 **这是第 D 节最想回答的问题之一。现在能说的：**
 
 | 层 | 写了什么 | 标签 |
 |---|---|---|
-| **Preboot 卷** | `<VG_UUID>/System/Library/CoreServices/boot.efi` + 其余 boot objects（`--bootefi` + `--create-snapshot` 的组合语义）；`.disk_label` 与 `.disk_label_2x`（`--label` 渲染） | `KNOWN` 机制；`BLOCKED` 确切文件清单 → `V-021` |
-| **System 卷的 APFS 字段** | root snapshot 指针（`--create-snapshot` 的「设为该卷的 root snapshot」）；blessed 目录/文件的记录 | `KNOWN` 语义；`BLOCKED` 具体是哪些 APFS 字段 → `V-022` |
+| **Preboot 卷** | **恰好三个文件**：`<VG_UUID>/System/Library/CoreServices/` 下的 `boot.efi`（723,512 B、flags 0）、`.disk_label`（941 B、`UF_HIDDEN`）、`.disk_label_2x`（3773 B、`UF_HIDDEN`），全部 `0644 root:wheel` | **`TESTED(25G76)`**，`V-021` 已关闭，逐项 stat 见第 A.10.2c 节 |
+| **System 卷的 `CoreServices`** | **同样的两个 label 文件**（941 / 3773 字节，`UF_HIDDEN`，另带 32 字节 `com.apple.FinderInfo` xattr）。1.0 完全没有这一行 | `TESTED(25G76)` |
+| **System 卷的 APFS 字段** | blessed 目录/文件各记成一个 `Directory ID`（APFS inode）+ `Path` + `Relative Path`，后者相对 **Preboot 卷根**。本次的值是 `24`（`boot.efi`）与 `21`（`CoreServices`）。**root snapshot 指针没写** —— `--create-snapshot` 在非 ARV 卷上被拒 | `TESTED(25G76)`，字段名已关闭；root snapshot 那一半 → `V-034` |
 | **HFS+ 卷头** | 手册明说 Folder Mode 在 HFS+ 卷上更新卷头。**我们是 APFS，这一条不适用** | `KNOWN` |
 | **固件 NVRAM** | **不写。** 只有 `--setBoot` 才写，而我们禁止它 | `KNOWN` |
 
@@ -1965,20 +2085,46 @@ sudo chown -R root:wheel "$MNT_PRE/$VG"
 # V-015：Preboot 卷根下的 Cryptexes/ 待第 D 节取证后补。不要猜着铺。
 
 # ══════════════════════════ 封印线 ══════════════════════════
+# 1.1 注：在 S3 形态（无快照，V-034）下这条线不再有技术约束 —— 没有快照，
+# 也就不存在「改了不进快照」的问题。但**纪律上仍然保留它**：一旦 V-034 走通
+# S1 或 S2，这条线立刻又变成硬约束，而那时才发现脚本里有越线的写操作就太晚了。
 # 这一行以下不得再写 System 卷。步 12 的快照一旦建成，
 # 后续对 System 卷的任何改动都不进快照 = 改了等于没改（A.9.4 末行）。
 # ═══════════════════════════════════════════════════════════
 
-# ───────── 步 12：bless + 快照（A.9、A.10）—— 一条命令做四件事 ─────────
+# ───────── 步 12：bless（A.10）。封印拆出去成了步 12b ─────────
 # 工具：bless(8)（自带）。禁止 --setBoot / --mount / --personalize（A.10.2）。
-# 失败表现：Can't use last-sealed-snapshot or create-snapshot on non system volume
-#           → role S 没设对，或容器建坏了（A.9.2）。
-log "12  bless --bootefi --create-snapshot"
+# 前置条件（A.6.6 的 IMPORTANT 块）：$MNT_PRE/$VG/System/Library/CoreServices 必须已存在，
+#   否则 bless 报 "No valid group or volume UUID folder" 并且一个文件都不写。
+# !! 1.1 实测：**不要带 --create-snapshot**。一块从零建出来的卷不是 ARV，
+#    带上它会被拒（"Can't use snapshot options on non ARV volume"，退出码 2），
+#    而且连前面那些该写的文件也一起不写。去掉之后退出码 0（A.10.2c / V-034）。
+log "12  bless --bootefi（不带快照选项）"
+test -d "$MNT_PRE/$VG/System/Library/CoreServices" \
+  || { echo "FATAL: Preboot 里没有 $VG/System/Library/CoreServices，bless 会失败"; exit 1; }
 sudo bless --folder "$MNT_SYS/System/Library/CoreServices" \
            --bootefi \
-           --create-snapshot \
            --label "$LABEL" \
            --verbose
+# 立刻验 bless 真的写进去了（A.10.2c 的三个文件）
+for f in boot.efi .disk_label .disk_label_2x; do
+  test -f "$MNT_PRE/$VG/System/Library/CoreServices/$f" \
+    || { echo "FATAL: bless 没在 Preboot 里写出 $f"; exit 1; }
+done
+
+# ───────── 步 12b：封印（A.9）—— 这一层目前没有已验证的自建手段 ─────────
+# V-034：bless 封不了第一次印。三条候选解在 A.10.2c：
+#   S1  走 75 的 R1（asr restore --toSnapshot … --erase），ARV 随块级复制过来。
+#       这条路下，本脚本的步 2..12 都不用跑 —— asr 把整个卷组连 Preboot 一起复制。
+#   S2  自己写一个调 fs_snapshot_create + fs_snapshot_root 的小程序。
+#   S3  干脆不要 ARV，靠 csr-active-config 的 bit 11 放行从卷（非快照）启动。
+# 本脚本按 S3 走：**什么都不做**，并把这个事实打出来，让 80 的 E0-L1 去判。
+log "12b 封印（V-034：按 S3 形态，不建快照）"
+echo "NOTE(V-034): 本块盘没有 root snapshot，按 S3 形态启动。"
+echo "             需要 csr-active-config bit 11 (CSR_ALLOW_UNAUTHENTICATED_ROOT)，"
+echo "             71 §6.7 的 NVRAM/Add 里 0xFEF 已包含它。"
+diskutil apfs listSnapshots "$MNT_SYS" 2>&1 || true
+diskutil info "$SYS" | grep -iE 'Sealed|Snapshot' || true
 
 # ───────────────── 步 13：离线验证（C.1 的 verify-image.sh）─────────────────
 log "13  离线验证"
@@ -2460,6 +2606,37 @@ for path in sys.argv[1:]:
 
 **所以本文的裁决不依赖 `77` 的 `U-001`。** 两者的交集只在「cryptex 的内容怎么铺」这一格，而那一格的第一选择是「把 x86_64 cryptex 的内容铺到 Preboot 卷上、建三个符号链接、不要 ticket」（第 A.6.5 节末段），**不是**「让 UpdateBrain 替我们签」。
 
+### E.1a 1.1 对裁决的修正：档位不变，但「唯一真正缺的那一层」换了
+
+**1.0 的裁决是第二档（「不够，但缺的全在取证范围内」），1.1 维持这个档位。**
+四轮取证把第 A 节的十层里九层从「机制已知」推到「命令已验」。
+**但它同时发现缺口不在原来认为的地方。**
+
+| 1.0 认为缺的 | 1.1 的结果 |
+|---|---|
+| Preboot 卷根下还有什么、`<UUID>/` 下的完整清单 | **拿到了**，679 条逐项（第 A.6.7 节）。连 `bless` 写哪三个、我们写哪七个都分清了 |
+| `bless` 到底写了哪些文件、哪些 APFS 字段 | **拿到了**（第 A.10.2c 节）。文件三个、字段是 `Bless Info` 的 `Directory ID`/`Path`/`Relative Path` |
+| cryptex 的结构与形态 | **形态拿到了**（sealed DMG + root_hash + trustcache + 8 个 board 的 apticket），**内容怎么铺仍缺**（`V-015`） |
+
+**1.1 新发现的那一层，是 1.0 整节都当成「已解决」的那一层：封印。**
+
+> **`bless --create-snapshot` 要求目标卷已经是 ARV。一块从零建出来的卷不是，
+> 所以 `bless` 封不了第一次印（`V-034`，第 A.10.2c 节）。**
+
+**这不改变档位，因为三条候选解里有两条在 CI 范围内**（S1 走 `asr`、S2 写一个调
+`fs_snapshot` 的小程序），**第三条（S3：干脆不要 ARV）本来就属于「只能启动才知道」
+的那一类，和 `V-025` 是同一级。**
+
+**它改变的是路径优先级：**
+
+1. **第一块盘走 `75` 的 R1（`asr restore --toSnapshot … --erase`）。**
+   它从「先做的那条」升级为「唯一已知能产出 ARV 的那条」。
+2. **同一轮里并行造一块 S3 形态（无快照）的盘**，用同一次 E0-L1 把
+   「ARV 到底是不是必须的」答掉。这两块盘的差别只有一个快照，
+   所以它是一次干净的对照实验。
+3. **本文第 B 节那段从零装配的脚本仍然全部有用** —— 它产出的就是 S3 形态那一块。
+   步 12b 已经把「这块盘没有 root snapshot」显式打出来，不是悄悄跳过。
+
 ### E.2 不要绕的三个弯
 
 **（1）不要等 R6（UpdateBrain）。** `77` 第 F 节的裁决是「在 `U-001` 关掉之前，R6 既不能排期也不能宣布可行」。本文的路径与 R6 并行、不依赖它。**R6 的价值在 build 保真（25G325 而不是运行器的 25G76），不在「只有它能造出可启动的卷」。** 本文的路径同样产出 25G325，因为它的素材是 payload 本身。
@@ -2514,6 +2691,7 @@ for path in sys.argv[1:]:
 
 | # | 问题 | 标签 | 查清方法 | 在 D 节范围内 | 阻塞什么 |
 |---|---|---|---|---|---|
+| **V-034**（新，**现在的第一优先**） | 一个从零建出来的卷怎么变成 ARV。`bless --create-snapshot` 明确拒绝（`Can't use snapshot options on non ARV volume`） | `TESTED(25G76)` 现象；`BLOCKED` 解法 | 第 A.10.2c 节的三条候选：S1 `asr restore --toSnapshot --erase`（最可行，`75` 的 R1）／S2 自己调 `fs_snapshot_create` + `fs_snapshot_root`／S3 不要 ARV，靠 `csr-active-config` bit 11 | S1 **是**（`bake` job）；S2 **是**（写个小 C 程序）；S3 **否**（只能启动才知道） | **第 A.9 节整层。** 这是现在唯一没有已验证自建手段的一层 |
 | **V-033**（新） | `bless` 判断「volume group 里有没有一个与**当前运行的 macOS** 兼容的 System role 卷」。在 25G76 的运行器上 bless 一块 25G325 的盘，这条检查怎么判 | `BLOCKED` | 下一轮：对一块铺了 25G325 payload 的 scratch 卷跑 `bless --verbose`，看这一行的措辞 | **是**（`tooling`） | 若它拒绝跨版本，`75` 的 R6（UpdateBrain 产 25G325）就必须自己完成 bless，不能靠运行器的 `bless`。**R1 路径不受影响**（源就是运行器自己） |
 | ~~**V-031**~~ | ~~`-role D -groupWith` 被拒~~ | **已解决**，见第 A.3.3a 节 | 根因：`apfs_newfs: A Non-sealed system sibling volume is not allowed`。解法：先建 Data，再建 System 并 `-groupWith` 它 | — | — |
 | **V-032**（新） | Preboot 卷根上那个 16 字节的 `com.apple.BootInfo` xattr 是什么、谁写的 | `BLOCKED` | `xattr -px com.apple.BootInfo /System/Volumes/Preboot` 的 16 字节原文；与 volume group UUID 比对 | **是**（`preboot`，下一轮加一条） | 不阻塞（我们不写它）。若它是启动链的输入，缺它的表现会是「选择器里没有 macOS」 |
