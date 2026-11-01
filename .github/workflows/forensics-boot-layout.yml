@@ -185,7 +185,7 @@ jobs:
             echo "########## 按挂载点 / （封印系统的正确问法）##########"
             diskutil apfs listSnapshots / 2>&1
             echo
-            echo "########## 按卷设备 $SYSVOL（上一轮失败的那条，留作对照）##########"
+            echo "########## 按卷设备 ${SYSVOL}（上一轮失败的那条，留作对照）##########"
             diskutil apfs listSnapshots "$SYSVOL" 2>&1
             echo
             echo "########## mount 看 / 到底挂的是哪个设备 ##########"
@@ -1325,7 +1325,7 @@ jobs:
               echo "---- 结果 ----"
               diskutil info "${DEV}s1" 2>&1 | grep -iE 'Type \(Bundle\)|Name|Partition Type|Mounted|Mount Point'
             else
-              echo "（这一级阶梯没有 s1 分区，跳过。WINNER=$WINNER）"
+              echo "（这一级阶梯没有 s1 分区，跳过。WINNER=${WINNER}）"
             fi
 
             echo
@@ -1608,7 +1608,7 @@ jobs:
           fi
           if [ "$SD" = "$RD" ]; then
             {
-              echo "FATAL: scratch 卷与 / 在同一块物理盘上（都是 $SD），拒绝 bless"
+              echo "FATAL: scratch 卷与 / 在同一块物理盘上（都是 ${SD}），拒绝 bless"
             } > out/C0-bless-experiment.txt 2>&1
             cat out/C0-bless-experiment.txt
             sudo diskutil unmount force "$MP" 2>/dev/null

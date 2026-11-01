@@ -34,6 +34,25 @@ except Exception:
 
 EXPR = re.compile(r"\$\{\{[^}]*\}\}")
 
+# `$NAME` 紧跟一个非 ASCII 字符 —— bash -n 抓不到，但它在运行时一定错。
+#
+# 由来：nested-boot 的 space job 写了 `echo "退出码 = $rc（1 = 没腾到目标）"`，
+# 运行器上报 `rc（: unbound variable` 然后整步失败。UTF-8 locale 下的 bash 把
+# 全角括号当成了标识符字符，于是变量名被读成 `rc（`。
+#
+# 本项目所有注释与提示都是中文，这个形状随手就会写出来，而代价是一次
+# CI 往返（macOS runner 一轮几十分钟）。没有 set -u 的步骤里它更坏：
+# 不报错，静默展开成空串，于是日志里的数字是错的而没人知道。
+# 正确写法一律是 `${rc}`。
+# 前面的 (?<!\\) 是为了放过 `\$RAW` 这种转义写法：它原样打印一个美元号，
+# 不展开，所以紧跟全角字符没有任何问题。
+VAR_THEN_WIDE = re.compile(r"(?<!\\)\$([A-Za-z_][A-Za-z0-9_]*)([^\x00-\x7f])")
+
+# 整行注释里的 `$VAR（` 也不展开。只放过「整行注释」这一种：行内 `#` 之后的
+# 注释要准确判断得先知道引号状态，不值得为它写一个 shell 词法分析器 ——
+# 而且那种情况下改成 ${VAR} 本来也无害。
+COMMENT_LINE = re.compile(r"^\s*#")
+
 
 def find_bash() -> str | None:
     found = shutil.which("bash")
@@ -67,7 +86,7 @@ def main(argv: list[str]) -> int:
         print("没有找到要检查的 workflow")
         return 1
 
-    total = bad = 0
+    total = bad = wide = 0
     for path in paths:
         with open(path, encoding="utf-8") as fh:
             doc = yaml.safe_load(fh)
@@ -90,16 +109,32 @@ def main(argv: list[str]) -> int:
                 )
             finally:
                 os.unlink(tmp)
-            if proc.returncode == 0:
+            hits = []
+            for lineno, line in enumerate(script.splitlines(), 1):
+                if COMMENT_LINE.match(line):
+                    continue
+                for m in VAR_THEN_WIDE.finditer(line):
+                    hits.append((lineno, m.group(1), m.group(2), line.strip()))
+
+            if proc.returncode == 0 and not hits:
                 print(f"  [√] {job} / 步 {idx}  {name}")
-            else:
+                continue
+
+            print(f"  [×] {job} / 步 {idx}  {name}")
+            if proc.returncode != 0:
                 bad += 1
-                print(f"  [×] {job} / 步 {idx}  {name}")
                 for line in (proc.stdout + proc.stderr).splitlines():
                     print(f"        {line}")
+            for lineno, var, ch, text in hits:
+                wide += 1
+                print(
+                    f"        第 {lineno} 行  ${var} 后面紧跟 {ch!r} "
+                    f"→ bash 会把变量名读成 `{var}{ch}`，改写成 ${{{var}}}"
+                )
+                print(f"          {text}")
 
-    print(f"\n{total} 个 run 块，{bad} 个有语法错")
-    return 1 if bad else 0
+    print(f"\n{total} 个 run 块，{bad} 个有语法错，{wide} 处 $变量紧跟全角字符")
+    return 1 if (bad or wide) else 0
 
 
 if __name__ == "__main__":

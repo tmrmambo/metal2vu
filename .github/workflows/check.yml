@@ -129,7 +129,7 @@ jobs:
 
       # workflow 里内嵌了几百行 bash。一个括号配错就是一次 CI 往返
       # （macOS runner 上 forensics 那个 job 一轮 45 分钟）。
-      - name: workflow 内嵌 shell 的语法检查
+      - name: workflow 内嵌 shell 的检查（bash -n，外加 $变量紧跟全角字符）
         run: |
           set -euo pipefail
           python3 -m pip install --quiet pyyaml

@@ -1018,7 +1018,7 @@ jobs:
               sudo chmod 644        "/Volumes/TGTDATA/Library/LaunchDaemons/net.metal2vu.$s.plist"
               echo "installed $s"
             else
-              echo "::warning::缺 $SH 或 $PL，未安装 $s"
+              echo "::warning::缺 ${SH} 或 ${PL}，未安装 ${s}"
               missing="${missing}${s} "
             fi
           done

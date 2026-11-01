@@ -259,6 +259,101 @@ jobs:
           if-no-files-found: warn
 
   # ===========================================================================
+  # installer-source —— 嵌套可用之后，下一步是在 guest 里跑 Apple 自己的安装器。
+  #                     那条路最大的好处是封印、Preboot、bless 全由 Apple 的
+  #                     带票二进制在**它自己的环境里**完成，我们一个字节都不用伪造
+  #                     （78 §A.10.2d-bis：运行器上 fs_snapshot_create 返回 EPERM，
+  #                     因为 bless/asr 带的那张 com.apple.private.vfs.snapshot
+  #                     我们拿不到；而安装器环境里那些二进制是现成的）。
+  #
+  #                     所以先问一句：安装介质从哪儿来。三个候选都是只读探查，几秒钟。
+  # ===========================================================================
+  installer-source:
+    name: installer-source (安装介质从哪儿来)
+    runs-on: macos-26-intel
+    timeout-minutes: 20
+    steps:
+      - name: 候选一  softwareupdate 的官方全量安装器列表
+        run: |
+          set -uo pipefail
+          mkdir -p out
+          echo "---- softwareupdate --list-full-installers ----"
+          # 这是 Apple 官方通道。拿到的是 Install macOS *.app（约 15 GB），
+          # 之后 createinstallmedia 就能做出可引导介质。
+          softwareupdate --list-full-installers 2>&1 | tee out/full-installers.txt
+          echo
+          echo "---- 本机版本（对照：能不能拿到跟 25G325 同版本的）----"
+          sw_vers
+          exit 0
+
+      - name: 候选二  Preboot 里的 restore 目录（asr-probe 里见过它）
+        run: |
+          set -uo pipefail
+          mkdir -p out
+          PRE=$(diskutil info -plist / | plutil -extract DeviceIdentifier raw -o - - \
+                | sed -E 's/s[0-9]+s[0-9]+$//')
+          echo "root 所在容器的 Preboot 挂载点（系统自己挂在 /System/Volumes/Preboot）"
+          ls -la /System/Volumes/Preboot/ 2>&1 | head -20
+          for d in /System/Volumes/Preboot/*/; do
+            [ -d "$d" ] || continue
+            echo "---- ${d} ----"
+            ls -la "$d" 2>&1 | head -30
+            if [ -d "${d}restore" ]; then
+              echo "   >>> restore 目录在，内容："
+              ls -la "${d}restore" 2>&1 | tee -a out/preboot-restore.txt
+              find "${d}restore" -maxdepth 2 \( -name '*.dmg' -o -name '*.chunklist' \) \
+                   -exec ls -l {} \; 2>/dev/null | tee -a out/preboot-restore.txt
+            fi
+          done
+          echo "（PRE=${PRE}，仅记录）"
+          exit 0
+
+      - name: 候选三  Recovery 卷里的 BaseSystem（76 §1.5.2 的三道墙）
+        run: |
+          set -uo pipefail
+          mkdir -p out
+          RECDEV=$(diskutil info -plist / 2>/dev/null \
+                   | plutil -extract RecoveryDeviceIdentifier raw -o - - 2>/dev/null || echo "")
+          echo "Recovery 设备 = ${RECDEV:-（没读到）}"
+          if [ -n "${RECDEV}" ]; then
+            MP="$RUNNER_TEMP/recmnt"; mkdir -p "$MP"
+            if sudo diskutil mount -mountPoint "$MP" "${RECDEV}" 2>&1; then
+              echo "---- Recovery 卷根 ----"
+              sudo ls -la "$MP" 2>&1 | head -20 | tee out/recovery-root.txt
+              echo "---- 找 BaseSystem / chunklist ----"
+              sudo find "$MP" -maxdepth 3 \
+                   \( -name 'BaseSystem.dmg' -o -name '*.chunklist' -o -name '*RamDisk*' \) \
+                   -exec ls -l {} \; 2>/dev/null | tee -a out/recovery-root.txt
+              sudo diskutil unmount "${RECDEV}" || true
+            else
+              echo "挂不上（Recovery 卷通常需要 -mountPoint 且不许普通挂载）"
+            fi
+          fi
+          exit 0
+
+      - name: QEMU 侧需要的固件在不在
+        run: |
+          set -uo pipefail
+          mkdir -p out
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          export HOMEBREW_NO_ENV_HINTS=1
+          brew install qemu 2>&1 | tail -3
+          SHARE="$(brew --prefix qemu)/share/qemu"
+          echo "---- UEFI 固件（OpenCore 要跑在它上面）----"
+          ls -l "$SHARE"/edk2-x86_64-code.fd "$SHARE"/edk2-i386-vars.fd 2>&1 | tee out/firmware.txt
+          echo "---- 可用机型与加速器 ----"
+          qemu-system-x86_64 -machine help | grep -E 'q35|pc-i440' | head -5
+          exit 0
+
+      - name: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-source-report
+          path: out/
+          if-no-files-found: warn
+
+  # ===========================================================================
   # space —— 运行器上到底能腾出多少，逐项记账。
   #          目的不是「腾一下试试」，而是得到一个能写进 75 §3.1 的硬数字：
   #          完整版镜像 48 GiB + asr 的写入峰值需要多少，运行器给不给得起。
@@ -274,6 +369,10 @@ jobs:
       - name: 腾之前的全景
         run: |
           set -uo pipefail
+          # out/ 在第一步就建好：artifact 的 upload 步骤是 if: always()，
+          # 但目录不存在时它只能 warn 一声什么也不传，于是一次失败的 run
+          # 什么证据都留不下 —— 这正是最需要证据的那一次。
+          mkdir -p out
           df -h /
           echo "---- 容器 ----"
           diskutil info / | sed -n '1,30p'
@@ -285,11 +384,13 @@ jobs:
       - name: 腾
         run: |
           set -uo pipefail
+          mkdir -p out
           chmod +x tools/ci/free_space.sh
           NEED="${NEED_GB:-200}"
-          tools/ci/free_space.sh "$NEED"; rc=$?
-          echo "free_space.sh 退出码 = $rc（1 = 没腾到目标）"
-          echo "SPACE_RC=$rc" >> "$GITHUB_ENV"
+          tools/ci/free_space.sh "$NEED" 2>&1 | tee out/free_space.txt
+          rc=${PIPESTATUS[0]}
+          echo "free_space.sh 退出码 = ${rc}（1 = 没腾到目标）"
+          echo "SPACE_RC=${rc}" >> "$GITHUB_ENV"
           exit 0
         env:
           NEED_GB: ${{ inputs.need_gb || '200' }}
