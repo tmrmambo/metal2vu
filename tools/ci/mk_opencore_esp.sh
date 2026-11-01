@@ -36,10 +36,13 @@ set -euo pipefail
 
 WORK="${1:?用法: mk_opencore_esp.sh <工作目录> [选项]}"; shift
 
-OC_TAG=latest
-OCBIN_REF=master
-LILU_TAG=latest
-VSMC_TAG=latest
+# 默认值钉死，照 71 §2.5 的要求（原话是「查 release 页取最新，写死 tag」）。
+# 这三个是 run 41303152355 实测解析出来的 latest，已验证四个下载 URL 都成立。
+# 要试新版传 --oc-tag latest，脚本会把解析结果记进 MANIFEST 好让下一轮再钉。
+OC_TAG=1.0.8
+OCBIN_REF=master          # 规格要求「固定 commit」，还没钉；master 是已知可用
+LILU_TAG=1.7.2
+VSMC_TAG=1.3.8
 PICKER=builtin
 VARIANT=RELEASE
 SIZE_MIB=64
@@ -131,9 +134,68 @@ cp "$OCBIN/Drivers/HfsPlus.efi" "$EFI/OC/Drivers/"
 cp "$DL/oc/X64/EFI/OC/Tools/OpenShell.efi" "$EFI/OC/Tools/" 2>/dev/null || true
 
 # kext 最小集三件（76 §5.4：一个不多、一个不少）
-cp -R "$DL/lilu/Lilu.kext"                       "$EFI/OC/Kexts/"
-cp -R "$DL/vsmc/Kexts/VirtualSMC.kext"           "$EFI/OC/Kexts/"
-cp -R "$DL/vsmc/Kexts/AppleMCEReporterDisabler.kext" "$EFI/OC/Kexts/"
+#
+# 不写死路径。第一轮（run 41303152355）就是写死路径死掉的：
+# `cp $DL/vsmc/Kexts/AppleMCEReporterDisabler.kext` 报 No such file —— 而同一个
+# Kexts/ 目录下的 VirtualSMC.kext 拷得好好的。release 的内部布局不是我们能假定的东西，
+# 它随版本变，而失败信息「No such file」完全不告诉你它到底在哪。
+# 所以改成按名字找，并且找不到时把整棵树列出来，让下一轮有的可看。
+locate_kext() {   # locate_kext <名字.kext> <搜索根…>
+    local name="$1"; shift
+    local hit
+    for root in "$@"; do
+        hit=$(find "$root" -maxdepth 4 -type d -name "$name" 2>/dev/null | head -1)
+        [ -n "$hit" ] && { echo "$hit"; return 0; }
+    done
+    echo "找不到 $name，这几棵树里有的是：" >&2
+    for root in "$@"; do
+        echo "  -- $root" >&2
+        find "$root" -maxdepth 3 -name '*.kext' -printf '     %p\n' 2>/dev/null >&2
+    done
+    return 1
+}
+
+for k in Lilu.kext VirtualSMC.kext; do
+    src=$(locate_kext "$k" "$DL/lilu" "$DL/vsmc")
+    echo "  kext $k  <-  ${src#"$DL"/}"
+    cp -R "$src" "$EFI/OC/Kexts/"
+done
+
+# AppleMCEReporterDisabler 规格说是「随 VirtualSMC release 分发」（71 §4.4），
+# 但 1.3.8 的 DEBUG 包里没有。它的全部内容就是一个 Info.plist ——
+# 一个不含可执行文件的空 kext，作用是占掉 AppleIntelMCEReporter 的 bundle id，
+# 从而阻止它在 MacPro7,1 的 board-id 下加载（不阻止会 panic）。
+# 所以找不到就自己合成，并且把「合成了」这件事打出来，不假装它是上游的件。
+MCE="$EFI/OC/Kexts/AppleMCEReporterDisabler.kext"
+if src=$(locate_kext AppleMCEReporterDisabler.kext "$DL/vsmc" "$DL/lilu" 2>/dev/null); then
+    echo "  kext AppleMCEReporterDisabler.kext  <-  ${src#"$DL"/}（上游提供）"
+    cp -R "$src" "$EFI/OC/Kexts/"
+else
+    echo "  kext AppleMCEReporterDisabler.kext  <-  **本脚本合成**（上游包里没有）"
+    mkdir -p "$MCE/Contents"
+    cat > "$MCE/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>          <string>en</string>
+	<key>CFBundleIdentifier</key>                 <string>com.apple.driver.AppleMCEReporter</string>
+	<key>CFBundleInfoDictionaryVersion</key>      <string>6.0</string>
+	<key>CFBundleName</key>                       <string>AppleMCEReporterDisabler</string>
+	<key>CFBundlePackageType</key>                <string>KEXT</string>
+	<key>CFBundleShortVersionString</key>         <string>1.0.0</string>
+	<key>CFBundleSignature</key>                  <string>????</string>
+	<key>CFBundleVersion</key>                    <string>1.0.0</string>
+	<key>OSBundleRequired</key>                   <string>Root</string>
+</dict>
+</plist>
+PLIST
+    # 占位生效的机制是「同一个 bundle id 只能加载一个」。所以这里的
+    # CFBundleIdentifier 必须正好是 com.apple.driver.AppleMCEReporter ——
+    # 写错一个字母就什么也不阻止，而症状是启动期 panic，不指向这里。
+    grep -q 'com.apple.driver.AppleMCEReporter' "$MCE/Contents/Info.plist" \
+      || { echo "合成的 Info.plist 里 bundle id 不对" >&2; exit 1; }
+fi
 
 # OpenCanopy 的资源（76 §2.3：Label 与 Font 都是 mandatory，Audio 不取）
 if [ "$PICKER" = canopy ]; then

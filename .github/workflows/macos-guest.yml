@@ -41,9 +41,9 @@ on:
   workflow_dispatch:
     inputs:
       oc_tag:
-        description: 'OpenCorePkg 的 release tag（latest 会解析并记进 MANIFEST，之后应当钉死）'
+        description: 'OpenCorePkg 的 release tag（给 latest 会解析并记进 MANIFEST）'
         type: string
-        default: 'latest'
+        default: '1.0.8'
       variant:
         description: 'RELEASE 还是 DEBUG（71 §2.5：两套都要留，panic 期只有 DEBUG 有日志）'
         type: choice
@@ -100,12 +100,12 @@ jobs:
           # 严格：这一步每一条命令都在往产物里放东西，任何失败都该当场停下。
           chmod +x tools/ci/mk_opencore_esp.sh
           tools/ci/mk_opencore_esp.sh "$RUNNER_TEMP/oc" \
-              --oc-tag   "${OC_TAG:-latest}" \
+              --oc-tag   "${OC_TAG:-1.0.8}" \
               --variant  "${VARIANT:-DEBUG}" \
               --picker   "${PICKER:-builtin}" \
               --size-mib 64
         env:
-          OC_TAG:  ${{ inputs.oc_tag || 'latest' }}
+          OC_TAG:  ${{ inputs.oc_tag || '1.0.8' }}
           VARIANT: ${{ inputs.variant || 'DEBUG' }}
           PICKER:  ${{ inputs.picker || 'builtin' }}
 
