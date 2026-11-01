@@ -158,7 +158,57 @@ MTLRegisterDevices()                                S-METAL +0x1D980D
 `getMetalPluginClassForService` （`S-METAL` +0x1D89FB）`KNOWN`：
 
 1. 读 IORegistry 属性 `MetalPluginName`（必须是 `CFString`）。
-2. `gpu_bundle_find_trusted(name, pathOut, 1024)` 必须返回 0。这是 trust gate，对应既有文档的 B-009；`00-OVERVIEW.md` 第 4.5 节说明研发期 SIP/AMFI 关闭下不构成阻断。
+2. `gpu_bundle_find_trusted(name, pathOut, 1024)` 必须返回 0。这是 trust gate，对应既有文档的 B-009。**本轮已反编译到底，`B-009` 关闭，机制如下（`KNOWN`，`libsystem_sandbox-BaseSystem-analysis.i64`）：**
+
+   **它不在 `Metal` 里。** `Metal` 的 `_gpu_bundle_find_trusted` 只是一条
+   `jmp qword ptr cs:…` 的 stub，导入自 `/usr/lib/libSystem.B.dylib`；真实现是
+   `libsystem_sandbox.dylib` 的 `_gpu_bundle_find_trusted`（`0x7ff80c4d0270`）。
+
+   ```c
+   // 遍历 GPU_STANDARD_BUNDLE_PATHS（0x7ff8412168d0），循环 v6 += 8 到 v6 == 16，
+   // 所以表恰好两项；第三项读出来是 NULL。
+   //   [0] "/Library/GPUBundles"          ← Data 卷，先搜这个
+   //   [1] "/System/Library/Extensions"   ← 系统卷
+   snprintf(buf, 1024, "%s/%s.bundle", GPU_STANDARD_BUNDLE_PATHS[i], name);
+   if (stat(buf, &st) != 0) { if (errno != ENOENT) return -1; continue; }
+   if ((st.st_mode & S_IFMT) != S_IFDIR) continue;          // 必须是目录
+   if (gpu_bundle_is_path_trusted(buf) == -1) return -1;
+   if (gpu_bundle_is_path_trusted(buf) != 0)   continue;    // ← 注意：非 0 = 不可用
+   strlcpy(pathOut, buf, size);  return 0;                  // ← 0 = 可用
+   ```
+
+   **`gpu_bundle_is_path_trusted` 的语义与名字相反：返回 0 才算可用。** 它是：
+
+   ```c
+   // 0x7ff80c4d043b
+   result = rootless_check_trusted_class(path, "KernelExtensionManagement");
+   if (result == 1) return !_dyld_shared_cache_contains_path(path);
+   return result;
+   ```
+
+   而 `rootless_check_trusted_class` → `rootless_check_trusted_internal`
+   （`0x7ff80c4cf8cb`）的**第一条语句**决定一切：
+
+   ```c
+   v6 = 0;
+   if (csr_check(2) == 0)   // 2 = CSR_ALLOW_UNRESTRICTED_FS
+       return v6;           // 返回 0 → 调用方判定「可用」
+   ```
+
+   **所以 SIP 关闭时 trust gate 直接放行，一条 sandbox 规则都不查。**
+   `00-OVERVIEW.md` 第 4.5 节那句「研发期 SIP/AMFI 关闭下不构成阻断」因此从
+   `INFERRED` 升为 `KNOWN`，而且依据是机制不是经验。
+
+   同一函数的第二条放行分支顺带定义了 ARV 的语义：
+
+   ```c
+   if (path != NULL && is_path_on_authenticated_root_volume(path) != 0)
+       return 0;            // 在 ARV 上 → 也放行
+   ```
+
+   **路径在 ARV 上就不查 rootless 规则，因为 ARV 已经用 seal 保证了完整性。
+   两套机制是互替的：ARV 上靠 seal，非 ARV 上靠 sandbox 规则。**
+   `/Library/GPUBundles` 在 Data 卷（非 ARV），走第二套，而第二套在 SIP 关闭时整条让过。
 3. `[NSBundle bundleWithPath:path]` 必须非 nil。
 4. 读 `MetalPluginClassName`：是 `CFString` 则 `[bundle classNamed:]`；**属性缺失或类型不对则退回 `[bundle principalClass]`**。
 5. `[cls isSubclassOfClass:[_MTLDevice class]]` 必须为真，否则返回 nil。

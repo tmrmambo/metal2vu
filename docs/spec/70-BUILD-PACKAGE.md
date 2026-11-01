@@ -1033,7 +1033,60 @@ sudo kmutil print-diagnostics /Library/Extensions/Metal2VuAccel.kext
 | harness agent | `/usr/local/libexec/harness-agent` | `root:wheel` `755` | 80 分册 2.6，**属于 golden snapshot，不属于本包** |
 | 版本清单 | `/Library/GPUBundles/Metal2Vu.bundle/Contents/Resources/MANIFEST.json` | `root:wheel` `644` | 第 7 节 |
 
-`BLOCKED`：`/Library/GPUBundles` 是否是 25G325 上 Metal.framework 实际搜索第三方 plugin bundle 的路径，由 `20-OBJC-DEVICE.md` 用仓库中的 `Metal-BaseSystem-analysis.i64` 确证。00-OVERVIEW 第 2.4 节已把它当作既定路径，但本文不把未确证的路径当 `KNOWN`。
+> [!IMPORTANT]
+> **`P-005` 已关闭，`/Library/GPUBundles` 确认是搜索路径，而且是第一优先。** `KNOWN`，
+> 反编译 `libsystem_sandbox.dylib`（25G325 x86_64，`libsystem_sandbox-BaseSystem-analysis.i64`）。
+>
+> `gpu_bundle_find_trusted` 不在 `Metal` 里 —— `Metal` 只有一个跳到 libSystem 的
+> stub，真实现在 `libsystem_sandbox.dylib`（`_gpu_bundle_find_trusted` @ `0x7ff80c4d0270`）。
+> 它遍历一张叫 `GPU_STANDARD_BUNDLE_PATHS` 的表，对每一项拼
+> `"%s/%s.bundle"`、`stat` 确认是目录、再过 trust gate。
+> **循环以 `v6 += 8` 步进、到 `v6 == 16` 结束，所以表恰好两项**，而第三项读出来是 NULL：
+>
+> | 下标 | 路径 |
+> |---|---|
+> | `[0]` | **`/Library/GPUBundles`** ← 先搜这个，而且它在 **Data 卷**上（firmlink，实测 `st_dev` 与 Data 卷相同） |
+> | `[1]` | `/System/Library/Extensions` |
+>
+> **这是整个项目「要不要动系统卷」这个问题的答案：不用。**
+> Apple 自己把第三方 GPU bundle 的位置放在 Data 卷上，而且排在系统卷之前。
+>
+> **trust gate 的机制也读清了**（`gpu_bundle_is_path_trusted` @ `0x7ff80c4d043b`）：
+>
+> ```c
+> result = rootless_check_trusted_class(path, "KernelExtensionManagement");
+> if (result == 1) return !_dyld_shared_cache_contains_path(path);
+> return result;
+> ```
+>
+> 注意**语义是反的**：函数名叫 `is_path_trusted`，但调用方是
+> `if (is_path_trusted != 0) goto 下一个路径` —— **返回 0 才算可用。**
+> 而 `rootless_check_trusted_class` → `rootless_check_trusted_internal`
+> （`0x7ff80c4cf8cb`）的**第一条语句**就是：
+>
+> ```c
+> v6 = 0;
+> if (csr_check(2) == 0)      // 2 = CSR_ALLOW_UNRESTRICTED_FS
+>     return v6;              // 返回 0 = 放行
+> ```
+>
+> **即 SIP 关闭（`CSR_ALLOW_UNRESTRICTED_FS` 被允许）时 trust gate 直接返回放行，
+> 一条 sandbox 规则都不查。** 这把 `00-OVERVIEW` 第 4.5 节那句「研发期 SIP/AMFI
+> 关闭下不构成阻断」从 `INFERRED` 升为 `KNOWN`，依据是机制而不是经验。
+>
+> 同一个函数里还有第二条放行分支，它顺带解释了 ARV 的语义：
+>
+> ```c
+> if (path != NULL) {
+>     if (is_path_on_authenticated_root_volume(path) != 0)
+>         return 0;           // 在 ARV 上 → 也放行
+> }
+> ```
+>
+> **路径在 ARV 上就不查 rootless 规则** —— 因为 ARV 已经用 seal 保证了完整性。
+> 两套机制是互替的：**在 ARV 上靠 seal，不在 ARV 上靠 sandbox 规则。**
+> 而 `/Library/GPUBundles` 在 Data 卷（非 ARV），所以它走的是第二套，
+> 而第二套在 SIP 关闭时整条让过。
 
 **组件 2 与 3 是两个 kext 还是一个**：00-OVERVIEW 第 5 节指出两者耦合、必须一起设计。本文按两个 bundle 布局，因为它们的 `IOProviderClass` 不同（accelerator 挂 `IOPCIDevice`，display 走 `IOFramebuffer` 范畴），分开便于独立卸载与独立诊断。`INFERRED`，最终由 `11-KERNEL-DISPLAY.md` 决定；若决定合并，则合为一个 bundle 两个 personality。
 
@@ -1321,7 +1374,7 @@ archive/b-20261030-0914-a31f9c2/
 | P-002 | 静态 LLVM + `all-targets` 下 `libvulkan_lvp.dylib` 的体积与加载时间是否可接受 | `BLOCKED` | P-001 之后测量 | 可能需要改用动态 LLVM 并随包交付 `libLLVM.dylib` |
 | P-003 | ORCJIT 在 macOS x86_64 上是否稳定 | `INFERRED` | P-001 后跑离屏渲染；失败则退 MCJIT | 3.4.3 的配置项 |
 | P-004 | 继承 `MTLIOAccelDevice` 的确切链接参数（`-framework Metal` 是否足够，还是需要 `-undefined dynamic_lookup`） | `INFERRED` | 在构建机上直接试编一个最小子类。类符号对外可见这一点已由 `20-OBJC-DEVICE.md` 第 4.3 节确证 | 3.2 的链接参数 |
-| P-005 | `/Library/GPUBundles` 是否为 25G325 上的实际搜索路径 | `BLOCKED` | 反编译 `Metal` 样本中的 **`gpu_bundle_find_trusted`**（由 `20-OBJC-DEVICE.md` 第 3 节定位为路径解析与 trust gate 的唯一入口），读出它拼接的目录常量 | 6.1 的落地路径 |
+| ~~P-005~~ | `/Library/GPUBundles` 是否为 25G325 上的实际搜索路径 | **`KNOWN`，已关闭** | `GPU_STANDARD_BUNDLE_PATHS` 恰好两项，`[0] = /Library/GPUBundles`、`[1] = /System/Library/Extensions`。实现在 `libsystem_sandbox.dylib` 而不是 `Metal`（后者只有 stub）。详见第 6.1 节的 IMPORTANT 块 | 已落地 |
 | P-006 | kext 的 `OSBundleLibraries` 确切条目与版本字符串 | `BLOCKED` | 读 `AppleParavirtGPU.kext` 的 `Info.plist`（仓库已有 x86 payload）；归 `10`/`11` 分册 | 3.3；4.4 的首要失败源 |
 | P-007 | aux collection 构建是否需要 KDK | `INFERRED` | 在 L1 guest 上跑 4.2 的两条命令 | 2.1 的卡点 2；构建机方案 |
 | P-008 | macOS 26 是否提供 x86_64 KDK | `BLOCKED` | 查 Apple 开发者下载；若无则 P-007 必须为"不需要" | 内核调试能力 |

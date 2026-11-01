@@ -109,6 +109,45 @@ x86_64 / SIP disabled / `Apple Paravirtual device`）。**结果是四条规格�
 
 **OCLP 的 Intel 分支就是本文第 A.9 与 A.10 节要写的那两步。** 它每天在成千台 Intel Mac 上跑，所以「破封的自建快照在 Intel 上能启动」这件事不需要我们去赌。
 
+#### 0.2.1 一条比上面全部都强的结论：我们的产物一个字节都不落在系统卷上
+
+> [!IMPORTANT]
+> **本项目**不需要**破封，因为它不往系统卷写任何东西。** `KNOWN`，三条独立确证。
+>
+> **（1）Metal 找第三方 GPU bundle 的路径表第一项就在 Data 卷上。**
+> 反编译 `libsystem_sandbox.dylib` 的 `gpu_bundle_find_trusted`
+> （`70` 第 6.1 节有完整反编译）：`GPU_STANDARD_BUNDLE_PATHS` **恰好两项**，
+> `[0] = /Library/GPUBundles`，`[1] = /System/Library/Extensions`，
+> **而且 `[0]` 先搜**。即 Apple 自己把第三方 GPU bundle 的位置定在 Data 卷上。
+>
+> **（2）第三方 kext 的官方机制也在 Data 卷上。**
+> `70` 第 4 节已确立：第三方 kext 走 `/Library/Extensions` + auxiliary kext
+> collection，由 `kernelmanagerd` 动态构建。**`/System/Library/Extensions` 是
+> boot/system collection 的来源，我们一个 kext 都不往那里放。**
+>
+> **（3）`/Library` 与 `/usr/local` 实测都在 Data 卷上。**
+> `TESTED(25G76)`，firmlink 表逐条生效（第 A.5.2 节）：
+> `/Library`、`/usr/local`、`/Applications`、`/private`、`/Users` 等 18 条
+> 的 `st_dev` 全部等于 Data 卷的 `16777225`。
+> 而 **Data 卷本来就不封印** —— 运行器实测 `Macintosh HD - Data` 的
+> `Sealed: No`（第 A.10.2c 节的容器清单）。封印只针对系统卷。
+>
+> **所以「Apple 认不认我们改的东西」这个问题的答案是：我们没改它的东西。**
+> `70` 第 6.1 节那张安装布局表里的每一行 —— Metal bundle、两个 kext、
+> Lavapipe 的 dylib、ICD 清单、helper、探针 —— 落点全在 Data 卷。
+>
+> **这把「封印」在本项目里的角色降到了最小：**
+>
+> | 问题 | 还是问题吗 |
+> |---|---|
+> | seal 算不算得出来 | 不需要关心 —— 内核算，而且我们不改系统卷，所以 seal 不会失配 |
+> | Apple 对 seal 的签名 | **永远拿不到，也永远不需要** |
+> | 运行期逐块验哈希 | 不触发 —— 我们读写的是 Data 卷，SSV 的读路径校验只覆盖系统卷 |
+> | **root snapshot** | **仍然需要。** 这是唯一剩下的一项，而且理由与封印无关：`boot.efi` 的启动逻辑是「找这个卷的 root snapshot 并挂载它」，没有它就不知道该挂什么（`V-034`） |
+>
+> **即 `V-034` 不是「怎么骗过 Apple 的签名」，是「怎么让 `boot.efi` 有个东西可挂」。**
+> 这两件事此前在本文里被混为一谈，1.1 的这一节把它们分开。
+
 ### 0.3 必须在 macOS 上装配的四条真实理由
 
 `75` 第 0.0 节已确立工具侧的事实（`mkapfs` 只建单个卷、`linux-apfs-rw` 自报 "expect data corruption"、`apfs-fuse` 只读且不支持 firmlink、Paragon 的快照只读）。本节把它收紧成四条**具体缺什么**：
