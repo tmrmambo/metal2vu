@@ -366,7 +366,14 @@ jobs:
           set +e
           mkdir -p out
           IMG="$RUNNER_TEMP/asrprobe.raw"
-          SIZE=$((24 * 1024 * 1024 * 1024))   # 源 System 12.6 + Preboot 2.8 + Recovery 1.5 ≈ 17 GB，留余量
+          # 第一轮给了 24 GiB，asr 跑到 100% 然后
+          #     Volume replication failed - No space left on device
+          # 而 du 显示它已经写进去 18 GB。源系统卷的 Capacity Consumed 只有 12.6 GB，
+          # 两个数差得上这么多，最可能的解释是 asr 复制时没有保留 decmpfs 压缩
+          #（78 §0.3.1 实测 payload 未压缩是 19,259,872,224 字节 ≈ 19.3 GB，正好对得上）。
+          # 加上 Preboot 2.8 + Recovery 1.5 + APFS 元数据余量，24 GiB 确定不够。
+          # 运行器有 118 GiB 可用，所以这一轮直接给 48 GiB，把「到底要多少」量出来。
+          SIZE=$((48 * 1024 * 1024 * 1024))
           rm -f "$IMG"; : > "$IMG"
 
           # GPT：ESP 512 MiB + 其余。p2 写成 Apple_HFS（78 §A.1 约束 3）
@@ -511,8 +518,25 @@ jobs:
 
             echo
             echo "########## asr 造出来的容器长什么样 ##########"
-            CNT=$(diskutil list "$DEV" | awk '/APFS Container Scheme/{print $NF}' | head -1)
+            # 第一轮这里取空了：`diskutil list $DEV` 只列 disk2 自己，
+            # 「APFS Container Scheme」那一行出现在容器（disk3）的段落里，不在 disk2 的段落里。
+            # 改成从 s2 的 info 读 APFSContainerReference（78 §A.2 已实测这个键可靠）。
+            CNT=$(diskutil info -plist "${DEV}s2" 2>/dev/null \
+                  | plutil -extract APFSContainerReference raw -o - - 2>/dev/null)
+            [ -n "$CNT" ] || CNT=$(diskutil list 2>/dev/null \
+                  | awk -v d="${DEV#/dev/}s2" '$0 ~ d && /Container/{for(i=1;i<=NF;i++) if($i=="Container") print $(i+1)}' | head -1)
+            [ -n "$CNT" ] || CNT=$(diskutil apfs list 2>/dev/null \
+                  | awk -v d="${DEV#/dev/}s2" '/Physical Store/{ps=$NF} /APFS Container Reference/{ref=$NF} ps==d&&ref!=""{print ref; exit}')
             echo "CNT=$CNT"
+            echo "---- 三种取法的对照 ----"
+            echo "  info 的 APFSContainerReference : $(diskutil info -plist "${DEV}s2" 2>/dev/null | plutil -extract APFSContainerReference raw -o - - 2>&1)"
+            echo "  diskutil list（全局）里的相关行 :"
+            diskutil list 2>&1 | grep -nE "${DEV#/dev/}s2|Container" | head -10
+            if [ -z "$CNT" ]; then
+              echo ">>> 仍然取不到容器引用。下面全部跳过，但先留一份全景诊断。"
+              diskutil list 2>&1
+              diskutil apfs list 2>&1
+            fi
             diskutil apfs list "$CNT" 2>&1
             echo
             echo "---- P-005：有没有连带造 Data 卷与 volume group ----"
@@ -530,8 +554,9 @@ jobs:
 
             echo
             echo "########## Preboot 里有什么（UUID 目录 / cryptex）##########"
+            # `APFS Volume Disk (Role):   disk3s2 (Preboot)` —— 取倒数第二个字段更稳
             PRE=$(diskutil apfs list "$CNT" 2>/dev/null \
-                  | awk '/\(Preboot\)/{print $5}' | head -1)
+                  | awk '/\(Preboot\)/{print $(NF-1)}' | head -1)
             echo "PRE=$PRE"
             if [ -n "$PRE" ]; then
               PM="$RUNNER_TEMP/pre2"; mkdir -p "$PM"
@@ -551,7 +576,7 @@ jobs:
             echo "########## V-018：bless --apfsdriver 能不能让 jumpstart 非空 ##########"
             echo "# 判据是 diskutil info -plist 的 MacOSSystemAPFSEFIDriverVersion 键"
             echo "# （运行器自己那块盘上它是 2811160007000004，bake 的 probe 实测）。"
-            SYSV=$(diskutil apfs list "$CNT" 2>/dev/null | awk '/\(System\)/{print $5}' | head -1)
+            SYSV=$(diskutil apfs list "$CNT" 2>/dev/null | awk '/\(System\)/{print $(NF-1)}' | head -1)
             echo "SYSV=$SYSV"
             if [ -n "$SYSV" ]; then
               echo "---- bless --apfsdriver 之前 ----"
