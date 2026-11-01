@@ -109,6 +109,13 @@ jobs:
       - name: mkgpt.py 自检（GUID 字节序、CRC32、几何、往返、篡改检出）
         run: python3 tools/ci/mkgpt.py selftest
 
+      # mkbootsector.py 是嵌套虚拟化判定的「证据生产端」。它错一个相对位移，
+      # 症状是「QEMU 下串口文件空」—— 而那跟「HVF 不可用」长得一模一样，
+      # 会把一次本该归因到 hypervisor 的判定污染成我们自己的 bug。
+      # 它的自检里有个 16 位解释器，检查的是行为而不是字节，所以是必过项。
+      - name: mkbootsector.py 自检（黄金向量、解释器跑一遍、承重字节图）
+        run: python3 tools/ci/mkbootsector.py selftest
+
       - name: mkgpt.py → gptdump.py 的端到端一致性
         run: |
           set -euo pipefail

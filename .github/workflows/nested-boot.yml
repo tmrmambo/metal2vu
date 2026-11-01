@@ -1,0 +1,340 @@
+# 规格: docs/spec/91-RUNTIME-EVIDENCE.md（R-011 新增）/ docs/spec/75-IMAGE-PREBAKE.md §7
+#
+# 一个问题，两级探针：**在 GitHub 的 macos-26-intel 运行器里能不能再跑一个 VM。**
+#
+# 为什么它排在造盘前面
+# --------------------
+# 运行器自己就是一台 KVM guest（91 §1：GPU 报 `Apple Paravirtual device`，
+# SMBIOS 是 Macmini6,2 + board-id VMM-x86_64）。在它里面再起一个 VM 是**嵌套
+# 虚拟化**，取决于我们看不见也改不了的那台 KVM 宿主有没有开 nested。
+#
+# 这一条的答案决定两件事：
+#   成立 → 造出来的盘可以在同一个 job 里用 QEMU 启起来看串口。V-025（自建盘能不能
+#          引导）在 CI 内部就能关掉，48 GB 的镜像也不用运出运行器（绕开 artifact 配额）。
+#          更要紧的是：可以在运行器里跑 Apple 自己的安装器，整条封印/Preboot/bless
+#          的难题一次性绕过 —— 安装器环境里那些带 com.apple.private.vfs.snapshot
+#          的二进制是现成的（78 §A.10.2d-bis 实测 bless/asr 都带）。
+#   不成立 → 启动验证必须回到真机，造盘只能「造完运出去」，周期从分钟变成小时。
+#
+# 两级探针，分开是因为它们会以不同的方式失败
+# ------------------------------------------
+#   一级  tools/hvf/hvf_probe.c    问 framework：hv_vm_create / hv_vm_map / hv_vcpu_create
+#   二级  mkbootsector.py + QEMU   让 guest 真跑 23 字节的代码，往 COM1 吐一个带 run id
+#                                  的标记。宿主侧 grep 到标记才算「执行过」。
+#
+# 一级过、二级不过是一个有意义的中间态：句柄拿得到但 vCPU 一 run 就退出，
+# 这正是嵌套没开时最常见的形态。所以二级还跑一个 -accel tcg 的对照组：
+# tcg 不过说明是我们的引导扇区或测试架子坏了，此时 hvf 的结论无效。
+
+name: nested-boot
+
+on:
+  workflow_dispatch:
+    inputs:
+      reclaim_space:
+        description: '跑 space job：腾空间并出逐项账单'
+        type: boolean
+        default: true
+      need_gb:
+        description: 'space job 的目标可用空间 GB（完整版镜像 48 GiB 另加 asr 峰值，建议 200）'
+        type: string
+        default: '200'
+  push:
+    paths:
+      - 'tools/hvf/**'
+      - 'tools/ci/mkbootsector.py'
+      - 'tools/ci/free_space.sh'
+      - '.github/workflows/nested-boot.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nested-boot
+  cancel-in-progress: true
+
+jobs:
+
+  # ===========================================================================
+  # hvf —— 嵌套虚拟化到底可不可用。预期几分钟内出结论。
+  #        每个诊断步骤末尾 exit 0（91 的 R-004：set +e 只关 errexit，
+  #        步骤退出码仍取最后一条命令），判定集中在最后一步。
+  # ===========================================================================
+  hvf:
+    name: hvf (嵌套虚拟化可用性)
+    runs-on: macos-26-intel
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境事实（先记下来，出了岔子才分得清是哪一层）
+        run: |
+          set -uo pipefail
+          echo "---- 系统 ----"
+          sw_vers; uname -a
+          echo "---- 虚拟化相关 sysctl ----"
+          for k in kern.hv_support kern.hv_vmm_present machdep.cpu.brand_string \
+                   hw.ncpu hw.memsize; do
+            printf '  %-28s = %s\n' "$k" "$(sysctl -n "$k" 2>/dev/null || echo '(无)')"
+          done
+          echo "---- CPU 特征里跟虚拟化有关的位 ----"
+          # VMX 是 Intel 的硬件虚拟化扩展。它出现在 features 里说明 KVM 宿主把它
+          # 透传给了这一层；不出现则嵌套必定不可用，后面的失败就有了直接解释。
+          sysctl -n machdep.cpu.features machdep.cpu.leaf7_features 2>/dev/null \
+            | tr ' ' '\n' | grep -E 'VMX|EPT|UNRESTRICTED|TPR' || echo "  （没有 VMX/EPT 相关位）"
+          echo "---- 我们这台机器是谁 ----"
+          ioreg -l | grep -i 'board-id' | head -3 || true
+          sysctl -n hw.model || true
+          echo "---- SIP / boot-args（78 §A.10.2d 的因果链用）----"
+          csrutil status || true
+          csrutil authenticated-root status 2>/dev/null || true
+          nvram boot-args 2>/dev/null || echo "  boot-args 未设"
+          exit 0
+
+      - name: 一级探针  hvf_probe（framework 层面）
+        run: |
+          set -uo pipefail
+          OUT="$RUNNER_TEMP/hvf_probe"
+          echo "---- 编译 ----"
+          # 不加 -Werror：Hypervisor 的 x86 接口在新 SDK 上带 deprecation 注解，
+          # 一个警告就会把整个探针挡在门外，而我们要问的不是它新不新。
+          cc -O2 -Wall -Wextra -framework Hypervisor -o "$OUT" tools/hvf/hvf_probe.c
+          echo "---- ad-hoc 签名并带上 entitlement ----"
+          # com.apple.security.hypervisor 是**公开** entitlement（不是 private.*），
+          # 所以 AMFI 开着时自签名也能带上。这一点和 fs_snapshot_create 要的那个
+          # restricted entitlement 不同（78 §A.10.2d-bis：那个自签名会被拒）。
+          codesign -s - --entitlements tools/hvf/hvf.entitlements -f "$OUT"
+          echo "---- 回读，确认 entitlement 真的在二进制里 ----"
+          codesign -d --entitlements - "$OUT" 2>&1 | tee "$RUNNER_TEMP/ent.txt"
+          if grep -q 'com.apple.security.hypervisor' "$RUNNER_TEMP/ent.txt"; then
+            echo ">>> entitlement 确认在位"
+          else
+            echo "::warning::回读看不到 hypervisor entitlement，下面的失败可能是签名问题而非嵌套问题"
+          fi
+          echo
+          echo "---- 跑 ----"
+          "$OUT"; rc=$?
+          echo "hvf_probe 退出码 = $rc"
+          echo "HVF_PROBE_RC=$rc" >> "$GITHUB_ENV"
+          exit 0
+
+      - name: 装 QEMU
+        run: |
+          set -uo pipefail
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          export HOMEBREW_NO_INSTALL_CLEANUP=1
+          export HOMEBREW_NO_ENV_HINTS=1
+          brew install qemu 2>&1 | tail -20
+          echo "---- 版本与可用加速器 ----"
+          qemu-system-x86_64 --version | head -2
+          qemu-system-x86_64 -accel help
+          QEMU=$(python3 -c 'import os,shutil;print(os.path.realpath(shutil.which("qemu-system-x86_64") or ""))')
+          echo "真实路径 = $QEMU"
+          echo "QEMU=$QEMU" >> "$GITHUB_ENV"
+          echo "---- QEMU 自己带没带 hypervisor entitlement ----"
+          # 没带的话 -accel hvf 会以 "Error: HV_ERROR" 失败，而那和「嵌套没开」
+          # 长得一样。所以这里先看、不够就自己补签，把这一类误判排除掉。
+          if codesign -d --entitlements - "$QEMU" 2>&1 | grep -q 'com.apple.security.hypervisor'; then
+            echo ">>> 自带，不动它"
+          else
+            echo ">>> 没带，自己 ad-hoc 补签"
+            sudo codesign -s - --entitlements tools/hvf/hvf.entitlements -f "$QEMU"
+            codesign -d --entitlements - "$QEMU" 2>&1 | grep -A2 hypervisor || true
+          fi
+          exit 0
+
+      - name: 二级探针  让 guest 真跑一段代码
+        run: |
+          set -uo pipefail
+          WORK="$RUNNER_TEMP/nested"; mkdir -p "$WORK"
+          # 标记里带 run id：读到的串不可能是上一轮留下来的
+          MARK="HVFGUEST-${GITHUB_RUN_ID}"
+          echo "标记 = $MARK"
+
+          echo "---- 造引导扇区 ----"
+          python3 tools/ci/mkbootsector.py create "$WORK/boot.img" --message "$MARK"
+          python3 tools/ci/mkbootsector.py dump "$WORK/boot.img"
+          echo
+
+          : > "$WORK/verdict.txt"
+
+          run_cfg() {
+            label="$1"; shift
+            ser="$WORK/$label.ser"; : > "$ser"
+            echo "======== $label : qemu $* ========"
+            "$QEMU" -machine pc -m 256 -display none -no-reboot \
+                    -serial "file:$ser" \
+                    -drive "file=$WORK/boot.img,format=raw,index=0,media=disk" \
+                    "$@" > "$WORK/$label.out" 2> "$WORK/$label.err" &
+            pid=$!
+            i=0
+            while [ "$i" -lt 25 ]; do
+              grep -q "$MARK" "$ser" 2>/dev/null && break
+              kill -0 "$pid" 2>/dev/null || break
+              sleep 1; i=$(( i + 1 ))
+            done
+            kill -9 "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            if grep -q "$MARK" "$ser" 2>/dev/null; then
+              echo ">>> $label PASS —— guest 执行了我们的代码（${i}s 内拿到标记）"
+              echo "    串口内容: $(tr -d '\r' < "$ser" | head -1)"
+              echo "$label=PASS" >> "$WORK/verdict.txt"
+            else
+              echo ">>> $label FAIL —— 25s 内没拿到标记"
+              echo "--- qemu stderr ---"; head -30 "$WORK/$label.err" || true
+              echo "--- qemu stdout ---"; head -10 "$WORK/$label.out" || true
+              echo "--- 串口文件（原始字节）---"; od -c "$ser" | head -6 || true
+              echo "$label=FAIL" >> "$WORK/verdict.txt"
+            fi
+            echo
+          }
+
+          # 对照组先跑：tcg 是纯软件模拟，一定跟嵌套无关。它过了才证明
+          # 引导扇区、-serial file、grep 这一整套架子是好的。
+          run_cfg tcg -accel tcg
+          run_cfg hvf -accel hvf
+          # HVF 对 CPU 模型比 tcg 挑。默认模型不行时 -cpu host 常常可以，
+          # 所以这一组单独记，免得把「模型不合」记成「嵌套不可用」。
+          run_cfg hvf-cpuhost -accel hvf -cpu host
+
+          echo "---- 三组结果 ----"
+          cat "$WORK/verdict.txt"
+          exit 0
+
+      - name: 判定
+        run: |
+          set -uo pipefail
+          WORK="$RUNNER_TEMP/nested"
+          V="$WORK/verdict.txt"
+          [ -f "$V" ] || { echo "::error::没有 verdict.txt，上一步根本没跑到"; exit 1; }
+          get() { grep -m1 "^$1=" "$V" 2>/dev/null | cut -d= -f2 || echo MISSING; }
+          TCG=$(get tcg); HVF=$(get hvf); HOST=$(get hvf-cpuhost)
+          printf 'hvf_probe 退出码 = %s\ntcg=%s  hvf=%s  hvf-cpuhost=%s\n\n' \
+                 "${HVF_PROBE_RC:-未知}" "$TCG" "$HVF" "$HOST"
+
+          mkdir -p out
+          {
+            echo "# nested-boot 判定"
+            echo
+            echo "- run: ${GITHUB_RUN_ID}"
+            echo "- hvf_probe 退出码: ${HVF_PROBE_RC:-未知}"
+            echo "- QEMU -accel tcg: $TCG"
+            echo "- QEMU -accel hvf: $HVF"
+            echo "- QEMU -accel hvf -cpu host: $HOST"
+          } > out/verdict.md
+
+          if [ "$TCG" != "PASS" ]; then
+            echo ">>> 对照组 tcg 都没过 —— 坏的是引导扇区或测试架子，不是 hypervisor。"
+            echo ">>> hvf 的结果本轮**不作为结论**。"
+            echo "- 结论: 无效（对照组失败）" >> out/verdict.md
+            exit 0
+          fi
+
+          if [ "$HVF" = "PASS" ] || [ "$HOST" = "PASS" ]; then
+            echo ">>> **嵌套虚拟化可用。** guest 代码在 HVF 下真的执行了。"
+            echo ">>> 下一步：把造出来的盘在同一个 job 里用 -accel hvf 启起来（关 V-025），"
+            echo ">>> 以及更要紧的那条 —— 在运行器里跑 Apple 自己的安装器，"
+            echo ">>> 绕开封印/Preboot/bless 整条难题。"
+            echo "- 结论: 嵌套可用" >> out/verdict.md
+          else
+            echo ">>> **嵌套虚拟化不可用**：tcg 过了（架子是好的），两种 hvf 配置都没过。"
+            echo ">>> 这不是我们能改的 —— 取决于运行器之上那台 KVM 宿主有没有开 nested。"
+            echo ">>> 后果：启动验证回到真机；造盘仍可在 CI 做，但只能造完运出去。"
+            echo "- 结论: 嵌套不可用" >> out/verdict.md
+          fi
+
+          cp "$V" out/ 2>/dev/null || true
+          for f in "$WORK"/*.err "$WORK"/*.ser; do
+            [ -f "$f" ] && cp "$f" out/ 2>/dev/null
+          done
+          cp "$RUNNER_TEMP/ent.txt" out/entitlements.txt 2>/dev/null || true
+          exit 0
+
+      - name: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nested-boot-report
+          path: out/
+          if-no-files-found: warn
+
+  # ===========================================================================
+  # space —— 运行器上到底能腾出多少，逐项记账。
+  #          目的不是「腾一下试试」，而是得到一个能写进 75 §3.1 的硬数字：
+  #          完整版镜像 48 GiB + asr 的写入峰值需要多少，运行器给不给得起。
+  # ===========================================================================
+  space:
+    name: space (腾空间并出账单)
+    runs-on: macos-26-intel
+    timeout-minutes: 45
+    if: github.event_name == 'push' || inputs.reclaim_space
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 腾之前的全景
+        run: |
+          set -uo pipefail
+          df -h /
+          echo "---- 容器 ----"
+          diskutil info / | sed -n '1,30p'
+          echo "---- 装了哪些 Xcode ----"
+          ls -d /Applications/Xcode*.app 2>/dev/null || echo "  没有"
+          xcode-select -p || true
+          exit 0
+
+      - name: 腾
+        run: |
+          set -uo pipefail
+          chmod +x tools/ci/free_space.sh
+          NEED="${NEED_GB:-200}"
+          tools/ci/free_space.sh "$NEED"; rc=$?
+          echo "free_space.sh 退出码 = $rc（1 = 没腾到目标）"
+          echo "SPACE_RC=$rc" >> "$GITHUB_ENV"
+          exit 0
+        env:
+          NEED_GB: ${{ inputs.need_gb || '200' }}
+
+      - name: 腾完之后：造一个 48 GiB 的稀疏镜像看放不放得下
+        run: |
+          set -uo pipefail
+          # 这一步是「账单对不对」的验收：空间数字说够了，就真写一个同样大的
+          # 文件出来。稀疏文件只占实际写入的块，所以还要用 dd 往里真写 4 GiB，
+          # 确认不是靠稀疏糊过去的。
+          IMG="$RUNNER_TEMP/space-check.raw"
+          BYTES=$(( 48 * 1024 * 1024 * 1024 ))
+          dd if=/dev/zero of="$IMG" bs=1 count=0 seek="$BYTES" 2>/dev/null
+          ls -l "$IMG"; du -h "$IMG"
+          echo "---- 往里真写 4 GiB ----"
+          dd if=/dev/zero of="$IMG" bs=1m count=4096 conv=notrunc 2>&1 | tail -2
+          du -h "$IMG"
+          df -h /
+          rm -f "$IMG"
+          echo "---- 删掉之后 ----"
+          df -h /
+          exit 0
+
+      - name: 判定
+        run: |
+          set -uo pipefail
+          free_b=$(diskutil info -plist / | plutil -extract APFSContainerFree raw -o - -)
+          free_gb=$(( free_b / 1000000000 ))
+          echo "最终可用 = ${free_gb} GB"
+          mkdir -p out
+          echo "free_gb=${free_gb}" > out/space.txt
+          echo "free_space_rc=${SPACE_RC:-未知}" >> out/space.txt
+          if [ "$free_gb" -ge 200 ]; then
+            echo ">>> 够 48 GiB 完整版镜像 + asr 峰值，space 不再是约束。"
+          elif [ "$free_gb" -ge 100 ]; then
+            echo ">>> 够一份 48 GiB 镜像，但同时留 asr 峰值会紧。"
+          else
+            echo "::warning::只有 ${free_gb} GB，完整版镜像要降容量或改走分块流出"
+          fi
+          exit 0
+
+      - name: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: space-report
+          path: out/
+          if-no-files-found: warn
