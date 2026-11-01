@@ -1,0 +1,360 @@
+# 规格: docs/spec/71-IMAGE-OPENCORE.md §6 §8.2 / docs/spec/76-BOOT-LAYOUT-PICKER.md §2 §5 §6
+#
+# 把 macOS guest 真正启动起来这条路，拆成**能独立失败**的几段。本 workflow 先做前两段。
+#
+# 分工（用户 2026-11-01 定）
+# ------------------------
+#   macOS 运行器造镜像   Apple 自己的工具链（softwareupdate / createinstallmedia /
+#                        asr / diskutil / APFS 读写）、腾完 202 GB、Intel CPU
+#   Linux 运行器跑镜像   它才是**生产那个 hypervisor**（00-OVERVIEW §2.1：macOS 作为
+#                        云平台自己的 KVM guest 直接运行）。顺带测 EPYC 的兼容性 ——
+#                        实测运行器是 AMD EPYC 7763，而宿主机代次是抽卡。
+#
+# 为什么 OpenCore 这一段放在 Linux 上
+# ----------------------------------
+# 它纯粹是「下载 + 解包 + 编一张 SSDT + 生成一个 plist + 做一个 FAT32 镜像」，
+# 没有一步需要 macOS。Linux 运行器盘快 6 倍（实测 422 vs 72 MB/s）、并发额度宽松、
+# 启动也快。把它放这边，macOS 运行器的时间全留给只有它能做的事。
+#
+# 两段的失败形态不同，所以分成两个 job
+# -----------------------------------
+#   opencore     装配 ESP。失败是「下载不到 / 文件名对不上 / plist 键集变了」。
+#                config.plist 的键集错误由 make_oc_config.py 的缺键门禁当场挡住
+#                （71 §6.1 的纪律 + 本项目加的那道门禁）。
+#   oc-boot      让 OVMF 真的加载 OpenCore 并出 picker。**这一段不需要任何 macOS 介质**，
+#                所以它能在造盘之前就把一大批配置错误挑出来，而且只要一两分钟。
+#                判据是三条互相独立的证据：串口里的 OpenCore banner、QMP 截图、
+#                以及 OpenCore 自己写回 ESP 的日志文件（Misc/Debug/Target = 0x4B
+#                的第 6 位是 OC_LOG_FILE）。三条都拿到才算这一段过。
+#
+# 还没做的下一段（写在这里免得忘）
+# ------------------------------
+#   media        在 macOS 运行器上把安装介质做出来：Recovery 卷的 BaseSystem.dmg
+#                （1,459,674,020 字节）转 raw，或 softwareupdate --fetch-full-installer
+#                取 26.7.2/25G332（17.9 GB）。注意 artifact 配额放不下这两个中的任何一个，
+#                所以介质不出运行器，启动验证要和造介质在同一个 job 里（75 §3.4 同一条理由）。
+#   boot-macos   接上介质，关 V-025 / 78 §C.2 的 L1-1…L1-9。
+
+name: macos-guest
+
+on:
+  workflow_dispatch:
+    inputs:
+      oc_tag:
+        description: 'OpenCorePkg 的 release tag（latest 会解析并记进 MANIFEST，之后应当钉死）'
+        type: string
+        default: 'latest'
+      variant:
+        description: 'RELEASE 还是 DEBUG（71 §2.5：两套都要留，panic 期只有 DEBUG 有日志）'
+        type: choice
+        options: ['DEBUG', 'RELEASE']
+        default: 'DEBUG'
+      picker:
+        description: 'builtin（排障档）或 canopy（76 §2 的 Apple 样式）'
+        type: choice
+        options: ['builtin', 'canopy']
+        default: 'builtin'
+  push:
+    paths:
+      - 'tools/ci/make_oc_config.py'
+      - 'tools/ci/mk_opencore_esp.sh'
+      - 'tools/oc/**'
+      - '.github/workflows/macos-guest.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-guest
+  cancel-in-progress: true
+
+jobs:
+
+  # ===========================================================================
+  # opencore —— 装配 OpenCore 的 ESP。产物约 30 MB，装得下 artifact 配额。
+  # ===========================================================================
+  opencore:
+    name: opencore (装配 ESP)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 工具与版本
+        run: |
+          set +e -u -o pipefail
+          mkdir -p out
+          sudo apt-get update -qq
+          # acpica-tools 提供 iasl（编 SSDT）；mtools 提供 mcopy/mdir
+          # （不用 loop mount：运行器上 mount -o loop 要 root 且时常不可用）
+          sudo apt-get install -y -qq acpica-tools mtools dosfstools 2>&1 | tail -2
+          for t in iasl mkfs.vfat mcopy mdir unzip curl python3; do
+            printf '  %-12s %s\n' "$t" "$(command -v "$t" || echo '缺')"
+          done
+          iasl -v 2>&1 | head -2
+          exit 0
+
+      - name: 装配
+        run: |
+          set -euo pipefail
+          # 严格：这一步每一条命令都在往产物里放东西，任何失败都该当场停下。
+          chmod +x tools/ci/mk_opencore_esp.sh
+          tools/ci/mk_opencore_esp.sh "$RUNNER_TEMP/oc" \
+              --oc-tag   "${OC_TAG:-latest}" \
+              --variant  "${VARIANT:-DEBUG}" \
+              --picker   "${PICKER:-builtin}" \
+              --size-mib 64
+        env:
+          OC_TAG:  ${{ inputs.oc_tag || 'latest' }}
+          VARIANT: ${{ inputs.variant || 'DEBUG' }}
+          PICKER:  ${{ inputs.picker || 'builtin' }}
+
+      - name: 断言：规格点名的那些东西真的在镜像里
+        run: |
+          set +e -u -o pipefail
+          mkdir -p out
+          IMG="$RUNNER_TEMP/oc/out/opencore.img"
+          cp "$RUNNER_TEMP/oc/out/opencore-manifest.txt" out/ 2>/dev/null
+          export MTOOLS_SKIP_CHECK=1
+          LS="$RUNNER_TEMP/oc/listing.txt"
+          mdir -i "$IMG" -/ ::/EFI > "$LS" 2>&1
+          cp "$LS" out/image-listing.txt
+
+          fail=0
+          want() {
+            if grep -qi -- "$1" "$LS"; then
+              echo "  [ok]   $1"
+            else
+              echo "  [FAIL] $1  —— $2"
+              fail=1
+            fi
+          }
+          echo "---- 必须在 ----"
+          want 'BOOTx64.efi'          '固件要从 \EFI\BOOT\BOOTX64.EFI 起（74 B-001）'
+          want 'OpenCore.efi'         'OpenCore 本体'
+          want 'config.plist'         '配置'
+          want 'OpenRuntime.efi'      '71 §6.9.1：Booter quirks 与 NVRAM routing 都要它'
+          want 'HfsPlus.efi'          '76 §6 的 71-A：是 HfsPlus.efi 不是 OpenHfsPlus.efi'
+          want 'SSDT-EC.aml'          '76 §5：唯一必需的 SSDT'
+          want 'Lilu.kext'            '76 §5.4 最小集'
+          want 'VirtualSMC.kext'      '同上'
+          want 'AppleMCEReporterDisabler' '同上，MacPro7,1 的 board-id 要它'
+
+          echo "---- 必须不在 ----"
+          nowant() {
+            if grep -qi -- "$1" "$LS"; then
+              echo "  [FAIL] $1 竟然在镜像里 —— $2"; fail=1
+            else
+              echo "  [ok]   $1 不在"
+            fi
+          }
+          nowant 'WhateverGreen'      '71 §6.10 整节论证：我们自己写显卡驱动'
+          nowant 'OpenHfsPlus'        'OcBinaryData 里没有这个文件名'
+          nowant 'SSDT-PLUG'          '与 DummyPowerManagement = true 方向相反'
+
+          echo "---- config.plist 回读 ----"
+          mtype -i "$IMG" ::/EFI/OC/config.plist > "$RUNNER_TEMP/oc/config.plist"
+          python3 tools/ci/make_oc_config.py dump "$RUNNER_TEMP/oc/config.plist" \
+            | tee out/config-dump.txt
+          cp "$RUNNER_TEMP/oc/config.plist" out/config.plist
+
+          echo
+          test "$fail" = 0 && echo ">>> 全部断言通过" || echo "::error::有断言没过"
+          exit "$fail"
+
+      - name: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencore-esp
+          path: |
+            out/
+            ${{ runner.temp }}/oc/out/opencore.img
+          if-no-files-found: warn
+
+  # ===========================================================================
+  # oc-boot —— 让 OVMF 真的加载 OpenCore。**不需要任何 macOS 介质。**
+  #
+  # 这一段的价值在于便宜：它用一两分钟把「plist 有语法错 / 驱动缺文件 /
+  # SSDT 编坏 / ScanPolicy 把盘挡了」这一整类错误挑出来，而这些错误如果拖到
+  # 接上 macOS 介质之后才暴露，症状全都长成同一个样子 ——「选择器里什么都没有」
+  # （78 §C.2 的 L1-8，排查顺序有四步）。
+  # ===========================================================================
+  oc-boot:
+    name: oc-boot (OVMF 加载 OpenCore，无 macOS 介质)
+    runs-on: ubuntu-latest
+    needs: opencore
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: opencore-esp
+          path: esp
+
+      - name: 环境与 /dev/kvm
+        run: |
+          set +e -u -o pipefail
+          mkdir -p out
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 ovmf mtools socat 2>&1 | tail -2
+          echo "---- 版本 ----"
+          qemu-system-x86_64 --version | head -1
+          qemu-system-x86_64 -accel help
+          echo "---- OVMF（71 §8.2.4 用的是 4M 版）----"
+          ls -l /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_VARS_4M.fd 2>&1
+          echo "---- /dev/kvm ----"
+          ls -l /dev/kvm 2>&1
+          if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+            ls -l /dev/kvm
+          fi
+          echo "---- 宿主 CPU（AMD 这一关：靠 vendor=GenuineIntel 伪装，不打内核补丁）----"
+          lscpu | grep -E 'Model name|Virtualization' || true
+          exit 0
+
+      - name: 启动
+        run: |
+          set +e -u -o pipefail
+          mkdir -p out
+          W="$RUNNER_TEMP/boot"; mkdir -p "$W"
+          IMG="$W/opencore.img"
+          find esp -name opencore.img -exec cp {} "$IMG" \;
+          ls -l "$IMG" || { echo "::error::没拿到 opencore.img"; exit 1; }
+          cp /usr/share/OVMF/OVMF_VARS_4M.fd "$W/vars.fd"
+          chmod +w "$W/vars.fd"
+
+          # -cpu 行照 71 §5.2，但去掉两处，各有理由：
+          #   kvm=on      默认就是 on，显式写没有坏处但也没有信息量
+          #   check       默认就是 true（QEMU 的 X86CPU 属性），写了是冗余；
+          #               绝对不要换成 enforce —— EPYC 上缺 Intel 专属特征会直接拒绝启动
+          # 加一处：migratable=off。+invtsc 只有在给过 TSC 频率或关掉 migratable 时
+          # 才真的透给 guest，否则会被静默过滤并只留一行 warning（QEMU 的
+          # x86_cpu_filter_features）。macOS 的计时依赖 invariant TSC，所以这一条要坐实。
+          CPU='Skylake-Server-v4,-hle,-rtm,vendor=GenuineIntel,+invtsc,migratable=off'
+          CPU="$CPU,vmware-cpuid-freq=on,+ssse3,+sse4.2,+popcnt,+avx,+aes,+xsave,+xsaveopt"
+          echo "-cpu $CPU"
+
+          OSK='ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc'
+
+          qemu-system-x86_64 \
+            -machine q35,accel=kvm \
+            -cpu "$CPU" \
+            -smp 4,cores=2,sockets=1,threads=2 \
+            -m 4096 \
+            -global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off \
+            -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
+            -drive if=pflash,format=raw,file="$W/vars.fd" \
+            -device isa-applesmc,osk="$OSK" \
+            -device pvpanic \
+            -smbios type=2 \
+            -device ich9-ahci,id=sata \
+            -drive id=oc,if=none,format=raw,file="$IMG" \
+            -device ide-hd,bus=sata.0,drive=oc,bootindex=0 \
+            -device VGA,vgamem_mb=128 \
+            -display none \
+            -chardev socket,id=ser0,path="$W/ser.sock",server=on,wait=off,logfile="$W/serial.log",logappend=off \
+            -serial chardev:ser0 \
+            -qmp unix:"$W/qmp.sock",server=on,wait=off \
+            -action panic=exit-failure -action reboot=shutdown \
+            -name oc-boot > "$W/qemu.out" 2> "$W/qemu.err" &
+          QPID=$!
+          echo "qemu pid=$QPID"
+
+          # 等 picker。OpenCore 的 banner 形如 `OC: OpenCore DBG-xxx is loading`。
+          i=0
+          while [ "$i" -lt 60 ]; do
+            grep -qi 'OpenCore' "$W/serial.log" 2>/dev/null && break
+            kill -0 "$QPID" 2>/dev/null || break
+            sleep 1; i=$(( i + 1 ))
+          done
+          echo "等了 ${i}s"
+          sleep 6   # 再给它把 picker 画出来
+
+          # QMP：连上必须先握手，否则除 qmp_capabilities 之外一律 CommandNotFound，
+          # 异步事件也不会投递（QMP 规范）。format: png 是 QEMU 7.1 起支持的。
+          if [ -S "$W/qmp.sock" ]; then
+            { printf '{"execute":"qmp_capabilities"}\n'
+              printf '{"execute":"query-status"}\n'
+              printf '{"execute":"screendump","arguments":{"filename":"%s","format":"png"}}\n' \
+                     "$W/picker.png"
+              sleep 2; } | socat - UNIX-CONNECT:"$W/qmp.sock" | tee "$W/qmp.log"
+          else
+            echo "::warning::QMP socket 不在，截图这一路取不到"
+          fi
+
+          kill -9 "$QPID" 2>/dev/null || true
+          wait "$QPID" 2>/dev/null || true
+
+          cp "$W/serial.log" out/ 2>/dev/null
+          cp "$W/qemu.err" out/ 2>/dev/null
+          cp "$W/qmp.log"  out/ 2>/dev/null
+          cp "$W/picker.png" out/ 2>/dev/null
+
+          echo "---- OpenCore 有没有把日志写回 ESP（Target 0x4B 的 OC_LOG_FILE 位）----"
+          export MTOOLS_SKIP_CHECK=1
+          mdir -i "$IMG" :: 2>&1 | tee out/esp-root-after-boot.txt
+          for f in $(mdir -i "$IMG" -b :: 2>/dev/null | grep -i 'opencore.*\.txt' || true); do
+            echo "   取 $f"
+            mtype -i "$IMG" "$f" > "out/$(basename "$f")" 2>/dev/null || true
+          done
+          exit 0
+
+      - name: 判定
+        run: |
+          set +e -u -o pipefail
+          mkdir -p out
+          S=out/serial.log
+          have_serial=no; have_png=no; have_eflog=no
+          [ -s "$S" ] && grep -qi 'OpenCore' "$S" && have_serial=yes
+          [ -s out/picker.png ] && have_png=yes
+          ls out/opencore*.txt >/dev/null 2>&1 && have_eflog=yes
+
+          echo "---- 三条独立证据 ----"
+          printf '  %-34s %s\n' \
+            '串口里有 OpenCore banner'   "$have_serial" \
+            'QMP screendump 拿到 PNG'    "$have_png" \
+            'OpenCore 写回 ESP 的日志'   "$have_eflog"
+          echo
+          echo "---- 串口前 60 行 ----"
+          head -60 "$S" 2>/dev/null || echo "（串口日志空）"
+
+          {
+            echo "# oc-boot 判定（run ${GITHUB_RUN_ID}）"
+            echo "- 串口 banner: ${have_serial}"
+            echo "- QMP 截图: ${have_png}"
+            echo "- ESP 日志: ${have_eflog}"
+          } > out/verdict.md
+
+          # H-007 顺手结案：socket chardev 的 logfile= 到底支持不支持。
+          # 支持的话 serial.log 就会有内容；不支持 QEMU 会在 stderr 上报参数错误。
+          if grep -qi 'logfile' out/qemu.err 2>/dev/null; then
+            echo ">>> H-007：socket chardev 不接受 logfile=，退路是 -serial file:"
+            echo "- H-007: logfile= 不被接受" >> out/verdict.md
+          elif [ -s "$S" ]; then
+            echo ">>> H-007 关闭：socket chardev 的 logfile= 可用，串口落盘了 $(wc -c < "$S") 字节"
+            echo "- H-007: logfile= 可用（关闭）" >> out/verdict.md
+          fi
+
+          if [ "$have_serial" = yes ]; then
+            echo ">>> **OVMF 加载了 OpenCore。** 配置这一层通了，下一段是接 macOS 介质。"
+          else
+            echo "::warning::串口里没有 OpenCore banner。按 78 §C.2 的 L1-8 顺序查："
+            echo "   1) BOOTx64.efi 在不在 ESP 上（上一个 job 的断言已经验过）"
+            echo "   2) OVMF 有没有去 \\EFI\\BOOT\\BOOTX64.EFI 找（看 qemu.err 与串口头部）"
+            echo "   3) config.plist 有没有被 OpenCore 拒掉（DEBUG 构建会在串口报键名）"
+            echo "   4) Misc/Debug/Target 的串口位有没有开（0x4B 的 bit3）"
+          fi
+          exit 0
+
+      - name: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oc-boot-report
+          path: out/
+          if-no-files-found: warn

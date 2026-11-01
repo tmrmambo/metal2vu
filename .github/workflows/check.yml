@@ -116,6 +116,13 @@ jobs:
       - name: mkbootsector.py 自检（黄金向量、解释器跑一遍、承重字节图）
         run: python3 tools/ci/mkbootsector.py selftest
 
+      # make_oc_config.py 生成的是引导器的配置。它错一个键的症状是「配置看起来对、
+      # 行为不对」—— 在 78 §C.2 的 L1-8 里表现为「选择器里没有 macOS 这一项」，
+      # 而那条的排查顺序有四步。自检里有 45 项断言，逐条对着 71 §6 / 76 §5 的原文，
+      # 包括那条已登记的勘误（HfsPlus.efi 而不是 OpenHfsPlus.efi）。必过项。
+      - name: make_oc_config.py 自检（71 §6 的键值、缺键门禁、两个 picker 变体）
+        run: python3 tools/ci/make_oc_config.py selftest
+
       - name: mkgpt.py → gptdump.py 的端到端一致性
         run: |
           set -euo pipefail

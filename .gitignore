@@ -39,6 +39,9 @@
 # 只放行 tools/ 下的：analysis/ 里如果出现同名文件，那会是从 Apple 二进制
 # dump 出来的权限清单，属衍生物，仍然应当默认排除。
 !tools/**/*.entitlements
+# 我们自己写的 ACPI 源码（iasl 的输入）。编出来的 .aml 不进仓，CI 现编。
+# 同样只放行 tools/ 下的 —— analysis/ 里的 .dsl 会是反编译 Apple/QEMU 表的产物。
+!tools/**/*.dsl
 !*.m
 !*.mm
 !*.c
