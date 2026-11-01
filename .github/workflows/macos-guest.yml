@@ -116,13 +116,26 @@ jobs:
           IMG="$RUNNER_TEMP/oc/out/opencore.img"
           cp "$RUNNER_TEMP/oc/out/opencore-manifest.txt" out/ 2>/dev/null
           export MTOOLS_SKIP_CHECK=1
+          # 两份清单，各有用处，不要混用：
+          #   -/   给人看的目录树（短名 + 长名两列）
+          #   -b   每行一个完整路径，**断言只能对这一份做**
+          # 第一轮栽在这上面：断言 grep 'SSDT-EC.aml' 在 -/ 的输出里匹配不上，
+          # 因为 SSDT-EC.aml 正好符合 8.3，mtools 不给它建长名项，于是 mdir 只打
+          # 短名 `SSDT-EC  aml` —— 点变成了两个空格。文件其实在镜像里，114 字节。
+          # 这正是「用给人看的格式做机器判定」的典型代价。
           LS="$RUNNER_TEMP/oc/listing.txt"
+          BL="$RUNNER_TEMP/oc/bare.txt"
           mdir -i "$IMG" -/ ::/EFI > "$LS" 2>&1
+          mdir -i "$IMG" -b -/ ::/EFI > "$BL" 2>&1
           cp "$LS" out/image-listing.txt
+          cp "$BL" out/image-paths.txt
+          echo "---- 全路径清单（断言对的是这一份）----"
+          sed -n '1,60p' "$BL"
 
           fail=0
+          # -F 关掉正则：这些是文件名，里面的点就是点，不是「任意字符」。
           want() {
-            if grep -qi -- "$1" "$LS"; then
+            if grep -qiF -- "$1" "$BL"; then
               echo "  [ok]   $1"
             else
               echo "  [FAIL] $1  —— $2"
@@ -142,7 +155,7 @@ jobs:
 
           echo "---- 必须不在 ----"
           nowant() {
-            if grep -qi -- "$1" "$LS"; then
+            if grep -qiF -- "$1" "$BL"; then
               echo "  [FAIL] $1 竟然在镜像里 —— $2"; fail=1
             else
               echo "  [ok]   $1 不在"
