@@ -1,10 +1,38 @@
 # 78 APFS 卷构建：一块能启动的 macOS 26 x86_64 盘的 on-disk 规格
 
-文档版本：1.0
-基线日期：2026-10-30
+文档版本：1.1
+基线日期：2026-10-30（1.1 修订：2026-11-01）
 上级文档：`docs/spec/00-OVERVIEW.md`
 配套分册：`71-IMAGE-OPENCORE.md`（素材与引导器）、`75-IMAGE-PREBAKE.md`（装配形式）、`76-BOOT-LAYOUT-PICKER.md`（卷角色与分区）、`77-UPDATEBRAIN-ABI.md`（Apple 自己怎么做）、`80-TEST-HARNESS.md`（启动验收）
 取证 workflow：`.github/workflows/forensics-boot-layout.yml`
+自有工具：`tools/ci/mkgpt.py`（离线写 GPT）、`tools/ci/gptdump.py`（读 GPT 原始字节）
+
+---
+
+## 版本 1.1 修订说明：两轮取证把第 A 节从「机制已知」推到「命令已验」
+
+1.0 把第 A 节的十层里八层写成了可照抄的命令，但那些命令**一条都没在真机上跑过**。
+1.1 的全部内容来自两轮 CI 取证（run `41271530800` 与 run `41274204499`，运行器 25G76 /
+x86_64 / SIP disabled / `Apple Paravirtual device`）。**结果是四条规格被证伪、十条待定项被关闭。**
+
+**被证伪的四条（1.0 照着写一定会失败，按严重度排）：**
+
+| # | 1.0 怎么写的 | 实测 | 后果 |
+|---|---|---|---|
+| 1 | 第 A.1 节：用 `gpt create -f` / `gpt add` 写分区表 | **`gpt` 的任何修改类子命令在 25G76 上一律 `operation not permitted`** —— 带不带 `sudo`、关不关 SIP、先不先 `unmountDisk` 都一样，而 `gpt -r show` 正常 | 装配链**第一条命令**就倒。改为离线写（`tools/ci/mkgpt.py`），见第 A.1 节 |
+| 2 | 第 A.1 节约束 3：p2 的 APFS 类型 GUID「必须在建容器之前就写对」 | **恰好相反。** 事先把 p2 写成 `7C3457EF-…`，`diskutil apfs createContainer` 报 `Error: -69614: The disk is already in use by APFS`。把 p2 写成 `Apple_HFS`（`48465300-…`）则成功，且 `createContainer` **自己把类型改成了 APFS** | 第二条命令倒。约束 3 整条反写，见第 A.1 节 |
+| 3 | 第 A.3.2 节第 2 步：`addVolume … -role D -groupWith "$SYS"` | **`Error: -69624: Unable to add a new APFS Volume to an APFS Container`。** 同一容器上 `-role S`、`-role B`、`-role V` 三条**全部成功** | Data 卷建不出来。登记为 **`V-031`**，第 A.3.3 节给了六条待试变体 |
+| 4 | 第 A.4.2 节规则 3 的退路：`chflags 0x80000` | **`chflags: invalid flags: 0x80000`，这个写法不存在。** 而助记符 `chflags restricted` 正常（回读 `flags=80000 restricted`） | 退路无效，但主路可用，所以不阻塞 |
+
+**被关闭的待定项：** `V-001`（见上）、`V-003`（`APFSContainerReference` 键名正确）、
+`V-006`（`FilesystemName` = `APFS`，非大小写敏感）、`V-007`（role B/V 可设）、
+`V-009`（`restricted` 可用、`0x80000` 不可）、`V-014`（Preboot 全树已取到，见第 A.6.7 节）、
+`V-016`（Preboot 里**确实有** `com.apple.Boot.plist`）、`V-017`（三份 `boot.efi` 字节相同，
+问题消失）、`V-021`（`bless --info` 直接给出 blessed 路径）、`V-029`（新增，ESP 可建）、
+`V-030`（新增，`gpt` EPERM 的根因）。
+
+**仍未关闭：** `V-002`、`V-004`、`V-005`、`V-008`、`V-011`…`V-013`、`V-015`（部分）、
+`V-018`、`V-019`、`V-020`、`V-022`、`V-023`、`V-028`、`V-031`。逐条见第 E 节的表。
 
 ## 0. 本文作用与前提
 
@@ -206,26 +234,145 @@ macos-golden.raw                 GPT，虚拟容量 16 GB（下限见 A.4.5）
 
 ### A.1 GPT 层 【必需】
 
-**直接接 `75` 第 0.0.1 节的序列，不改一个数。** 本文不重复那段脚本，只复述它定下的几何与补三条本文需要的约束。
+**几何接 `75` 第 0.0.1 节，一个数不改。工具换掉了：不能用 `gpt`。**
 
-| 项 | 值 | 来源 |
+| 项 | 值 | 标签 |
 |---|---|---|
-| 分区表 | GPT，用 `/usr/sbin/gpt create -f` 建，**不用 `diskutil partitionDisk`** | `75` §0.0.1 |
-| p1 起始扇区 | `2048`（1 MiB 对齐） | `75` §0.0.1 |
-| p1 长度 | `512 MiB / 512 = 1048576` 扇区 | `75` §0.0.1 |
-| p1 类型 | `gpt add -t efi` → `C12A7328-F81F-11D2-BA4B-00A0C93EC93B` | `75` §0.0.1、`76` §3.1 |
-| p2 起始扇区 | `2048 + 1048576 = 1050624` | 算术 |
-| p2 长度 | `TOTAL_SECT - 1050624 - 2048`（盘尾留 1 MiB 给 GPT 备份表） | `75` §0.0.1 |
-| p2 类型 | **`7C3457EF-0000-11AA-AA11-00306543ECAC`**（Apple APFS） | `75` §0.0.1、`76` §3.1 |
-| 收尾 | `gpt recover <rdisk>` 把备份表挪到真实盘尾 | `75` §0.0.1 |
+| 分区表 | GPT。**用 `tools/ci/mkgpt.py` 离线写进镜像文件**，不用 `/usr/sbin/gpt`，也不用 `diskutil partitionDisk` | `TESTED(25G76)` |
+| p1 起始扇区 | `2048`（1 MiB 对齐） | `TESTED(25G76)` |
+| p1 长度 | `512 MiB / 512 = 1048576` 扇区 → 止于 LBA `1050623` | `TESTED(25G76)` |
+| p1 类型 | `C12A7328-F81F-11D2-BA4B-00A0C93EC93B`（ESP）。`diskutil list` 回读显示 `EFI` | `TESTED(25G76)` |
+| p2 起始扇区 | `2048 + 1048576 = 1050624` | `TESTED(25G76)` |
+| p2 长度 | 吃到 last usable LBA，尾部按 1 MiB 向下取整 | `TESTED(25G76)` |
+| **p2 写入时的类型** | **`48465300-0000-11AA-AA11-00306543ECAC`（Apple_HFS）** ← 见下面的约束 3 | `TESTED(25G76)` |
+| **p2 建完容器后的类型** | `7C3457EF-0000-11AA-AA11-00306543ECAC`（Apple APFS），**由 `createContainer` 自己改** | `TESTED(25G76)` |
+| 收尾 | **不需要** `gpt recover`：`mkgpt.py` 一次就把备份头与备份项数组写在真实盘尾 | `TESTED(25G76)` |
+
+#### A.1.0 为什么不能用 `gpt`：`V-030` 的实测结果
+
+run `41274204499` 的 `D0-rawdev-permission.txt` 把「到底什么被拒了」拆成七条逐个量，
+运行器 `whoami = runner`、`sudo -n` 可用、`csrutil status = disabled`、
+目标是 `hdiutil attach -nomount` 刚挂上的 4 GiB 空镜像（`Virtual: Yes`、`Media Read-Only: No`）：
+
+| 探针 | 结果 |
+|---|---|
+| `sudo dd if=/dev/rdiskN` 读 1 扇区 | `rc=0` |
+| `sudo dd if=/dev/diskN` 读 1 扇区 | `rc=0` |
+| `sudo dd of=/dev/rdiskN` 写 1 扇区 | **`rc=0`** |
+| `sudo dd of=/dev/diskN` 写 1 扇区 | **`rc=0`** |
+| `sudo gpt -r show /dev/rdiskN` | `rc=0`，正常输出 |
+| `sudo gpt create -f /dev/rdiskN` | `rc=1` `operation not permitted: create` |
+| `sudo gpt create -f /dev/diskN` | `rc=1` 同上 |
+| `diskutil unmountDisk force` 之后再 `gpt create` | `rc=1` 同上 |
+| **不带** `sudo` 的 `dd` 写 | `rc=0` |
+| **不带** `sudo` 的 `gpt create` | `rc=1` 同上 |
+
+**结论（`TESTED(25G76)`）：这不是权限问题，是 `gpt(8)` 自己的护栏。**
+裸设备写入在这台机器上是允许的 —— 所以 `newfs_msdos`、`asr`、`dd` 这些都不受影响
+（`newfs_msdos` 在同一轮已实测成功，见第 A.1.2 节）。被禁的只有 `gpt` 的修改类子命令。
+野外有同样的报告：Ventura 起 `gpt` 除 `show` 以外的子命令一律返回
+`operation not permitted`，加 `sudo`、进 root shell、卸载磁盘、关 SIP 都无效
+（<https://apple.stackexchange.com/questions/460191/gpt-operation-not-permitted-in-ventura>，
+内容已改写以符合许可要求）。
+
+**所以 `75` 第 0.0.1 节与本节的分区表一步改成离线写。** 分区表就是文件头部的几个扇区，
+在 `hdiutil attach` **之前**以普通文件写入即可；普通文件不受这条护栏约束，也不需要 `sudo`。
+`hdiutil attach` 之后 MediaKit 解析这张表并给出 `/dev/diskNs1`、`/dev/diskNs2` —— 这一步
+run `41274204499` 已实测通过，`diskutil list` 的回读是：
+
+```text
+/dev/disk2 (disk image):
+   #:                       TYPE NAME                    SIZE       IDENTIFIER
+   0:      GUID_partition_scheme                        +4.3 GB     disk2
+   1:                        EFI                         536.9 MB   disk2s1
+   2:                  Apple_HFS                         3.8 GB     disk2s2
+```
+
+而 `gpt -r show` 对同一块盘的回读证实四套元数据都在规范位置上：
+
+```text
+    start     size  index  contents
+        0        1         PMBR
+        1        1         Pri GPT header
+        2       32         Pri GPT table
+       34     2014
+     2048  1048576      1  GPT part - C12A7328-F81F-11D2-BA4B-00A0C93EC93B
+  1050624  7337944      2  GPT part - 7C3457EF-0000-11AA-AA11-00306543ECAC
+  8388568        7
+  8388575       32         Sec GPT table
+  8388607        1         Sec GPT header
+```
+
+（第 2 行的类型已经是 APFS，因为这份回读是在 `createContainer` 之后取的 —— 这同时就是
+约束 3 的证据。）
+
+#### A.1.1 可照抄的分区表一步
+
+```bash
+# 几何与 75 §0.0.1 相同；工具换成 mkgpt.py。IMG 是还没 attach 的普通文件。
+python3 tools/ci/mkgpt.py create "$IMG" \
+        --size "$TOTAL_BYTES" \
+        --part "auto:$((512*1024*1024)):efi:EFI" \
+        --part "auto:auto:hfs:Macintosh HD"      # ← 注意是 hfs 不是 apfs，见约束 3
+
+# 独立复核（它会重新从字节解析，核对两个头的 CRC、项数组 CRC、几何、边界、重叠）
+python3 tools/ci/mkgpt.py verify "$IMG"
+
+# 之后才 attach。-nomount 是必须的：此刻 p2 还只是一个声称自己是 HFS+ 的空分区。
+DEV=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount "$IMG" \
+      | awk '/^\/dev\/disk/{print $1; exit}')
+```
+
+`mkgpt.py` 的正确性由三层守住，全部在 `check.yml` 里是必过项：
+UEFI 2.x 规范里已知的 GUID 混合字节序向量与 CRC32 向量、几何断言与 1 字节篡改必须被检出的
+往返测试、以及 `gptdump.py` 的哑读复核（它不复用 `mkgpt.py` 的任何常量，所以不会和它犯同一个错）。
+**最终判据仍然是 MediaKit 认不认**，而这一条已经实测通过。
 
 **三条本文追加的约束：**
 
 1. **APFS 分区必须是最后一个。** `73` 第 4.6.2 节的首启扩容是 `diskutil apfs resizeContainer <PHYS> 0`，`0` 的语义是吃到下一个分区或分区表末尾。p2 之后没有分区，所以它能一直扩到盘尾。`KNOWN`（`76` 第 3.1 节同一约束）。
-2. **写 GPT 必须对 `rdisk` 裸设备做，铺文件系统内容对 `disk` 做。** `75` 第 0.0.1 节的脚本里 `RAW="${DEV/disk/rdisk}"` 就是这件事。`gpt(8)` 需要裸设备；`diskutil mount` 要缓冲设备。
-3. **p2 的分区类型 GUID 必须在建容器之前就写对。** `diskutil apfs createContainer` 会把目标分区变成 Physical Store，但它**不保证**替我们改分区类型 GUID。`INFERRED`，查清方法：建完容器后 `gpt show <rdisk>` 看 p2 的类型，与上表比对。若不一致，用 `gpt remove` + `gpt add -t 7C3457EF-…` 重写（分区内容不动）。登记为 `V-001`。
+2. **分区表离线写进文件；铺文件系统内容对 `disk`/`rdisk` 节点做。** 原先这一条说的是「写 GPT 必须对 `rdisk` 裸设备做」，已被第 A.1.0 节推翻。裸设备这一侧仍然有一条真实的区分：`newfs_msdos` 要 `rdisk` 的**分区**节点（`${DEV/disk/rdisk}s1`），`diskutil mount` 要缓冲设备。
+3. **p2 在写分区表时必须写成 `Apple_HFS`，不能写成 APFS。** 这一条与 1.0 的写法完全相反，依据是实测：
 
-#### A.1.1 与 `76` 第 3.1 节的分区数差异，必须在这里说清
+   | p2 写入时的类型 | `diskutil apfs createContainer "${DEV}s2"` 的结果 |
+   |---|---|
+   | `7C3457EF-…`（Apple APFS） | **`Error: -69614: The disk is already in use by APFS`** |
+   | `48465300-…`（Apple_HFS） | 成功。打印 `Switching disk2s2 to APFS` / `Created new APFS Container disk3`，并**自己把 GPT 里 p2 的类型改成 `7C3457EF-…`** |
+
+   解释：`createContainer` 看见分区已经声称自己是 APFS，就去找那里的容器超级块；
+   找不到（分区是空的）于是报「已被 APFS 占用」而拒绝覆盖。这是一条防误删的保护，
+   不是缺陷。**所以 `V-001` 的答案是「`createContainer` 确实替我们改类型，而且必须由它改」。**
+   `TESTED(25G76)`。
+
+#### A.1.2 ESP 上的 FAT32：`V-029`，两条路都通，但只有一条能用
+
+1.0 从没问过「ESP 的文件系统怎么建」。run `41274204499` 把两条路都试了，**两条都返回 0，
+但其中一条会毁掉 ESP 的分区类型 GUID**：
+
+| 路 | 命令 | 退出码 | 副作用 |
+|---|---|---|---|
+| **a（用这条）** | `sudo newfs_msdos -F 32 -v EFI "${DEV/disk/rdisk}s1"` | `0` | 无。GPT 里 p1 的类型仍是 `C12A7328-…` |
+| b（不要用） | `sudo diskutil eraseVolume FAT32 EFI "${DEV}s1"` | `0` | **把 p1 的类型改成了 `Microsoft Basic Data`**（回读 `Partition Type: Microsoft Basic Data`） |
+
+`newfs_msdos` 的回显（`TESTED(25G76)`，1 MiB 对齐的 512 MiB 分区）：
+
+```text
+512 bytes per physical sector
+/dev/rdisk2s1: 1046496 sectors in 130812 FAT32 clusters (4096 bytes/cluster)
+bps=512 spc=8 res=32 nft=2 mid=0xf8 spt=32 hds=128 hid=2048 drv=0x80
+bsec=1048576 bspf=1022 rdcl=2 infs=1 bkbs=6
+```
+
+**为什么路 b 有害：** 固件只在分区类型是 `C12A7328-F81F-11D2-BA4B-00A0C93EC93B` 时才把
+那个分区当 ESP 去找 `\EFI\BOOT\BOOTX64.EFI`（`74` 第 2 节的 shim 就放在那里）。
+类型变成 MS Basic Data 之后，OpenCore 连被加载的机会都没有，而**症状是「固件直接跳过这块盘」**，
+与 `76` 第 1.3 节判据 1 失败时的表现一样难归因。
+
+**写进第 B 节的规则：ESP 一律用 `newfs_msdos -F 32`，禁止 `diskutil eraseVolume` 碰 p1。**
+若一定要用 `diskutil`，必须在之后重写 p1 的类型 —— 而 `gpt` 又不能用（第 A.1.0 节），
+那就只能 detach、用 `mkgpt.py` 重写整张表、再 attach。所以这条退路实际上不存在。
+
+#### A.1.3 与 `76` 第 3.1 节的分区数差异，必须在这里说清
 
 `76` 第 3.1 节写的是**三分区**（p1 ESP / p2 BaseSystem 1600 MiB / p3 APFS），`75` 第 0.0.1 节写的是**两分区**（p1 ESP 512 MiB / p2 APFS）。`76` 第 6.5 节的 `75-A` 条又建议把 `75` 改成三分区。**这两条修订是同一轮交叉产出的，时间上 `75` 的 1.2 修订在后。**
 
@@ -264,7 +411,23 @@ CNT=$(diskutil info -plist "${DEV}s${APFS_PART}" \
 #       所以也可以把它的 stdout 抓下来 grep
 ```
 
-`INFERRED`：`APFSContainerReference` 这个键名未在运行器上实测。查清方法在第 D 节（`diskutil info -plist` 全文落盘）。登记为 `V-003`。**退路是确定可用的**，所以这一条不阻塞。
+**`V-003` 已关闭：`APFSContainerReference` 就是正确的键名。** `TESTED(25G76)`，两处独立取到：
+
+```text
+# 运行器自己的盘（volumes job，23-container-ref.txt）
+== physical store candidate: disk0s2
+  "APFSContainerReference" => "disk1"
+  "Content" => "Apple_APFS"
+  "DeviceIdentifier" => "disk0s2"
+
+# scratch 镜像（tooling job，B4-scratch.txt）
+  "APFSContainerReference" => "disk3"
+  "DeviceIdentifier" => "disk2s2"
+```
+
+退路（抓 `createContainer` 的 stdout）仍然成立，实测回显是
+`Created new APFS Container disk3` —— 注意**没有** "with disk identifier" 这几个字，
+1.0 写的那个串对不上，所以退路的 grep 要按 `Created new APFS Container ([a-z0-9]+)` 写。
 
 ### A.3 卷层 【四个必需，一个不要】
 
@@ -302,9 +465,21 @@ sudo diskutil apfs addVolume "$CNT" APFS "Macintosh HD" -role S -nomount
 SYS=$(vol_of "Macintosh HD"); echo "System  = $SYS"
 
 # ---- 2. Data，与 System 成组 ----
+# !! 这一条在 25G76 上实测失败：Error: -69624（见 A.3.3a，V-031）。
+#    下一轮取证会从 A.3.3a 的 D2..D7 里挑出可用的变体替换它。
+#    在那之前这整个脚本不可照抄运行 —— 这是 1.1 唯一的一处「已知不通」。
 sudo diskutil apfs addVolume "$CNT" APFS "Macintosh HD - Data" \
      -role D -groupWith "$SYS" -nomount
 DATA=$(vol_of "Macintosh HD - Data"); echo "Data    = $DATA"
+
+# ---- 2b. 立刻验组。1.0 把这一步放在第 6 步，太晚：中间还插两次 addVolume，
+#          真出错时要回溯三条命令才知道哪条坏了。
+GROUPS=$(diskutil apfs listVolumeGroups "$CNT" 2>&1)
+printf '%s\n' "$GROUPS"
+printf '%s\n' "$GROUPS" | grep -qF "$SYS" \
+  || { echo "FATAL(V-031): System 卷不在任何 volume group 里，停"; exit 1; }
+printf '%s\n' "$GROUPS" | grep -qF "$DATA" \
+  || { echo "FATAL(V-031): Data 卷不在 System 的组里，停"; exit 1; }
 
 # ---- 3. Preboot。不进组（容器级共享卷）----
 sudo diskutil apfs addVolume "$CNT" APFS "Preboot" -role B -nomount
@@ -327,11 +502,71 @@ diskutil apfs listVolumeGroups "$CNT"
 
 **`vol_of` 用 `diskutil list` 的文本输出而不是 plist**，理由与 `75` 第 2.3.3 节同：`diskutil info -plist` 没有「按卷名查设备」这样一个键，而 `apfs list -plist` 的数组下标会随卷的建立顺序变化。文本匹配在这里更稳。`INFERRED`，第 D 节会把两种输出都落盘，确定 plist 路径后可以换成 plist 版本。
 
-#### A.3.3 `-role B` 与 `-role V` 能不能由我们自己设，这是一条真实的未知
+#### A.3.3 四个 role 的实测结果：担心错了对象
 
-`diskutil(8)` 对 role 有两句保留（转述自手册）：卷可以带零个或多个 role 元数据标志，**并非所有组合都合法，也并非所有标志都允许由用户设置或更改**；`addVolume` 一节另说你可能**一次只能带一个 role**，还有其他规则。
+1.0 写的是「`-role S` 与 `-role D` 肯定能设，`-role B`/`-role V` 是未知」。
+run `41274204499` 在一个 4 GiB scratch 容器上把四条逐个跑了一遍，**结果与担心的方向相反**：
 
-即：**`-role S` 与 `-role D` 肯定能设**（`75` 第 2.3.3 节已按手册写出 `-role D -groupWith` 的用法，这是社区通行做法），**`-role B`（Preboot）与 `-role V`（VM）会不会被 `diskutil` 拒绝，手册没说。** `INFERRED`，登记为 **`V-007`，这是本文第一优先要查的三条之一**。
+| 命令 | 退出码 | 回显 | 标签 |
+|---|---|---|---|
+| `addVolume disk3 APFS "Macintosh HD" -role S -nomount` | `0` | `Created new APFS Volume disk3s1` | `TESTED(25G76)` |
+| `addVolume disk3 APFS "Macintosh HD - Data" -role D -groupWith disk3s1 -nomount` | **`1`** | **`Error: -69624: Unable to add a new APFS Volume to an APFS Container`** | `TESTED(25G76)` |
+| `addVolume disk3 APFS "Preboot" -role B -nomount` | `0` | `Created new APFS Volume disk3s2` | `TESTED(25G76)` |
+| `addVolume disk3 APFS "VM" -role V -nomount` | `0` | `Created new APFS Volume disk3s3` | `TESTED(25G76)` |
+
+**`V-007` 关闭：`-role B` 与 `-role V` 都能由我们自己设，不需要任何退路。**
+
+与此一致的还有 `diskutil apfs addVolume` 自己打印的用法串（`TESTED(25G76)`，
+这比手册更贴近这个 build）：
+
+```text
+[-role <roles>]
+      <roles> = "0" or one or more of B|R|V|I|T|S|D|E|X|H|C|Y
+[-group[With] | -sibling <apfsVolumeDisk>]
+```
+
+`changeVolumeRole` 的用法串同时确认了退路 R-a 存在，而且语义比手册讲得细：
+
+```text
+Usage: diskutil apfs changeVolumeRole|chrole <apfsVolumeDisk> <roles>
+      <roles> = "0" or "clear" or one or more of
+                b|r|v|i|t|s|d|e|x|h|c|y
+                B|R|V|I|T|S|D|E|X|H|C|Y
+Unspecified flags are left alone; lower case clears a flag;
+upper case sets a flag; clear clears all flags; 0 is ignored.
+```
+
+即：**大写置位、小写清位、`clear` 全清、`0` 忽略，未提到的位不动**，而且动词有别名 `chrole`。
+
+#### A.3.3a 真正的那个坑：`-role D -groupWith` 被拒（`V-031`）
+
+**这是 1.1 发现的最严重的一条，而它恰好在 1.0 认为「肯定能设」的那一格里。**
+`-69624` 是 `diskutil` 的通用错误，不指明原因。已排除的解释：
+
+- **不是容器太小**：同一个容器上后续的 `-role B`、`-role V` 都成功了。
+- **不是 role D 本身被禁**：用法串里 `D` 在允许集合内，而 `-role S` 在同一容器上成功。
+- **不是卷名冲突**：容器里当时只有 `Macintosh HD` 一个卷。
+
+**六条待试变体，下一轮取证逐个跑（workflow 里的 `V-031` 阶梯）：**
+
+| # | 变体 | 为什么可能 |
+|---|---|---|
+| D2 | `addVolume … -groupWith "$SYS"`，**不给 `-role D`** | 成组这个动作本身可能就隐含了 role D；显式再给一次可能构成「不合法的组合」 |
+| D3 | `addVolume … -role D -group "$SYS"` | 用法串写的是 `-group[With]`，两种拼法都该接受，但 `-groupWith` 的解析可能有别的分支 |
+| D4 | `addVolume … -role D -sibling "$SYS"` | 用法串把 `-sibling` 与 `-group[With]` 列为同一组互斥项，语义可能更宽松 |
+| D5 | 先 `addVolume` 不带 role 也不成组，再 `changeVolumeRole <vol> D`，再想办法成组 | 把两件事拆开，定位到底是 role 还是 group 被拒 |
+| D6 | 把顺序倒过来：先建 Data（`-role D`，不成组），再建 System（`-role S -groupWith <data>`） | 组的锚可能必须是 Data 那一侧 |
+| D7 | `addVolume` 之后用 `diskutil apfs deleteVolumeGroup` / 重建，观察 `listVolumeGroups` 的中间态 | 纯诊断，用来读 `-69624` 的上下文 |
+
+**这一条阻塞整条装配链**：没有成组的 Data 卷，firmlink 建不起来（第 A.5.2 节），
+启动会停在早期用户态。所以它是第 E 节表里现在的**第一优先**。
+
+**同时它给第 A.3.2 节的脚本加了一条硬门禁**：第 2 步之后必须立刻验
+`diskutil apfs listVolumeGroups "$CNT"` 里有且只有一个组、成员恰好两个。
+1.0 的脚本把自检放在第 6 步，太晚 —— 中间还插了两次 `addVolume`，
+真出错时要回溯三条命令才知道哪条坏了。
+
+#### A.3.3b 三条退路（原文保留，`V-007` 已不需要它们，但 `V-031` 可能需要 R-b）
 
 **三条退路，按优先级：**
 
@@ -435,7 +670,18 @@ awk -F'\t' 'NR>1 && ($5=="524288" || $5=="524320") { print $1 }' "$IDX" \
   | sudo xargs -0 -n 200 chflags restricted
 ```
 
-`INFERRED`：`chflags restricted` 这个助记符是否被 25G325 的 `chflags` 接受未实测（它是 `SF_RESTRICTED` 的标准助记符）。退路是 `chflags 0x80000`。查清方法在第 D 节（`chflags` 用法串 + 对一个 scratch 文件实测）。登记为 `V-009`。
+**`V-009` 已关闭，而 1.0 写的退路是错的。** `TESTED(25G76)`，run `41271530800` 的 `B3-chflags.txt`：
+
+| 写法 | 结果 |
+|---|---|
+| `sudo chflags restricted <file>` | **成功**。回读 `stat -f 'flags=%Xf  %Sf'` → `flags=80000  restricted` |
+| `sudo chflags 0x80000 <file>` | **`chflags: invalid flags: 0x80000`。这个写法不存在**，回读 `flags=0` |
+| `sudo chflags compressed <file>` | 助记符被接受但**标志没置上**，回读 `flags=0`；文件内容照常读出（`cat` → `hello`，`stat -f %z` → `6`） |
+
+两条连带结论：
+
+1. **退路取消。** 只有助记符 `restricted` 可用。要用数字形式得查 `chflags(1)` 接受的八进制/十进制写法，但既然助记符通的，这件事没有继续查的价值。
+2. **第 A.4.2 节规则 1 的那个灾难场景，用 `chflags` 触发不了。** APFS 上 `chflags compressed` 不会真的置 `UF_COMPRESSED`。所以「标志与内容不一致」这个杀手只能由**同时写 `com.apple.decmpfs` xattr 与标志**的工具制造（即 `cp -p`/`rsync -X` 一类按 xattr 原样搬运的路径），而不会由我们自己的 `chflags` 一步制造。**这把第 0.3.1 节那条风险的触发面缩小了，但没有消除** —— 规则 1（禁止照抄 `FLG`）仍然有效，因为真正的危险在 xattr 搬运那一侧。
 
 #### A.4.3 可照抄的铺内容序列
 
@@ -663,7 +909,11 @@ ESP:\EFI\OC\OpenCore.efi
 2. **它把自动添加的件分成两类具名的东西：cryptographic 与 EFI rendering。** 对上第 A.6.3 节的两组文件：`.im4*`（cryptographic）与 `.disk_label*`（EFI rendering，即渲染给固件选择器看的那张图）。
 3. **它给了一条可以在 CI 里跑的取证实验：** 在一块 scratch 磁盘镜像上造一个 HFS+ 卷，给一个空的暂存目录，跑 `diskutil apfs convert -prebootSource <dir>`，然后看 `diskutil` 往我们的目录里加了什么。**那就是 Apple 自己认为的 Preboot 必需件清单。** 而 `-dryrun` 还能让我们不真的转换。这条实验写进第 D 节的 `preboot-probe` job。
 
-#### A.6.3 `<VG_UUID>/` 下面有什么：现在能确定什么、缺什么
+#### A.6.3 `<VG_UUID>/` 下面有什么：从 payload 推出来的那一份
+
+> **1.1 注：这一节是 1.0 从 payload 索引与手册推出来的预测。实测清单在第 A.6.7 节，
+> 那里逐条与本节对账。本节保留，因为「哪些件来自 payload、哪些件不来自」这个
+> 区分只有本节有，而它决定我们要不要自己准备那个文件。**
 
 **路径骨架（`KNOWN`，多个独立来源一致）：**
 
@@ -776,31 +1026,220 @@ SYSROOT="${1:?}"; PREROOT="${2:?}"; VG="${3:?}"
 PBCS="$PREROOT/$VG/System/Library/CoreServices"
 sudo mkdir -p "$PBCS"
 
-# ---- 1. 两个 plist。bless 可能已经铺了，这里做幂等的兜底 ----
-for f in SystemVersion.plist PlatformSupport.plist; do
+# ---- 1. 四个 plist / bin。bless 可能已经铺了，这里做幂等的兜底 ----
+#      BridgeVersion.{bin,plist} 是 1.1 从实测清单补上的（A.6.7）：
+#      运行器同样没有 T2，这两项照样在，说明它们是无条件铺的。
+for f in SystemVersion.plist PlatformSupport.plist BridgeVersion.plist BridgeVersion.bin; do
+  [ -f "$SYSROOT/System/Library/CoreServices/$f" ] || continue
   sudo ditto "$SYSROOT/System/Library/CoreServices/$f" "$PBCS/$f"
 done
-# 断言字节数与 payload 一致（71 §4.1 的 790、本文 §0.5 的 604）
-test "$(stat -f%z "$PBCS/PlatformSupport.plist")" = "790" || echo "WARN: PlatformSupport.plist 字节数不符"
-test "$(stat -f%z "$PBCS/SystemVersion.plist")"   = "604" || echo "WARN: SystemVersion.plist 字节数不符"
+# 断言字节数。790 来自 71 §4.1 与实测双向确认；SystemVersion 随版本浮动
+# （25G325 payload = 604，25G76 实测 = 603），所以只断言区间。
+test "$(stat -f%z "$PBCS/PlatformSupport.plist")" = "790" \
+  || echo "WARN: PlatformSupport.plist 字节数不是 790"
+SV=$(stat -f%z "$PBCS/SystemVersion.plist")
+[ "$SV" -ge 590 ] && [ "$SV" -le 620 ] \
+  || echo "WARN: SystemVersion.plist 字节数 $SV 不在 590..620"
 
 # ---- 2. boot.efi 的兜底。bless --bootefi 正常会铺，没铺就从 i386 拷 ----
+#      实测（A.6.7）：三份 boot.efi（Preboot / System CoreServices / usr/standalone/i386）
+#      SHA-256 完全相同，所以拷哪一份都一样 —— V-017 这一问因此消失。
 if [ ! -f "$PBCS/boot.efi" ]; then
   sudo ditto "$SYSROOT/usr/standalone/i386/boot.efi" "$PBCS/boot.efi"
 fi
 test "$(stat -f%z "$PBCS/boot.efi")" = "723512" || echo "WARN: boot.efi 字节数不符 723512"
 
-# ---- 3. 选择器名字。.disk_label* 由 bless --label 渲染，这里只写文本的那个 ----
-printf 'macOS 26.7.2' | sudo tee "$PBCS/.contentDetails" >/dev/null
+# ---- 3. 选择器名字。.disk_label*、.disk_label.contentDetails、.root_uuid
+#         四个件全部由 bless 生成（A.6.7 的 A 类），这里什么都不写。
+#         1.0 在这里手写了一个 .contentDetails —— 文件名本身就是错的
+#         （实际是 .disk_label.contentDetails），而且不该由我们写。
 
-# ---- 4. 所有者 ----
+# ---- 4. 启动用的 BKC 副本。1.1 从实测清单补上（A.6.7 的 B 类）----
+BKC="$PREROOT/$VG/boot/System/Library/KernelCollections"
+sudo mkdir -p "$BKC"
+sudo ditto "$SYSROOT/System/Library/KernelCollections/BootKernelExtensions.kc" \
+           "$BKC/BootKernelExtensions.kc"
+test "$(stat -f%z "$BKC/BootKernelExtensions.kc")" = "67584000" \
+  || echo "WARN: BootKernelExtensions.kc 字节数不符 67584000"
+
+# ---- 5. EFI 登录界面的渲染资源。1.1 从实测清单补上（A.6.7 的 B 类）----
+#      实测路径是 <VG>/System/Library/Caches/com.apple.corestorage/EFILoginLocalizations/
+#      源是 payload 的 usr/standalone/i386/EfiLoginUI/（13 个 .efires，A.6.4）。
+#      注意两边的文件名集合不完全相同（实测约 20 个），差额由 updatePreboot 生成，
+#      所以这一步尽力拷，缺的交给第 10 步。
+EFIL="$PREROOT/$VG/System/Library/Caches/com.apple.corestorage/EFILoginLocalizations"
+sudo mkdir -p "$EFIL"
+sudo ditto "$SYSROOT/usr/standalone/i386/EfiLoginUI/" "$EFIL/" || \
+  echo "WARN: EfiLoginUI 拷贝不完整，交给 updatePreboot"
+
+# ---- 6. 所有者。实测（A.6.7）Preboot 上的件是 root:staff / runner:staff 混合、
+#         flags 一律为 0（没有 SF_RESTRICTED）。我们一刀切 root:wheel，
+#         因为「谁拥有它」在 EFI 阶段没有消费者（那时还没有 BSD 层）。
 sudo chown -R root:wheel "$PREROOT/$VG"
 
-# ---- 5. cryptex：V-015 关掉之前这里是空的。不要猜着铺。 ----
-echo "TODO V-015: Preboot 卷根下的 Cryptexes/ 待取证后补"
+# ---- 7. 不要铺的：全部 *.im4m（实测是 8 个 board 各一份的票据）、Firmware/、
+#         restore/、PreLoginData/、var/db/*Info.plist、Preboot 卷根的
+#         com.apple.BootInfo xattr。理由见 A.6.7 的 C 类。
+
+# ---- 8. cryptex：V-015 关掉之前这里是空的。不要猜着铺。 ----
+echo "TODO V-015: Preboot 卷根下的 Cryptexes/ 与 <VG>/cryptex1/current/ 待取证后补"
 ```
 
 **第 5 步留空是故意的，而不是遗漏。** 猜着铺 2.4 GB 的 cryptex 内容，错了的表现是「启动到某个点卡住」而不是报错，在无头环境里无法归因（`76` 第 1.3 节同一个误诊模式）。**先取证，再铺。**
+
+#### A.6.7 实测清单（`V-014` 关闭）：一台活着的 macOS 26 x86_64 的 Preboot 卷长什么样
+
+全部 `TESTED(25G76)`，来自 run `41271530800` 的 `preboot` job。
+运行器是 26.6.1 / 25G76 / x86_64 / `Apple Paravirtual device`，SIP 已关，
+封印完好（`/` 挂的是系统卷的 root snapshot）。**Preboot 卷全树共 679 条**（不含 `Cryptexes/`）。
+
+**第一层（Preboot 卷根）：**
+
+```text
+/System/Volumes/Preboot/            drwxr-xr-x root:staff   xattr com.apple.BootInfo (16 B)
+├─ .TemporaryItems/folders.0/TemporaryItems       d-wx--x--t root:wheel
+├─ 0F9D8E91-834F-3213-9298-BA3FF72476FE/          drwxr-xr-x runner:staff  ← volume group UUID
+├─ com.apple.security.cryptexd/                   drwx---r-x root:staff（读不到，权限）
+└─ Cryptexes/                                     drwxrwxrwx root:staff
+```
+
+三条立刻可用的事实：
+
+1. **per-UUID 目录名确实就是 volume group UUID**，格式是标准 36 字符 UUID。第 A.3.2 节第 5 步取的那个 `$VG` 直接用。
+2. **`Cryptexes/` 与 per-UUID 目录是同级的，不在它下面。** 1.0 第 A.6.5 节把它的位置标成未知，现在定死：**Preboot 卷根下**。
+3. **Preboot 卷根上有一个 16 字节的 `com.apple.BootInfo` xattr**，而整棵树里**只有这一处**有值得注意的 xattr（另一处是 `com.apple.loginwindow.plist` 上的 `com.apple.quarantine`）。谁写的、内容是什么都未知 —— 登记为 **`V-032`**。它只有 16 字节，很可能是一个 UUID（指向当前 blessed 的 volume group）。**不阻塞**：我们自己铺的时候不写它，看启动是否受影响即可。
+
+**`<VG_UUID>/System/Library/CoreServices/` —— 启动链真正读的那个目录（10 类件）：**
+
+| 件 | 1.0 预测 | 实测 |
+|---|---|---|
+| `boot.efi` | 有 | **有**，723,512 字节，`0644 root:wheel`，`flags=0` |
+| `boot.efi.<board>.im4m` × 8 | 1.0 猜「3 个 `.im4*`，我们无 T2 大概率不需要」 | **有，而且是每个 board 一份，8 份**。board 标识符：`j152fap` `j160ap` `j185ap` `j185fap` `j214ap` `j214kap` `j215ap` **`x86legacyap`** |
+| `SystemVersion.plist` | 有，604 字节 | **有**，**603** 字节（1.0 的 604 是 25G325 payload 的值，运行器是 25G76，差 1 字节是版本串长度）；`0644 root:staff`，`flags=0` |
+| `PlatformSupport.plist` | 有，790 字节 | **有，790 字节，与 System 卷上那份 SHA-256 完全相同**（`06ffc188ff2bccd233b594e3e43ba4e6a9b57a168e27489839b7a3b0d2f28107`）；顶层键 `SupportedBoardIds` / `SupportedModelProperties`，16 条 |
+| `.disk_label` | 有 | **有** |
+| `.disk_label_2x` | 有 | **有** |
+| `.contentDetails` | 1.0 写的文件名 | **文件名错了。实际是 `.disk_label.contentDetails`** |
+| `.root_uuid` | 1.0 完全没有这一项 | **有。** 名字自明：blessed 系统卷的 UUID |
+| `BridgeVersion.bin` / `BridgeVersion.plist` | 1.0 完全没有这两项 | **有。** T2/Bridge 固件版本。我们没有 T2，但它们存在于一台同样没有 T2 的虚机上 → 说明它们是无条件铺的 |
+
+**`<VG_UUID>/` 下的其余八棵子树：**
+
+| 子树 | 内容 | 对我们的意义 |
+|---|---|---|
+| `boot/System/Library/KernelCollections/` | `BootKernelExtensions.kc`、`BootKernelExtensions.kc.elides`、`BootKernelExtensions.kc.<board>.im4m` × 8 | **这是启动用的那份 BKC 的副本，在 Preboot 上。** 第 0.3.1 节已核实 payload 里的 `BootKernelExtensions.kc` 是 67,584,000 字节且**不带 `AFT`**（未压缩）—— 两边对得上 |
+| `System/Library/KernelCollections/` | `BootKernelExtensions.kc.<board>.im4m` × 8（**只有 im4m，没有 `.kc` 本体**） | 第二份 ticket 副本。为什么要两份未知，不阻塞 |
+| `cryptex1/current/` | `app.dmg` `app.dmg.root_hash` `app.dmg.trustcache`、`os.dmg` `os.clone.dmg` `os.dmg.root_hash` `os.dmg.trustcache`、`apticket.<board>.im4m` × 8、`BuildManifest.plist` `RestoreVersion.plist` `SystemVersion.plist` | **见下面单独一段，这是本节最重要的发现** |
+| `Firmware/` | 74 条，全是 `.im4m`：`094-96883-090.dmg.{root_hash,trustcache}`、`094-96899-090.dmg.{root_hash,trustcache}`、`094-96884-089.dmg.aea.x86.{mtree,root_hash,trustcache}`、`BaseSystem.dmg.x86.trustcache`、`x86_64SURamDisk.dmg.x86.trustcache`，**每一项 × 8 个 board** | 全是票据，没有本体。`094-*` 是 Apple 的件号 |
+| `Library/Preferences/` | `com.apple.loginwindow.plist`；`SystemConfiguration/{com.apple.Boot.plist, NetworkInterfaces.plist, preferences.plist}` | **`V-016` 的答案：Preboot 里确实有 `com.apple.Boot.plist`**，见下 |
+| `System/Library/Caches/com.apple.corestorage/` | `EFILoginLocalizations/*.efires`（约 20 个）、`EncryptedRoot.plist.wipekey` | 这就是第 A.6.2 节事实 3 里 Apple 自己说的「EFI rendering」那一类，也对上第 A.6.4 节 payload 里 `usr/standalone/i386/EfiLoginUI/` 的 13 个 `.efires` |
+| `PreLoginData/` | `diagnostics/`（logd 的早期日志）+ `uuidtext/`（约 200 个日志符号文件） | **运行期产物，不是我们要铺的东西。** 679 条里绝大多数是这一棵 |
+| `restore/BuildManifest.plist`、`usr/standalone/OS.dmg.root_hash.<board>.im4m` × 8、`var/db/{AdminUserRecoveryInfo,AllUsersInfo}.plist` | 安装/恢复与用户元数据 | `var/db/*Info.plist` 两份就是第 A.6.2 节事实 2（`updatePreboot`）写的那一部分 |
+
+**`V-016` 的答案，以及它为什么不改变我们的做法。**
+`<VG_UUID>/Library/Preferences/SystemConfiguration/com.apple.Boot.plist` **存在**。
+它的字节来源就是第 A.6.3 节找到的那一条：payload 的
+`System/Library/Templates/Data/Library/Preferences/SystemConfiguration/com.apple.Boot.plist`（232 字节）。
+但本项目的 boot-args 由 OpenCore 的 `NVRAM/Add` 固化（`70` §5.3 路径 A、`71` §6.7），
+**不走这个文件**，所以第 A.6.6 节的脚本不往这里写。
+**它的存在只改变一件事：它在，不代表启动链读它。** `V-016` 从「它存不存在」关闭，
+「它影不影响我们」这一问的答案是「不影响」，依据是 OpenCore 自己注入 boot-args。
+
+**`cryptex1/current/` —— `V-015` 与 `77` 的 `U-001` 都因为这一棵发生了变化。**
+
+```text
+<VG_UUID>/cryptex1/current/
+├─ os.dmg                os.dmg.root_hash   os.dmg.trustcache
+├─ os.clone.dmg
+├─ app.dmg               app.dmg.root_hash  app.dmg.trustcache
+├─ apticket.j152fap.im4m      apticket.j160ap.im4m
+├─ apticket.j185ap.im4m       apticket.j185fap.im4m
+├─ apticket.j214ap.im4m       apticket.j214kap.im4m
+├─ apticket.j215ap.im4m       apticket.x86legacyap.im4m
+└─ BuildManifest.plist   RestoreVersion.plist   SystemVersion.plist
+```
+
+三条结论：
+
+1. **cryptex 的形态确认是 sealed DMG + root hash + trust cache，不是目录树。** 第 A.6.5 节的 `INFERRED` 转为 `TESTED(25G76)`。
+2. **三个符号链接的目标确认，第 A.6.5 节的推测成立。** `TESTED(25G76)`：
+
+   ```text
+   /System/Cryptexes/OS        -> ../../System/Volumes/Preboot/Cryptexes/OS
+   /System/Cryptexes/App       -> ../../System/Volumes/Preboot/Cryptexes/App
+   /System/Cryptexes/ExclaveOS -> ../../System/Volumes/Preboot/Cryptexes/ExclaveOS
+   ```
+
+   三条链接自身在 System 卷上、带 `restricted`；`/System/Cryptexes` 目录自己带
+   `com.apple.rootless`（0 字节）与 `restricted`；`OS` 那条额外带 45 字节的
+   `com.apple.fs.altlink`（1.0 从 payload 索引读出的「70 字节 xattr」是 25G325 的值，
+   运行器上是 45 字节，差异不影响结论）。`st_dev` 对照证实
+   `/System/Volumes/Preboot/Cryptexes/OS` 在 Preboot 卷上（`16777220`），
+   而 `/` 与 Data 卷同为 `16777225`。
+3. **`apticket.<board>.im4m` 是 8 个 board 各一份，全部预置。** 这是本轮最有分量的一条新证据，
+   因为它与「ticket 在密码学上绑定到它所在的那台设备」这句官方说法**不相容**：
+   如果票据是逐机签的，盘上只会有本机那一份。**8 份按 board-id 预发的票据说明
+   这一层是按 board 粒度签的，不是按机器粒度。** 这对 `77` 的 `U-001`
+   （UpdateBrain 的 PREPARE 相位是否必须向 `gs.apple.com` 签 cryptex1 ticket）
+   构成强烈的否定方向证据，但**还不足以判死**：也可能是安装介质里自带这 8 份、
+   而 APPLY 相位另有一次逐机签。查清方法在 `77` 第 D.3 节已写的实跑。
+
+**顺带解决了 run `41271530800` 留下的那个「待解释」：`/` 的 `st_dev` 为什么和 Data 卷一样。**
+因为 volume group 的两个卷对外呈现为**同一个文件系统**，这正是 firmlink 存在的理由 ——
+`/private`、`/Users` 这些路径要在 `/` 下看起来像本地目录。所以 `16777225` 是
+volume group 的 fsid，`16777220` 是 Preboot 的。`TESTED(25G76)`，
+这同时给第 A.5.2 节 `V-013` 的验证方法加了一条约束：**不能用 `st_dev` 区分
+System 与 Data**（它们相同），只能用 `stat -f '%Sd'` 看具体设备名，或比 `diskutil info`。
+
+**`bless --info /` 的实测输出（关闭 `V-021` 的一半）。** `TESTED(25G76)`：
+
+```text
+Mount point for / is /
+No auxiliary booter partition required
+System partition found
+Preferred system partition found: disk0s1
+Returning booter information dictionary:
+{
+    "Auxiliary Partitions" = ( );
+    "Data Partitions"      = ( disk1s5s1 );
+    "Preboot Volumes"      = ( disk1s2 );
+    "System Partitions"    = ( disk0s1 );
+}
+ 12884902278 => Blessed System File   is /System/Volumes/Preboot/<VG>/System/Library/CoreServices/boot.efi
+ 12884902198 => Blessed System Folder is /System/Volumes/Preboot/<VG>/System/Library/CoreServices
+The blessed volume in this APFS container is /dev/disk1s5, which is not mounted.
+```
+
+四条读出来的事实：
+
+1. **blessed 的目录与文件都在 Preboot 卷上**，不在 System 卷上。所以第 A.10 节那条
+   `bless --folder <sysvol>/System/Library/CoreServices --bootefi --create-snapshot`
+   里给的是**源**路径，`bless` 内部把结果记到 Preboot 的对应路径 —— 两者不矛盾，
+   但第 A.10 节必须把这件事写明，否则照抄的人会以为 blessed 目录是 System 卷上那个。
+2. **`"System Partitions" = ( disk0s1 )` 就是 ESP**，而 `disk0s1` 正是第 A.1 节的 p1。
+   `bless` 自己把 ESP 叫 "System Partition"，与 UEFI 术语一致。
+3. **`"Data Partitions" = ( disk1s5s1 )` 是一个快照设备**：`disk1s5` 是系统卷，
+   `disk1s5s1` 是它的 root snapshot，而 `/` 就挂在那上面。这是 SSV 从快照启动的形状，
+   与第 A.9 节的规格一致。
+4. **blessed 目录/文件被记成两个 APFS 文件 ID**（`12884902198` / `12884902278`），
+   不是路径字符串。所以 `V-022`（「具体是哪些 APFS 字段」）的答案方向是
+   「卷的 bootability 记录里存的是 inode 号」。完整字段仍需 `bless --info --plist` 的
+   全文，那一份本轮取到了（`43-bless-info-root.plist`）但还没逐键消化，`V-022` 保持开启。
+
+**`V-018` 本轮没关，而且原因本身是一条证据。** 读容器 jumpstart 区域那一步
+（`sudo dd if=/dev/rdisk0s2 bs=1m count=8 | strings`）**产出为空**。
+结合第 A.1.0 节的实测（裸设备读在**磁盘镜像**设备上正常），
+最可能的解释是**运行器自己那块物理盘的裸节点读被拦**，而镜像设备不受限。
+下一轮取证把这条探针的 stderr 留下来即可定死。
+
+**一张「我们要自己铺什么」的净表。** 把上面全部合起来，按「谁来铺」分三类：
+
+| 类 | 件 | 谁铺 |
+|---|---|---|
+| **A. `bless` 铺** | `boot.efi`、`.disk_label`、`.disk_label_2x`、`.disk_label.contentDetails`、`.root_uuid`、blessed 记录 | `bless --folder … --bootefi --create-snapshot --label …`（第 A.10 节） |
+| **B. 我们铺** | `SystemVersion.plist`、`PlatformSupport.plist`、`BridgeVersion.{bin,plist}`、`boot/System/Library/KernelCollections/BootKernelExtensions.kc`、`System/Library/Caches/com.apple.corestorage/EFILoginLocalizations/` | 第 A.6.6 节的脚本。**1.0 漏了 `BridgeVersion.*` 与 BKC 副本这两项** |
+| **C. 不铺** | 全部 `*.im4m`（8×N 份票据）、`Firmware/`、`restore/`、`PreLoginData/`、`var/db/*Info.plist`、`com.apple.BootInfo` xattr | 票据在 SIP/AMFI 全关 + `SecureBootModel = Disabled` 下不被校验（第 0.2 节）；`PreLoginData` 是运行期产物；`var/db/*Info.plist` 由 `updatePreboot` 生成 |
+| **D. 待定** | `Cryptexes/`（Preboot 卷根下）、`cryptex1/current/` | `V-015`。**第 A.6.6 节第 5 步继续留空** |
 
 ---
 ### A.7 Recovery volume 【不要】
@@ -933,11 +1372,29 @@ sudo bless --folder "$SYSROOT/System/Library/CoreServices" \
 case "$SYSROOT" in
   /|"") echo "FATAL: SYSROOT 是 / 或空，拒绝执行"; exit 1 ;;
 esac
-# 确认 SYSROOT 在我们 attach 的那块盘上，而不是运行器的根盘
-SYS_DISK=$(diskutil info -plist "$SYSROOT" | plutil -extract DeviceIdentifier raw -o - -)
-ROOT_DISK=$(diskutil info -plist / | plutil -extract DeviceIdentifier raw -o - -)
-[ "${SYS_DISK%%s*}" != "${ROOT_DISK%%s*}" ] || { echo "FATAL: SYSROOT 和 / 在同一块物理盘上"; exit 1; }
+# 确认 SYSROOT 在我们 attach 的那块盘上，而不是运行器的根盘。
+# 取整盘标识用 diskutil 自己的「Part of Whole」那一行，不要自己截字符串 ——
+# 1.0 写的是 ${SYS_DISK%%s*}，而 ${var%%s*} 删的是**最长**的 s* 后缀：
+# 对 disk3s1 它从 "disk" 里那个 s 就开始删，结果是 "di"；对 disk1s5s1 也是 "di"。
+# 两边恒等 → 这道护栏每次都误判成「同一块盘」。CI 上实测如此（见本节末）。
+whole_of() {
+  diskutil info "$1" 2>/dev/null \
+    | awk -F': *' '/^ *Part of Whole/{gsub(/[ \t]+$/,"",$2); print $2; exit}'
+}
+SYS_DISK=$(whole_of "$SYSROOT"); ROOT_DISK=$(whole_of /)
+[ -n "$SYS_DISK" ] && [ -n "$ROOT_DISK" ] \
+  || { echo "FATAL: 取不到整盘标识，未确定就不 bless"; exit 1; }
+[ "$SYS_DISK" != "$ROOT_DISK" ] \
+  || { echo "FATAL: SYSROOT 和 / 在同一块物理盘上（都是 $SYS_DISK）"; exit 1; }
 ```
+
+> **1.1 实测注记（`TESTED(25G76)`）。** 1.0 的那个写法在 CI 上把护栏变成了无条件触发：
+> 日志里是 `护栏：SYS_DISK=di  ROOT_DISK=di` → `FATAL` → `exit 0`。
+> 连带后果是 run `41271530800` 与 `41274204499` 两轮都没产出 bless 实验的输出文件，
+> 于是 `V-020`/`V-021`/`V-023` 看起来像「没跑」而其实是「被自己的护栏挡住了」。
+> **两条教训都写进第 C 节的纪律：**（1）判断「同一块物理盘」要问 `diskutil`，
+> 不要用 shell 的后缀删除；（2）**任何提前退出的分支都必须留下一个说明文件**，
+> 否则从产物上分不清「没跑」与「跑了但被挡」。
 
 `77` 第 E.2 节记录 UpdateBrain 自己也有同类护栏（`should_prepare_to_snapshot`，RVA `0x3dc7b`，目标 `mountPoint == "/"` 直接报错 1127）。**Apple 自己都加了这道检查，我们没有理由不加。**
 
@@ -1110,11 +1567,17 @@ sudo mount -o nobrowse -t apfs "/dev/$SYS"  "$MNT_SYS"
 sudo mount -o nobrowse -t apfs "/dev/$DATA" "$MNT_DATA"
 sudo mount -o nobrowse -t apfs "/dev/$PRE"  "$MNT_PRE"
 
-# 护栏（A.10.2）：确认我们不是在对运行器的根盘动手
-SYS_DISK=$(diskutil info -plist "$MNT_SYS" | plutil -extract DeviceIdentifier raw -o - -)
-ROOT_DISK=$(diskutil info -plist /        | plutil -extract DeviceIdentifier raw -o - -)
-[ "${SYS_DISK%%s*}" != "${ROOT_DISK%%s*}" ] \
-  || { echo "FATAL: 目标与 / 在同一块物理盘上"; exit 1; }
+# 护栏（A.10.2）：确认我们不是在对运行器的根盘动手。
+# 取整盘标识读 diskutil 的「Part of Whole」，不要用 ${var%%s*}（A.10.2 的 1.1 注记）。
+whole_of() {
+  diskutil info "$1" 2>/dev/null \
+    | awk -F': *' '/^ *Part of Whole/{gsub(/[ \t]+$/,"",$2); print $2; exit}'
+}
+SYS_DISK=$(whole_of "$MNT_SYS"); ROOT_DISK=$(whole_of /)
+[ -n "$SYS_DISK" ] && [ -n "$ROOT_DISK" ] \
+  || { echo "FATAL: 取不到整盘标识，未确定就不动手"; exit 1; }
+[ "$SYS_DISK" != "$ROOT_DISK" ] \
+  || { echo "FATAL: 目标与 / 在同一块物理盘上（都是 $SYS_DISK）"; exit 1; }
 
 # ───────────────── 步 7：铺 System 卷内容（A.4）—— 唯一必须自己写的一步 ─────────────────
 # 工具：ditto --hfsCompression（自带）。换不了 cp/rsync/tar：见 A.4.3 的四条理由。

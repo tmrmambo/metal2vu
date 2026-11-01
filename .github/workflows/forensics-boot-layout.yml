@@ -174,8 +174,25 @@ jobs:
           cat out/30-root-shape.txt
 
           # V-019：bless --create-snapshot 取的名字是什么格式
-          diskutil apfs listSnapshots "$SYSVOL"        > out/31-snapshots.txt        2>&1
-          diskutil apfs listSnapshots -plist "$SYSVOL" > out/32-snapshots.plist      2>&1
+          # 上一轮对 $SYSVOL（= disk1s5）跑这两条，得到
+          #   Error getting list of snapshots for APFS Volume:
+          #   A disk with a mount point is required (-69854)
+          # 因为封印系统从**快照**启动，系统卷本体（disk1s5）是不挂载的，挂的是
+          # 它的 root snapshot（disk1s5s1，见 bless --info 的 "Data Partitions"）。
+          # 所以这个动词要给**挂载点**，不是卷设备。按挂载点、卷设备两种都试，留全。
+          {
+            echo "########## 按挂载点 / （封印系统的正确问法）##########"
+            diskutil apfs listSnapshots / 2>&1
+            echo
+            echo "########## 按卷设备 $SYSVOL（上一轮失败的那条，留作对照）##########"
+            diskutil apfs listSnapshots "$SYSVOL" 2>&1
+            echo
+            echo "########## mount 看 / 到底挂的是哪个设备 ##########"
+            mount | awk 'NR==1 || /on \/ /'
+            echo "stat -f '%Sd' / = $(stat -f '%Sd' / 2>&1)"
+          } > out/31-snapshots.txt 2>&1
+          diskutil apfs listSnapshots -plist /         > out/32-snapshots.plist      2>&1
+          diskutil apfs listSnapshots -plist "$SYSVOL" > out/32-snapshots-byvol.plist 2>&1
           echo "========== 快照清单 =========="; cat out/31-snapshots.txt
           echo "========== 快照 plist 的全部键（V-022）=========="
           plutil -p out/32-snapshots.plist 2>&1 | head -60
@@ -1078,24 +1095,38 @@ jobs:
               printf '%-46s rc=%-3s %s\n' "$what" "$rc" \
                      "$(head -1 "$RUNNER_TEMP/probe.err" 2>/dev/null)"
             }
-            probe "dd 读 $RAW（1 扇区）"      sudo dd if="$RAW" of=/dev/null bs=512 count=1
-            probe "dd 读 $DEV（1 扇区）"      sudo dd if="$DEV" of=/dev/null bs=512 count=1
-            probe "dd 写 $RAW（1 扇区 零）"   sudo dd if=/dev/zero of="$RAW" bs=512 count=1 conv=notrunc
-            probe "dd 写 $DEV（1 扇区 零）"   sudo dd if=/dev/zero of="$DEV" bs=512 count=1 conv=notrunc
-            probe "gpt -r show $RAW（只读）"  sudo gpt -r show "$RAW"
-            probe "gpt create -f $RAW"        sudo gpt create -f "$RAW"
-            probe "gpt create -f $DEV"        sudo gpt create -f "$DEV"
+            # 标签一律纯 ASCII：上一轮用了中文全角括号，printf 的宽度填充按字节算，
+            # 在 artifact 里把设备路径那一段挤成了乱码，看不出测的是哪个节点。
+            probe "sudo dd  READ  rdisk (1 sector)" sudo dd if="$RAW" of=/dev/null bs=512 count=1
+            probe "sudo dd  READ  disk  (1 sector)" sudo dd if="$DEV" of=/dev/null bs=512 count=1
+            probe "sudo dd  WRITE rdisk (1 sector)" sudo dd if=/dev/zero of="$RAW" bs=512 count=1 conv=notrunc
+            probe "sudo dd  WRITE disk  (1 sector)" sudo dd if=/dev/zero of="$DEV" bs=512 count=1 conv=notrunc
+            probe "sudo gpt -r show    rdisk"       sudo gpt -r show "$RAW"
+            probe "sudo gpt create -f  rdisk"       sudo gpt create -f "$RAW"
+            probe "sudo gpt create -f  disk"        sudo gpt create -f "$DEV"
 
             echo
             echo "---- 先 unmountDisk 再重试（排除 DiskArbitration 占用这一解释）----"
             sudo diskutil unmountDisk force "$DEV" 2>&1
-            probe "unmount 后 gpt create -f $RAW" sudo gpt create -f "$RAW"
-            probe "unmount 后 dd 写 $RAW"          sudo dd if=/dev/zero of="$RAW" bs=512 count=1 conv=notrunc
+            probe "unmounted: gpt create -f rdisk"  sudo gpt create -f "$RAW"
+            probe "unmounted: dd WRITE rdisk"       sudo dd if=/dev/zero of="$RAW" bs=512 count=1 conv=notrunc
 
             echo
             echo "---- 不带 sudo 的同样两条（看 EPERM 是不是和 euid 无关）----"
-            probe "无 sudo gpt create -f $RAW"  gpt create -f "$RAW"
-            probe "无 sudo dd 写 $RAW"          dd if=/dev/zero of="$RAW" bs=512 count=1 conv=notrunc
+            probe "no sudo: gpt create -f rdisk"    gpt create -f "$RAW"
+            probe "no sudo: dd WRITE rdisk"         dd if=/dev/zero of="$RAW" bs=512 count=1 conv=notrunc
+
+            echo
+            echo "---- V-018 的那条探针为什么空：对运行器自己那块物理盘重试，这次留 stderr ----"
+            PHYS=$(diskutil list 2>/dev/null | awk '/Apple_APFS/{print $NF}' | head -1)
+            echo "PHYS=${PHYS:-未取到}"
+            if [ -n "${PHYS:-}" ]; then
+              probe "sudo dd READ /dev/r$PHYS (1 sector)" \
+                    sudo dd if="/dev/r$PHYS" of=/dev/null bs=512 count=1
+              probe "sudo dd READ /dev/$PHYS  (1 sector)" \
+                    sudo dd if="/dev/$PHYS" of=/dev/null bs=512 count=1
+              probe "sudo gpt -r show /dev/rdisk0"  sudo gpt -r show /dev/rdisk0
+            fi
 
             echo
             echo "########## gpt -r show 的全文（它读得到什么）##########"
@@ -1155,8 +1186,11 @@ jobs:
 
           WINNER=""; DEV=""; CNT=""
 
-          log "########## 阶梯 P1：离线写 GPT（mkgpt.py）+ diskutil 建容器 ##########"
-          log "# 这是本轮的主路。分区表以普通文件写入，不碰 /dev，不需要 sudo。"
+          log "########## 回归对照 P0：s2 预写成 APFS 类型 —— 预期失败 ##########"
+          log "# 上一轮实测：事先把 p2 的类型 GUID 写成 7C3457EF-…，createContainer 报"
+          log "#   Error: -69614: The disk is already in use by APFS"
+          log "# 78 §A.1 约束 3 因此被反写。这一级留着做回归：它若哪天成功了，"
+          log "# 说明 Apple 改了行为，约束 3 要再改回去。它不参与竞选胜者。"
           detach_all; rm -f "$IMG"
           {
             python3 tools/ci/mkgpt.py selftest
@@ -1167,34 +1201,32 @@ jobs:
             python3 tools/ci/gptdump.py "$IMG"
           } >> out/B4-scratch.txt 2>&1
           DEV=$(attach "$IMG")
+          if [ -n "$DEV" ]; then
+            diskutil list "$DEV" >> out/B4-scratch.txt 2>&1
+            sudo diskutil apfs createContainer "${DEV}s2" >> out/B4-scratch.txt 2>&1
+            log "    P0 createContainer 退出码 = $?（期望非 0，且报 -69614）"
+            log "    P0 容器引用 = $(container_of "$DEV")（期望为空）"
+          fi
+          DEV=""
+
+          log ""
+          log "########## 阶梯 P1（生产路径）：离线写 GPT，s2 写成 Apple_HFS ##########"
+          log "# 分区表以普通文件写入，不碰 /dev、不需要 sudo（gpt 的写路径在 25G76 上被禁，"
+          log "# 见 D0-rawdev-permission.txt）。s2 写成 Apple_HFS，让 createContainer 自己改类型。"
+          detach_all; rm -f "$IMG"
+          python3 tools/ci/mkgpt.py create "$IMG" --size "$SIZE" \
+                  --part "auto:${ESP_BYTES}:efi:EFI" --part "auto:auto:hfs:Macintosh HD" \
+                  >> out/B4-scratch.txt 2>&1
+          DEV=$(attach "$IMG")
           log "    DEV=$DEV"
           if [ -n "$DEV" ]; then
             log "---- MediaKit 认不认我们写的表 ----"
             diskutil list "$DEV" >> out/B4-scratch.txt 2>&1
-            log "---- V-001：建容器（分区类型事先已是 APFS）----"
             sudo diskutil apfs createContainer "${DEV}s2" >> out/B4-scratch.txt 2>&1
             log "    createContainer 退出码 = $?"
             CNT=$(container_of "$DEV")
             log "    CNT=$CNT"
             [ -n "$CNT" ] && WINNER="P1"
-          fi
-
-          if [ -z "$WINNER" ]; then
-            log ""
-            log "########## 阶梯 P1b：同上，但 s2 先写成 Apple_HFS 让 createContainer 自己改类型 ##########"
-            detach_all; rm -f "$IMG"
-            python3 tools/ci/mkgpt.py create "$IMG" --size "$SIZE" \
-                    --part "auto:${ESP_BYTES}:efi:EFI" --part "auto:auto:hfs:Scratch" \
-                    >> out/B4-scratch.txt 2>&1
-            DEV=$(attach "$IMG")
-            if [ -n "$DEV" ]; then
-              diskutil list "$DEV" >> out/B4-scratch.txt 2>&1
-              sudo diskutil apfs createContainer "${DEV}s2" >> out/B4-scratch.txt 2>&1
-              log "    createContainer 退出码 = $?"
-              CNT=$(container_of "$DEV")
-              log "    CNT=$CNT"
-              [ -n "$CNT" ] && WINNER="P1b"
-            fi
           fi
 
           if [ -z "$WINNER" ]; then
@@ -1303,8 +1335,60 @@ jobs:
             sudo diskutil apfs addVolume "$CNT" APFS "Macintosh HD" -role S -nomount 2>&1
             SYS=$(vol_of "Macintosh HD"); echo "SYS=$SYS"
 
-            echo "---- -role D -groupWith ----"
-            sudo diskutil apfs addVolume "$CNT" APFS "Macintosh HD - Data" -role D -groupWith "$SYS" -nomount 2>&1
+            echo
+            echo "########## V-031：Data 卷成组的六条变体阶梯 ##########"
+            echo "# 上一轮 \`-role D -groupWith \$SYS\` 报 Error: -69624，而同一容器上"
+            echo "# -role S / -role B / -role V 三条全成。78 §A.3.3a 列了六条待试变体，"
+            echo "# 这里逐条跑，第一条成功的就是生产路径。每条失败后把卷删掉再试下一条。"
+            DATA=""; DATA_WINNER=""
+            drop_data() {
+              local d
+              d=$(vol_of "Macintosh HD - Data")
+              [ -n "$d" ] && sudo diskutil apfs deleteVolume "$d" >/dev/null 2>&1
+              d=$(vol_of "Data")
+              [ -n "$d" ] && sudo diskutil apfs deleteVolume "$d" >/dev/null 2>&1
+              return 0
+            }
+            try_data() {  # try_data <标签> <addVolume 之后的参数...>
+              local tag="$1"; shift
+              [ -n "$DATA_WINNER" ] && return 0
+              echo "---- $tag: diskutil apfs addVolume $CNT APFS 'Macintosh HD - Data' $* ----"
+              sudo diskutil apfs addVolume "$CNT" APFS "Macintosh HD - Data" "$@" 2>&1
+              local rc=$?
+              echo "     退出码 = $rc"
+              local d; d=$(vol_of "Macintosh HD - Data")
+              if [ -n "$d" ]; then
+                echo "     建出来了：$d"
+                if diskutil apfs listVolumeGroups "$CNT" 2>/dev/null | grep -qF "$d"; then
+                  echo "     ✓ 而且和 $SYS 同组 → 这条可用"
+                  DATA="$d"; DATA_WINNER="$tag"; return 0
+                fi
+                echo "     × 建出来了但不在任何 volume group 里，不算成功，删掉重试"
+                drop_data
+              fi
+              return 0
+            }
+            try_data D1 -role D -groupWith "$SYS" -nomount
+            try_data D2            -groupWith "$SYS" -nomount
+            try_data D3 -role D -group     "$SYS" -nomount
+            try_data D4 -role D -sibling   "$SYS" -nomount
+            try_data D5 -role D -nomount
+            if [ -n "$DATA" ] && [ "$DATA_WINNER" = "D5" ]; then
+              echo "---- D5 建出来了但没成组，试 changeVolumeRole + 事后成组 ----"
+              sudo diskutil apfs changeVolumeRole "$DATA" D 2>&1
+              echo "     changeVolumeRole 退出码 = $?"
+              diskutil apfs listVolumeGroups "$CNT" 2>&1
+            fi
+            echo "DATA_LADDER_WINNER=${DATA_WINNER:-NONE}"
+            echo "DATA_VOL=${DATA:-}"
+            if [ -z "$DATA_WINNER" ]; then
+              echo "---- 六条全败，留一份诊断：容器与组的当前状态 ----"
+              diskutil apfs list "$CNT" 2>&1
+              diskutil apfs listVolumeGroups "$CNT" 2>&1
+              diskutil info "$SYS" 2>&1 | grep -iE 'Role|Group|Case|Sealed|Filesystem'
+            fi
+
+            echo
             echo "---- -role B（V-007 的核心一问）----"
             sudo diskutil apfs addVolume "$CNT" APFS "Preboot" -role B -nomount 2>&1
             echo "   退出码 = $?"
@@ -1384,13 +1468,45 @@ jobs:
             echo "WARN: 容器里没有 Preboot 卷 → V-021 的文件清单本轮取不到，V-020 仍可取"
           fi
 
-          # A.10.2 的护栏：确认目标不在运行器的根盘上
-          SD=$(diskutil info -plist "$MS" | plutil -extract DeviceIdentifier raw -o - - 2>/dev/null)
-          RD=$(diskutil info -plist /    | plutil -extract DeviceIdentifier raw -o - - 2>/dev/null)
-          echo "护栏：SYS_DISK=${SD%%s*}  ROOT_DISK=${RD%%s*}"
-          if [ "${SD%%s*}" = "${RD%%s*}" ]; then
-            echo "FATAL: scratch 卷与 / 在同一块物理盘上，拒绝 bless"
-            sudo diskutil unmount force "$MS"; sudo diskutil unmount force "$MP"
+          # ── A.10.2 的护栏：确认目标不在运行器的根盘上 ──
+          # 上一轮与上上一轮这个 job 都没产出 C0-bless-experiment.txt，根因就在这里：
+          # 原先用 `diskutil info -plist X | plutil -extract KEY raw -o - -`（plist 走管道），
+          # 两边都取不到值，于是「空 = 空」成立，护栏误判为同一块盘，exit 0 —— 而这条
+          # 退出路径又不落文件，所以从 artifact 上完全看不出发生了什么。
+          # 两处修正：(1) plutil 读临时文件而不是 stdin；(2) 取不到值一律当「未确定」，
+          # 未确定也不 bless，但必须把原因写进文件。
+          # 取「整盘标识」不要自己截字符串。上一轮用的是 ${SD%%s*}，
+          # 而 `${var%%s*}` 删的是**最长**的 `s*` 后缀 —— 对 disk3s1 它从
+          # "disk" 里的那个 s 开始删，结果是 "di"；对 disk1s5s1 同样是 "di"。
+          # 于是两边恒等，护栏每次都误判成「同一块盘」并 exit 0，而那条退出路径
+          # 又不落文件 —— 这就是前两轮 C0-bless-experiment.txt 一直缺失的全部原因。
+          # 正解：diskutil 自己就有「Part of Whole」这一行，直接读。
+          whole_of() {  # whole_of <路径|设备> -> diskN（取不到就空）
+            diskutil info "$1" 2>/dev/null \
+              | awk -F': *' '/^ *Part of Whole/{gsub(/[ \t]+$/,"",$2); print $2; exit}'
+          }
+          SD=$(whole_of "$MS"); RD=$(whole_of /)
+          echo "护栏：scratch 整盘='$SD'   根卷整盘='$RD'"
+          if [ -z "$SD" ] || [ -z "$RD" ]; then
+            {
+              echo "SKIPPED: 护栏取不到整盘标识，无法确认 scratch 卷不在运行器根盘上"
+              echo "SD='$SD'  RD='$RD'  MS=$MS  SYS=$SYS  PRE=$PRE"
+              echo "---- diskutil info \$MS ----"; diskutil info "$MS" 2>&1
+              echo "---- diskutil info / ----";    diskutil info /   2>&1
+              echo "→ 按 78 §A.10.2 的纪律，未确定就不 bless。"
+            } > out/C0-bless-experiment.txt 2>&1
+            cat out/C0-bless-experiment.txt
+            sudo diskutil unmount force "$MP" 2>/dev/null
+            sudo diskutil unmount force "$MS" 2>/dev/null
+            exit 0
+          fi
+          if [ "$SD" = "$RD" ]; then
+            {
+              echo "FATAL: scratch 卷与 / 在同一块物理盘上（都是 $SD），拒绝 bless"
+            } > out/C0-bless-experiment.txt 2>&1
+            cat out/C0-bless-experiment.txt
+            sudo diskutil unmount force "$MP" 2>/dev/null
+            sudo diskutil unmount force "$MS" 2>/dev/null
             exit 0
           fi
 
@@ -1503,8 +1619,12 @@ jobs:
             ls -lahO@R "$STAGE" 2>&1
 
             echo
-            echo "########## diskutil apfs convert -dryrun -prebootSource ##########"
-            sudo diskutil apfs convert -dryrun -prebootSource "$STAGE" "${DEV2}s1" 2>&1
+            echo "########## diskutil apfs convert <disk> -dryrun -prebootSource <dir> ##########"
+            # 参数顺序：disk 在前。上一轮写成 `convert -dryrun -prebootSource DIR DISK`，
+            # diskutil 把第一个非选项参数当磁盘，于是报 "Could not find disk for -dryrun"。
+            # 用法串原文：diskutil apfs convert <disk> [-dryrun]
+            #                                 [-prebootSource <dir>] [-noPrebootAdditions]
+            sudo diskutil apfs convert "${DEV2}s1" -dryrun -prebootSource "$STAGE" 2>&1
             echo "   退出码 = $?"
 
             echo
@@ -1521,7 +1641,7 @@ jobs:
             echo
             echo "########## 若 -dryrun 下不加件，去掉 -dryrun 重跑（目标是 scratch 镜像，无风险）##########"
             if [ -z "$(find "$STAGE" -type f 2>/dev/null)" ]; then
-              sudo diskutil apfs convert -prebootSource "$STAGE" "${DEV2}s1" 2>&1
+              sudo diskutil apfs convert "${DEV2}s1" -prebootSource "$STAGE" 2>&1
               echo "   退出码 = $?"
               echo "---- 暂存目录 ----"; find "$STAGE" 2>/dev/null | sort
               echo "---- 新容器的卷与 role（它应当自己建了一个 Preboot role 卷）----"
