@@ -109,6 +109,44 @@ class KeyGate:
         """整段替换一个子节（数组或我们完全重写的字典）。仍检查 key 是否存在。"""
         self.set(path, key, value)
 
+    def template(self, path: str, key: str) -> dict:
+        """取 Sample 里某个数组的第一条示例元素，作为我们自己拼元素的模板。
+
+        由来：run 41308936398 的 OpenCore 日志里
+
+            OCS: Missing key HideVerbose, context <Drivers>!
+
+        刷了九遍 —— 一个驱动一遍。我们自己拼的 driver 字典少了 OpenCore 1.0.8
+        在 `UEFI/Drivers` 元素里新增的 `HideVerbose` 键。
+
+        **缺键门禁抓不到这一类**，因为门禁比的是「我们写的键在不在 Sample 里」，
+        而数组是整段替换的，元素内部的键集没有任何人去比。
+
+        修法不是把 HideVerbose 补上就算完 —— 那只修掉这一个键，下个版本再加一个
+        键又会复现。正确做法是**以 Sample 的示例元素为模板，只覆盖我们在意的字段**，
+        于是将来任何新增键都自动拿到官方默认值。这和 §6.1「以 Sample.plist 为基
+        施加 diff」是同一条纪律，只是把它从顶层字典贯彻到数组元素里。
+        """
+        try:
+            node = self._walk(path)
+        except (KeyError, TypeError):
+            return {}
+        arr = node.get(key)
+        if isinstance(arr, list) and arr and isinstance(arr[0], dict):
+            return dict(arr[0])
+        return {}
+
+    def check_elements(self, label: str, tpl: dict, items: list) -> None:
+        """元素键集必须与模板一致。多了少了都记进缺失清单。"""
+        if not tpl:
+            return
+        want = set(tpl)
+        for i, it in enumerate(items):
+            for k in sorted(want - set(it)):
+                self.missing.append(f"{label}[{i}] 缺键 {k}")
+            for k in sorted(set(it) - want):
+                self.missing.append(f"{label}[{i}] 多了键 {k}（Sample 的元素里没有）")
+
     def all_false(self, path: str) -> dict:
         """把一个 Quirks 字典里所有布尔键置 False，保留非布尔键原值。
 
@@ -119,8 +157,12 @@ class KeyGate:
         return {k: (False if isinstance(v, bool) else v) for k, v in node.items()}
 
 
-def kext(bundle: str, exe: str, *, min_k: str = "", max_k: str = "", comment: str = "") -> dict:
+def kext(
+    tpl: dict, bundle: str, exe: str, *, min_k: str = "", max_k: str = "", comment: str = ""
+) -> dict:
+    """以 Sample 的 Kernel/Add 示例元素为模板，只覆盖我们在意的字段。"""
     return {
+        **tpl,
         "Arch": "x86_64",
         "BundlePath": bundle,
         "Comment": comment,
@@ -132,14 +174,23 @@ def kext(bundle: str, exe: str, *, min_k: str = "", max_k: str = "", comment: st
     }
 
 
-def driver(path: str, enabled: bool, comment: str) -> dict:
+def driver(tpl: dict, path: str, enabled: bool, comment: str) -> dict:
+    """以 Sample 的 UEFI/Drivers 示例元素为模板。
+
+    模板里的 HideVerbose、以及将来 OpenCore 新增的任何键，都会自动带上官方默认值。
+    """
     return {
+        **tpl,
         "Arguments": "",
         "Comment": comment,
         "Enabled": enabled,
         "LoadEarly": False,
         "Path": path,
     }
+
+
+def acpi_entry(tpl: dict, path: str, comment: str) -> dict:
+    return {**tpl, "Comment": comment, "Enabled": True, "Path": path}
 
 
 def build(
@@ -155,18 +206,21 @@ def build(
     c = sample
     g = KeyGate(c, allow_new)
 
+    # 三个数组的元素模板必须在替换之前取，否则就把自己要抄的东西盖掉了
+    tpl_acpi = g.template("ACPI", "Add")
+    tpl_kext = g.template("Kernel", "Add")
+    tpl_drv = g.template("UEFI", "Drivers")
+
     # ---------------- ACPI（76 §5：必需的 SSDT 只有 SSDT-EC）----------------
-    g.replace(
-        "ACPI",
-        "Add",
-        [
-            {
-                "Comment": "fake EC for QEMU; parent path is \\_SB.PCI0, not LPCB (76 §5.3.1)",
-                "Enabled": True,
-                "Path": "SSDT-EC.aml",
-            }
-        ],
-    )
+    acpi_items = [
+        acpi_entry(
+            tpl_acpi,
+            "SSDT-EC.aml",
+            "fake EC for QEMU; parent path is \\_SB.PCI0, not LPCB (76 §5.3.1)",
+        )
+    ]
+    g.check_elements("ACPI/Add", tpl_acpi, acpi_items)
+    g.replace("ACPI", "Add", acpi_items)
     g.replace("ACPI", "Delete", [])
     g.replace("ACPI", "Patch", [])
     g.replace("ACPI", "Quirks", g.all_false("ACPI/Quirks"))
@@ -207,24 +261,16 @@ def build(
     g.replace("DeviceProperties", "Delete", {})
 
     # ---------------- Kernel（71 §6.5 / 76 §5.4：最小集三件，一个不多一个不少）----
-    g.replace(
-        "Kernel",
-        "Add",
-        [
-            kext("Lilu.kext", "Contents/MacOS/Lilu", comment="patch engine; must be first"),
-            kext(
-                "VirtualSMC.kext",
-                "Contents/MacOS/VirtualSMC",
-                comment="SMC emulation; depends on Lilu",
-            ),
-            kext(
-                "AppleMCEReporterDisabler.kext",
-                "",
-                min_k="21.0.0",
-                comment="block AppleIntelMCEReporter under MacPro7,1 board-id",
-            ),
-        ],
-    )
+    kext_items = [
+        kext(tpl_kext, "Lilu.kext", "Contents/MacOS/Lilu",
+             comment="patch engine; must be first"),
+        kext(tpl_kext, "VirtualSMC.kext", "Contents/MacOS/VirtualSMC",
+             comment="SMC emulation; depends on Lilu"),
+        kext(tpl_kext, "AppleMCEReporterDisabler.kext", "", min_k="21.0.0",
+             comment="block AppleIntelMCEReporter under MacPro7,1 board-id"),
+    ]
+    g.check_elements("Kernel/Add", tpl_kext, kext_items)
+    g.replace("Kernel", "Add", kext_items)
     g.replace("Kernel", "Block", [])
     g.update(
         "Kernel/Emulate",
@@ -445,19 +491,22 @@ def build(
     g.replace("UEFI", "ReservedMemory", [])
 
     drivers = [
-        driver("OpenRuntime.efi", True, "required by Booter quirks + NVRAM routing"),
+        driver(tpl_drv, "OpenRuntime.efi", True,
+               "required by Booter quirks + NVRAM routing"),
         # 76 §6 的 71-A / L-003：文件名是 HfsPlus.efi，来源是 OcBinaryData/Drivers/。
         # 写成 OpenHfsPlus.efi 会在装配 ESP 时 copy 不到文件。
-        driver("HfsPlus.efi", True, "recovery volumes are HFS+ (OcBinaryData)"),
-        driver("ResetNvramEntry.efi", True, "picker entry to clear NVRAM"),
-        driver("ToggleSipEntry.efi", True, "picker entry to flip csr-active-config"),
-        driver("OpenCanopy.efi", picker == "canopy", "graphical picker (76 §2)"),
+        driver(tpl_drv, "HfsPlus.efi", True, "recovery volumes are HFS+ (OcBinaryData)"),
+        driver(tpl_drv, "ResetNvramEntry.efi", True, "picker entry to clear NVRAM"),
+        driver(tpl_drv, "ToggleSipEntry.efi", True,
+               "picker entry to flip csr-active-config"),
+        driver(tpl_drv, "OpenCanopy.efi", picker == "canopy", "graphical picker (76 §2)"),
         # 71 §6.9.1：OVMF 自带 virtio 驱动，L1 上不需要。它们的价值在 L2。
-        driver("VirtioPciDeviceDxe.efi", False, "virtio PCI transport"),
-        driver("Virtio10.efi", False, "virtio 1.0 device support"),
-        driver("VirtioBlkDxe.efi", False, "virtio-blk block io"),
-        driver("VirtioSerialDxe.efi", False, "virtio-serial"),
+        driver(tpl_drv, "VirtioPciDeviceDxe.efi", False, "virtio PCI transport"),
+        driver(tpl_drv, "Virtio10.efi", False, "virtio 1.0 device support"),
+        driver(tpl_drv, "VirtioBlkDxe.efi", False, "virtio-blk block io"),
+        driver(tpl_drv, "VirtioSerialDxe.efi", False, "virtio-serial"),
     ]
+    g.check_elements("UEFI/Drivers", tpl_drv, drivers)
     g.replace("UEFI", "Drivers", drivers)
 
     return c, g.missing, g.written
@@ -602,7 +651,12 @@ def _synthetic_sample() -> dict:
     """
     quirks = lambda ks: {k: False for k in ks}  # noqa: E731
     return {
-        "ACPI": {"Add": [], "Delete": [], "Patch": [], "Quirks": quirks(
+        # 三个数组各留一条示例元素，键集照 OpenCore 1.0.8 的实际 schema ——
+        # 包括 UEFI/Drivers 里那个 HideVerbose（run 41308936398 的日志里
+        # `OCS: Missing key HideVerbose, context <Drivers>!` 刷了九遍）。
+        # 有了示例元素，自检才能验到 check_elements 这条门禁。
+        "ACPI": {"Add": [{"Comment": "", "Enabled": False, "Path": ""}],
+                 "Delete": [], "Patch": [], "Quirks": quirks(
             ["FadtEnableReset", "NormalizeHeaders", "RebaseRegions",
              "ResetHwSig", "ResetLogoStatus", "SyncTableIds"])},
         "Booter": {"MmioWhitelist": [], "Patch": [], "Quirks": {
@@ -616,7 +670,10 @@ def _synthetic_sample() -> dict:
             "ProvideMaxSlide": 0, "ResizeAppleGpuBars": -1}},
         "DeviceProperties": {"Add": {}, "Delete": {}},
         "Kernel": {
-            "Add": [], "Block": [], "Force": [], "Patch": [],
+            "Add": [{"Arch": "Any", "BundlePath": "", "Comment": "", "Enabled": False,
+                     "ExecutablePath": "", "MaxKernel": "", "MinKernel": "",
+                     "PlistPath": ""}],
+            "Block": [], "Force": [], "Patch": [],
             "Emulate": {"Cpuid1Data": b"", "Cpuid1Mask": b"",
                         "DummyPowerManagement": False, "MaxKernel": "", "MinKernel": ""},
             "Quirks": {**quirks(
@@ -663,7 +720,10 @@ def _synthetic_sample() -> dict:
                         "SystemSerialNumber": "", "SystemUUID": ""},
         },
         "UEFI": {
-            "ConnectDrivers": False, "Drivers": [], "Unload": [], "ReservedMemory": [],
+            "ConnectDrivers": False,
+            "Drivers": [{"Arguments": "", "Comment": "", "Enabled": False,
+                         "HideVerbose": False, "LoadEarly": False, "Path": ""}],
+            "Unload": [], "ReservedMemory": [],
             "APFS": {"EnableJumpstart": False, "GlobalConnect": False,
                      "HideVerbose": False, "JumpstartHotPlug": False,
                      "MinDate": 0, "MinVersion": 0},
@@ -775,6 +835,36 @@ def cmd_selftest(_argv: list[str]) -> int:
           any(d["Path"] == "OpenCanopy.efi" and d["Enabled"] for d in cfg2["UEFI"]["Drivers"]))
     check("两个变体只差 picker 相关键",
           cfg2["Misc"]["Security"] == cfg["Misc"]["Security"])
+
+    print("== 数组元素以 Sample 的示例元素为模板（OCS: Missing key 那一类）==")
+    check("driver 元素带上了 HideVerbose",
+          all("HideVerbose" in d for d in cfg["UEFI"]["Drivers"]))
+    check("driver 元素的键集与模板完全一致",
+          all(set(d) == {"Arguments", "Comment", "Enabled", "HideVerbose",
+                         "LoadEarly", "Path"} for d in cfg["UEFI"]["Drivers"]))
+    check("kext 元素的键集与模板完全一致",
+          all(set(k) == {"Arch", "BundlePath", "Comment", "Enabled", "ExecutablePath",
+                         "MaxKernel", "MinKernel", "PlistPath"}
+              for k in cfg["Kernel"]["Add"]))
+    # 模板里多一个键时，九个 driver 元素应当**自动带上它**，而不是报缺键 ——
+    # 这正是模板化要达到的效果：OpenCore 下个版本往元素里加键，我们不用改代码。
+    # （第一版这条断言写反了，要求「各报一次缺键」，而那恰好是模板化消灭掉的行为。
+    #  测试先抓住的是测试自己。）
+    newkey = copy.deepcopy(_synthetic_sample())
+    newkey["UEFI"]["Drivers"][0]["SomeFutureKey"] = False
+    cfg_new, m_new, _ = build(newkey)
+    n_has = sum(1 for d in cfg_new["UEFI"]["Drivers"] if "SomeFutureKey" in d)
+    check("模板新增一个键时，九个 driver 元素自动带上它",
+          n_has == 9, f"带上的有 {n_has} 个")
+    check("而且不报缺键（这是模板化该有的样子）",
+          not any("SomeFutureKey" in m for m in m_new))
+    # 反方向：模板里没有的键，我们写了也要被报出来
+    noverb = copy.deepcopy(_synthetic_sample())
+    del noverb["UEFI"]["Drivers"][0]["HideVerbose"]
+    _, m_old, _ = build(noverb)
+    check("模板里没有 HideVerbose 时不会凭空加上",
+          not any("HideVerbose" in d for d in build(copy.deepcopy(noverb))[0]["UEFI"]["Drivers"]),
+          f"（缺失清单 {len(m_old)} 条）")
 
     print("== 缺键门禁：这是本脚本存在的主要理由 ==")
     broken = copy.deepcopy(_synthetic_sample())
