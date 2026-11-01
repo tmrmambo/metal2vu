@@ -1329,7 +1329,20 @@ jobs:
 
             echo
             echo "########## V-007：四个 role 逐个试 ##########"
-            vol_of() { diskutil list "$CNT" | awk -v n="$1" '$0 ~ ("APFS Volume " n " "){print $NF}' | head -1; }
+            # vol_of 必须**精确**匹配卷名。旧写法是
+            #   awk '$0 ~ ("APFS Volume " n " "){print $NF}'
+            # 它对 n="Macintosh HD" 会命中 "APFS Volume Macintosh HD - Data …" 那一行，
+            # 于是后面的 bless 实验拿着 Data 卷当系统卷跑，bless 回报
+            # "Volume does not have system role"。run 41279126720 实际踩到这一条。
+            vol_of() {  # vol_of <精确卷名> -> diskNsM
+              local want="$1" v n
+              for v in $(diskutil list "$CNT" 2>/dev/null | awk '/APFS Volume/{print $NF}'); do
+                n=$(diskutil info "$v" 2>/dev/null \
+                    | awk -F': *' '/^ *Volume Name/{gsub(/[ \t]+$/,"",$2); print $2; exit}')
+                if [ "$n" = "$want" ]; then printf '%s' "$v"; return 0; fi
+              done
+              return 1
+            }
 
             echo "---- -role S ----"
             sudo diskutil apfs addVolume "$CNT" APFS "Macintosh HD" -role S -nomount 2>&1
@@ -1518,8 +1531,24 @@ jobs:
 
           MS="$RUNNER_TEMP/ms"; MP="$RUNNER_TEMP/mp"
           mkdir -p "$MS" "$MP"
-          vol_of() { diskutil list "$CNT" | awk -v n="$1" '$0 ~ ("APFS Volume " n " "){print $NF}' | head -1; }
+          # 精确匹配，理由见上一步同名函数的注释（前缀式匹配会把
+          # "Macintosh HD - Data" 当成 "Macintosh HD"）。
+          vol_of() {
+            local want="$1" v n
+            for v in $(diskutil list "$CNT" 2>/dev/null | awk '/APFS Volume/{print $NF}'); do
+              n=$(diskutil info "$v" 2>/dev/null \
+                  | awk -F': *' '/^ *Volume Name/{gsub(/[ \t]+$/,"",$2); print $2; exit}')
+              if [ "$n" = "$want" ]; then printf '%s' "$v"; return 0; fi
+            done
+            return 1
+          }
           SYS=$(vol_of "Macintosh HD"); PRE=$(vol_of "Preboot")
+          DATA=$(vol_of "Macintosh HD - Data")
+          echo "逐卷核对：SYS=$SYS  DATA=$DATA  PRE=$PRE"
+          for v in "$SYS" "$DATA" "$PRE"; do
+            [ -n "$v" ] && diskutil info "$v" 2>&1 \
+              | awk -F': *' '/Volume Name|Role|Volume UUID|Volume Group UUID/{print "    " $0}'
+          done
           echo "阶梯胜者 = ${{ steps.scratch.outputs.ladder }}"
           echo "SYS=$SYS PRE=$PRE"
           if [ -z "$SYS" ]; then
@@ -1662,6 +1691,17 @@ jobs:
             echo
             echo "########## V-021：bless 之后的 Preboot 全树 ##########"
             sudo find "$MP" 2>/dev/null | sort | tee "$RUNNER_TEMP/pre-after.txt"
+
+            echo
+            echo "########## bless 也往**系统卷**的 CoreServices 写了东西 ##########"
+            # run 41279126720 的 --verbose 里 .disk_label / .disk_label_2x 各写了两份：
+            # 一份在 <sysvol>/System/Library/CoreServices/，一份在 Preboot 的 <UUID>/ 下。
+            # 1.0 与 1.1 都只盯着 Preboot 那一侧，漏了系统卷这一侧。
+            sudo ls -lahO@ "$MS/System/Library/CoreServices" 2>&1
+            for f in .disk_label .disk_label_2x .disk_label.contentDetails .root_uuid; do
+              p="$MS/System/Library/CoreServices/$f"
+              [ -e "$p" ] && stat -f '    %N  %z 字节  %Sp  flags=%Xf' "$p" 2>&1
+            done
             echo
             echo "########## diff ← 这就是 bless 往 Preboot 写了什么 ##########"
             diff -u "$RUNNER_TEMP/pre-before.txt" "$RUNNER_TEMP/pre-after.txt" 2>&1

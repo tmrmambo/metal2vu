@@ -21,8 +21,10 @@ x86_64 / SIP disabled / `Apple Paravirtual device`）。**结果是四条规格�
 |---|---|---|---|
 | 1 | 第 A.1 节：用 `gpt create -f` / `gpt add` 写分区表 | **`gpt` 的任何修改类子命令在 25G76 上一律 `operation not permitted`** —— 带不带 `sudo`、关不关 SIP、先不先 `unmountDisk` 都一样，而 `gpt -r show` 正常 | 装配链**第一条命令**就倒。改为离线写（`tools/ci/mkgpt.py`），见第 A.1 节 |
 | 2 | 第 A.1 节约束 3：p2 的 APFS 类型 GUID「必须在建容器之前就写对」 | **恰好相反。** 事先把 p2 写成 `7C3457EF-…`，`diskutil apfs createContainer` 报 `Error: -69614: The disk is already in use by APFS`。把 p2 写成 `Apple_HFS`（`48465300-…`）则成功，且 `createContainer` **自己把类型改成了 APFS** | 第二条命令倒。约束 3 整条反写，见第 A.1 节 |
-| 3 | 第 A.3.2 节第 2 步：`addVolume … -role D -groupWith "$SYS"` | **`Error: -69624: Unable to add a new APFS Volume to an APFS Container`。** 同一容器上 `-role S`、`-role B`、`-role V` 三条**全部成功** | Data 卷建不出来。登记为 **`V-031`**，第 A.3.3 节给了六条待试变体 |
+| 3 | 第 A.3.2 节的建卷顺序：System 第一个建，Data 再 `-groupWith` 它 | **顺序整条反了。** 内核日志：`apfs_newfs: A Non-sealed system sibling volume is not allowed` —— APFS 不许给一个未封印的系统卷建兄弟卷，而我们是最后才 bless 封印。**解法：先建 Data（不成组），再建 System（`-role S -groupWith <data>`）**，实测一次通过 | **`V-031` 已解决**，见第 A.3.3a 节。顺带定死「Preboot 的目录名 = Data 卷的 Volume UUID」 |
 | 4 | 第 A.4.2 节规则 3 的退路：`chflags 0x80000` | **`chflags: invalid flags: 0x80000`，这个写法不存在。** 而助记符 `chflags restricted` 正常（回读 `flags=80000 restricted`） | 退路无效，但主路可用，所以不阻塞 |
+
+| 5 | 第 A.3.2 节的 `vol_of`（按 `diskutil list` 的文本前缀匹配卷名） | `vol_of "Macintosh HD"` 命中 `Macintosh HD - Data` 那一行 —— 因为 Apple 的命名约定就是 `<名字>` 与 `<名字> - Data`，两者是前缀关系 | bless 实验被指向 Data 卷，回报 `Volume does not have system role`。改成逐卷读 `diskutil info` 的 `Volume Name` 精确比较 |
 
 **被关闭的待定项：** `V-001`（见上）、`V-003`（`APFSContainerReference` 键名正确）、
 `V-006`（`FilesystemName` = `APFS`，非大小写敏感）、`V-007`（role B/V 可设）、
@@ -549,9 +551,108 @@ upper case sets a flag; clear clears all flags; 0 is ignored.
 
 即：**大写置位、小写清位、`clear` 全清、`0` 忽略，未提到的位不动**，而且动词有别名 `chrole`。
 
-#### A.3.3a 真正的那个坑：`-role D -groupWith` 被拒（`V-031`）
+#### A.3.3a `V-031` 已解决：**Data 卷必须先建，System 卷成组到它**
 
-**这是 1.1 发现的最严重的一条，而它恰好在 1.0 认为「肯定能设」的那一格里。**
+> [!IMPORTANT]
+> **根因是一行内核日志，建卷顺序因此整条反过来。** `TESTED(25G76)`，run `41279126720`。
+> 复现 `addVolume … -role D -groupWith <sysvol>` 的同时抓统一日志，apfs 内核扩展说：
+>
+> ```text
+> (apfs) apfs_newfs:31899: disk3s1 A Non-sealed system sibling volume is not allowed, error = 0
+> (apfs) volumeCreate:5104: disk3 apfs_newfs failed with error 1
+> ```
+>
+> 往上一层是 `storagekitd` 把它翻译成 `IntErr=49153=0xc001` 再翻成 `DMErr=-69624`，
+> 而 `diskutil` 只把最后那个码印出来 —— 这就是为什么前两轮只看到一个通用错误。
+>
+> **APFS 不允许给一个「未封印的系统卷」创建兄弟卷。** 而我们的装配顺序是
+> 「建四个卷 → 铺内容 → 最后 bless 封印」，所以建 Data 卷的那一刻系统卷必然未封印。
+> 这是一个**先鸡后蛋**，而且不能靠「先封印再建 Data」解决：封印需要内容，
+> 内容需要 firmlink，firmlink 需要组。
+>
+> **解法是把顺序倒过来：先建 Data（`-role D`，不成组），再建 System
+> （`-role S -groupWith <data>`）。** 这时 `-groupWith` 的 sibling 是 Data 卷，
+> 不是系统卷，上面那条检查不会触发。实测一次通过：
+>
+> ```text
+> addVolume disk3 APFS "Macintosh HD - Data" -role D -nomount
+>     → Created new APFS Volume disk3s1
+> addVolume disk3 APFS "Macintosh HD" -role S -groupWith disk3s1 -nomount
+>     → Created new APFS Volume disk3s2      退出码 0
+>
+> +-> Volume Group 3B871442-CF1B-414F-98AB-289E20108111
+>     disk3s1 (Data)    Macintosh HD - Data   Volume UUID 3B871442-…-289E20108111
+>     disk3s2 (System)  Macintosh HD          Volume UUID 4A6F42A8-…-C1E59827801C
+> ```
+>
+> 之后 `-role B`（Preboot）与 `-role V`（VM）照旧成功，四个卷全齐。
+
+**这条还顺手定死了 Preboot 那个目录的名字怎么算出来（`TESTED(25G76)`，两处独立印证）：**
+
+> **volume group UUID == Data 卷的 Volume UUID。**
+>
+> - scratch 容器上：组 UUID `3B871442-CF1B-414F-98AB-289E20108111` 与 Data 卷
+>   `disk3s1` 的 Volume UUID **逐字符相同**。
+> - 运行器自己那块盘上：Preboot 的目录名是 `0F9D8E91-834F-3213-9298-BA3FF72476FE`
+>   （第 A.6.7 节），而 `diskutil apfs list` 回报 Data 卷 `disk1s1` 的 UUID
+>   **就是** `0F9D8E91-834F-3213-9298-BA3FF72476FE`。
+>
+> **所以 `$VG` 在建完 Data 卷的那一刻就已知**，不必等到成组之后去 `listVolumeGroups`。
+> 第 A.3.2 节第 5 步因此可以简化成一条 `diskutil info <data卷>` 读 `Volume UUID`，
+> 而原来那条 `plutil -extract Containers.0.VolumeGroups.0.APFSVolumeGroupUUID` 的
+> 数组下标依赖（第 A.3.2 节自己也提醒过它会随建卷顺序变）就不需要了。
+
+**修正后的建卷顺序（替换第 A.3.2 节第 1、2 步）：**
+
+```bash
+# ---- 1. Data。必须第一个建（A.3.3a：APFS 不许给未封印的系统卷建兄弟卷）----
+sudo diskutil apfs addVolume "$CNT" APFS "Macintosh HD - Data" -role D -nomount
+DATA=$(vol_of "Macintosh HD - Data"); echo "Data    = $DATA"
+
+# ---- 1b. volume group UUID 就是 Data 卷的 Volume UUID，这里直接取 ----
+VG=$(diskutil info "$DATA" \
+     | awk -F': *' '/^ *Volume UUID/{gsub(/[ \t]+$/,"",$2); print $2; exit}')
+echo "VG_UUID = $VG"      # Preboot 里那个目录就叫这个名字
+
+# ---- 2. System，成组到 Data ----
+sudo diskutil apfs addVolume "$CNT" APFS "Macintosh HD" \
+     -role S -groupWith "$DATA" -nomount
+SYS=$(vol_of "Macintosh HD"); echo "System  = $SYS"
+diskutil apfs listVolumeGroups "$CNT" | grep -qF "$SYS" \
+  || { echo "FATAL: System 卷没和 Data 卷成组"; exit 1; }
+```
+
+**另有一条 `vol_of` 的陷阱，本轮实际踩到了：** 原来的实现是
+
+```bash
+vol_of() { diskutil list "$CNT" | awk -v n="$1" '$0 ~ ("APFS Volume " n " "){print $NF}'; }
+```
+
+它对 `n="Macintosh HD"` 会命中 `APFS Volume Macintosh HD - Data …` 那一行 ——
+**因为 `"Macintosh HD "` 是 `"Macintosh HD - Data"` 的前缀。**
+后果是第 A.10 节的 bless 实验拿着 Data 卷当系统卷跑，`bless` 回报
+`Volume does not have system role` / `Snapshot options are only available for system volumes`。
+**修法是逐卷读 `diskutil info` 的 `Volume Name` 做精确比较：**
+
+```bash
+vol_of() {   # vol_of <精确卷名> -> diskNsM
+  local want="$1" v n
+  for v in $(diskutil list "$CNT" 2>/dev/null | awk '/APFS Volume/{print $NF}'); do
+    n=$(diskutil info "$v" 2>/dev/null \
+        | awk -F': *' '/^ *Volume Name/{gsub(/[ \t]+$/,"",$2); print $2; exit}')
+    [ "$n" = "$want" ] && { printf '%s' "$v"; return 0; }
+  done
+  return 1
+}
+```
+
+**这条教训比它看起来重要：** 两个卷名之间是前缀关系不是巧合，而是 Apple 的命名约定
+（`<名字>` 与 `<名字> - Data`）。任何按卷名查设备的代码都会撞上它。
+
+---
+
+**以下是第二轮写的分析过程，保留以便看清是怎么缩小到那一格的。**
+
 `-69624` 是 `diskutil` 的通用错误，不指明原因。已排除的解释：
 
 - **不是容器太小**：同一个容器上后续的 `-role B`、`-role V` 都成功了。
@@ -1538,6 +1639,67 @@ Data 卷的 `dslocal` 写用户）之后，而且要带 `-od <DATA挂载点>/pri
 现在我们知道「没有用户时它一定失败」，所以如果用户已经写进去了它还失败，
 那就是别的问题，不该被 WARN 吞掉。
 
+#### A.10.2b 1.1 实测：`bless --verbose` 逐条说出它写了什么
+
+`TESTED(25G76)`，run `41279126720`。这一轮 Preboot 的 `<UUID>/System/Library/CoreServices`
+目录事先建好了，`bless` 于是真的开始干活（虽然最后还是失败，原因见下）。
+`--verbose` 的输出是本项目第一次看到 `bless` 自述它的动作：
+
+```text
+Among the APFS volumes in /dev/disk3s1's volume group exists a System-roled volume
+  which is compatible with the currently-running macOS
+A System volume is reachable, so not considered Data-Given-Pre-SSV-to-SSV
+boot.efi unchanged at <sysvol>/System/Library/CoreServices/boot.efi. Skipping update...
+Refitting to width 78
+Refitting to width 157
+Scale 1 label data is valid: YES
+Putting scale 1 label bitmap in <sysvol>/System/Library/CoreServices/.disk_label
+0x000003AD bytes preallocated for …/.disk_label
+Invisibility set for …/.disk_label
+Putting scale 2 label bitmap in <sysvol>/System/Library/CoreServices/.disk_label_2x
+0x00000EBD bytes preallocated for …/.disk_label_2x
+Invisibility set for …/.disk_label_2x
+Found system volume UUID path in preboot for disk3s1
+Putting scale 1 label bitmap in <preboot>/<UUID>/System/Library/CoreServices/.disk_label
+Putting scale 2 label bitmap in <preboot>/<UUID>/System/Library/CoreServices/.disk_label_2x
+```
+
+**六条事实：**
+
+1. **`.disk_label` 与 `.disk_label_2x` 各写两份：一份在系统卷的
+   `System/Library/CoreServices/`，一份在 Preboot 的 `<UUID>/System/Library/CoreServices/`。**
+   1.0 与 1.1 此前都只盯 Preboot 那一侧，**漏了系统卷这一侧**。
+   第 A.6.7 节那张「谁铺什么」净表的 A 类因此要补一句：`bless` 在两处都写。
+2. **确切字节数**：`.disk_label` = `0x3AD` = **941 字节**；`.disk_label_2x` = `0xEBD` = **3773 字节**
+   （标签文本是 `forensics-scratch`，17 个字符）。两张位图的宽度分别 refit 到 **78** 与 **157** 像素。
+   所以字节数随标签文本长度变，不是常量 —— 第 C.1 节不要拿它做等值判据。
+3. **两个 label 文件被设成不可见**（`Invisibility set`，即 `UF_HIDDEN`）。我们自己若要预生成它们，
+   这个标志也要带上。
+4. **`--bootefi` 会先比较再决定写不写**：`boot.efi unchanged … Skipping update`。
+   这解释了第 A.6.7 节为什么 Preboot 里那份 `boot.efi` 与系统卷上那份 SHA-256 相同 ——
+   不是巧合，是 `bless` 的幂等逻辑。
+5. **`bless` 用「volume group 里有没有一个与当前运行的 macOS 兼容的 System role 卷」
+   来定位目标。** 即它**依赖 volume group 已经建好**（`V-031`），而且**依赖当前运行的
+   macOS 与目标版本兼容** —— 这是一条本项目此前完全没有的约束：
+   **在 25G76 的运行器上 bless 一块 25G325 的盘，这条检查会怎么判，未知。**
+   登记为 **`V-033`**。（缓解：我们的第一块盘走 R1 路径，源就是运行器自己，版本必然一致。）
+6. **`Found system volume UUID path in preboot for disk3s1`** —— 再一次印证
+   Preboot 里那个目录名就是 volume group / Data 卷的 UUID（第 A.3.3a 节）。
+
+**这一轮最后还是失败了，但失败原因是我们自己的脚本 bug，不是 `bless` 的限制：**
+
+```text
+Volume does not have system role
+Snapshot options are only available for system volumes
+Snapshot manipulation failed
+Couldn't bless the APFS preboot volume for volume mounted at …: No such file or directory
+   退出码 = 2
+```
+
+`vol_of "Macintosh HD"` 的前缀匹配把 **Data 卷**当成了系统卷（第 A.3.3a 节末段），
+所以 `bless` 被指向一个没有 system role 的卷。`vol_of` 已修成精确匹配，
+**下一轮才是 `V-021` 的最终答案**。
+
 #### A.10.3 它到底写了什么
 
 **这是第 D 节最想回答的问题之一。现在能说的：**
@@ -1682,21 +1844,28 @@ sudo gpt -r show "$RAW" | grep -F 7C3457EF-0000-11AA-AA11-00306543ECAC \
   || { echo "FATAL(V-001): 建完容器后 p2 的类型 GUID 不是 APFS"; exit 1; }
 
 # ─────────────────────── 步 4：四个卷（A.3）───────────────────────
-# 工具：diskutil apfs addVolume（自带）。
-# 实测（A.3.3）：-role S / -role B / -role V 三条都成；
-#               -role D -groupWith 报 -69624（V-031，未解决）。
+# 工具：diskutil apfs addVolume（自带）。四个 role 实测全部可设（A.3.3）。
+# !! 顺序：**Data 第一个建**，System 再成组到它。反过来会被内核拒：
+#    apfs_newfs: A Non-sealed system sibling volume is not allowed（A.3.3a / V-031）。
 log "4  四个卷"
-vol_of() { diskutil list "$CNT" | awk -v n="$1" '$0 ~ ("APFS Volume " n " "){print $NF}' | head -1; }
+# vol_of 必须精确匹配：$VOLNAME_SYS 是 $VOLNAME_DATA 的前缀（A.3.3a 末段）。
+vol_of() {
+  local want="$1" v n
+  for v in $(diskutil list "$CNT" 2>/dev/null | awk '/APFS Volume/{print $NF}'); do
+    n=$(diskutil info "$v" 2>/dev/null \
+        | awk -F': *' '/^ *Volume Name/{gsub(/[ \t]+$/,"",$2); print $2; exit}')
+    [ "$n" = "$want" ] && { printf '%s' "$v"; return 0; }
+  done
+  return 1
+}
 
-sudo diskutil apfs addVolume "$CNT" APFS "$VOLNAME_SYS"  -role S -nomount
-SYS=$(vol_of "$VOLNAME_SYS")
-# !! V-031：下面这一条在 25G76 上实测失败（-69624）。A.3.3a 的 D2..D7 待试。
-#    在它解决之前整个脚本停在这里 —— 不要注释掉这条断言绕过去，
-#    没有成组的 Data 卷，firmlink 建不起来，启动会停在早期用户态（A.5.2）。
-sudo diskutil apfs addVolume "$CNT" APFS "$VOLNAME_DATA" -role D -groupWith "$SYS" -nomount
+sudo diskutil apfs addVolume "$CNT" APFS "$VOLNAME_DATA" -role D -nomount
 DATA=$(vol_of "$VOLNAME_DATA")
-diskutil apfs listVolumeGroups "$CNT" | grep -qF "$DATA" \
-  || { echo "FATAL(V-031): Data 卷没和 System 卷成组"; exit 1; }
+sudo diskutil apfs addVolume "$CNT" APFS "$VOLNAME_SYS" \
+     -role S -groupWith "$DATA" -nomount
+SYS=$(vol_of "$VOLNAME_SYS")
+diskutil apfs listVolumeGroups "$CNT" | grep -qF "$SYS" \
+  || { echo "FATAL(V-031): System 卷没和 Data 卷成组"; exit 1; }
 sudo diskutil apfs addVolume "$CNT" APFS "Preboot" -role B -nomount
 PRE=$(vol_of "Preboot")
 sudo diskutil apfs addVolume "$CNT" APFS "VM"      -role V -nomount
@@ -2345,7 +2514,8 @@ for path in sys.argv[1:]:
 
 | # | 问题 | 标签 | 查清方法 | 在 D 节范围内 | 阻塞什么 |
 |---|---|---|---|---|---|
-| **V-031**（新，**现在的第一优先**） | `addVolume … -role D -groupWith <sysvol>` 报 `Error: -69624`，而同一容器上 `-role S`/`-role B`/`-role V` 全成。到底是 role、是成组、还是两者的组合被拒 | `TESTED(25G76)` 现象；`BLOCKED` 原因 | 第 A.3.3a 节的 D2..D7 六条变体阶梯，已写进 `tooling` job | **是**（`tooling`） | **整条装配链。** 没有成组的 Data 卷，firmlink 建不起来（第 A.5.2 节），启动停在早期用户态 |
+| **V-033**（新） | `bless` 判断「volume group 里有没有一个与**当前运行的 macOS** 兼容的 System role 卷」。在 25G76 的运行器上 bless 一块 25G325 的盘，这条检查怎么判 | `BLOCKED` | 下一轮：对一块铺了 25G325 payload 的 scratch 卷跑 `bless --verbose`，看这一行的措辞 | **是**（`tooling`） | 若它拒绝跨版本，`75` 的 R6（UpdateBrain 产 25G325）就必须自己完成 bless，不能靠运行器的 `bless`。**R1 路径不受影响**（源就是运行器自己） |
+| ~~**V-031**~~ | ~~`-role D -groupWith` 被拒~~ | **已解决**，见第 A.3.3a 节 | 根因：`apfs_newfs: A Non-sealed system sibling volume is not allowed`。解法：先建 Data，再建 System 并 `-groupWith` 它 | — | — |
 | **V-032**（新） | Preboot 卷根上那个 16 字节的 `com.apple.BootInfo` xattr 是什么、谁写的 | `BLOCKED` | `xattr -px com.apple.BootInfo /System/Volumes/Preboot` 的 16 字节原文；与 volume group UUID 比对 | **是**（`preboot`，下一轮加一条） | 不阻塞（我们不写它）。若它是启动链的输入，缺它的表现会是「选择器里没有 macOS」 |
 | **V-020** | `--bootefi` 的「拷贝 boot objects」语义在 `--snapshotname` 下是否同样启用 | `BLOCKED` | 前两轮都没跑到（护栏 bug + 缺 `<UUID>/` 目录）。第三轮的 workflow 里已经是「建目录 → bless → 若失败去掉 `--create-snapshot` → 再试 `--snapshotname`」三段 | **是**（`tooling`） | 不阻塞（第 A.9.3 节用合并的那一条） |
 | **V-021** | `bless` 确切往 Preboot 写了哪些**文件** | **部分关闭**（清单已由第 A.6.7 节给出）；生成行为仍 `BLOCKED` | 已知的新前置条件：`<UUID>/` 目录必须先存在（第 A.6.6 节的 IMPORTANT 块）。第三轮据此重跑 | **是**（`tooling`） | 它决定第 A.6.7 节那张「谁铺什么」净表里 A 类与 B 类的分界线对不对 |
