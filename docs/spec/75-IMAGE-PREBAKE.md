@@ -1,10 +1,11 @@
 # 75 在 GitHub Actions 运行器上预烘完整 macOS 磁盘镜像
 
-文档版本：1.0
-基线日期：2026-10-30
+文档版本：1.3
+基线日期：2026-10-30（1.1：`InstallationSize` 的双架构 cryptex 拆分；1.2：整条打包改单 job 全 CI、两分区、Alpine 住 ESP；1.3（2026-11-01）：分区表改为离线写，p2 类型 GUID 反写）
 对应组件：无（基础设施分册）
 上级文档：`docs/spec/00-OVERVIEW.md`
-配套分册：`docs/spec/71-IMAGE-OPENCORE.md`、`docs/spec/73-DEPLOY-RESCUE.md`、`docs/spec/74-BOOT-CPU-DISPATCH.md`
+配套分册：`docs/spec/71-IMAGE-OPENCORE.md`、`docs/spec/73-DEPLOY-RESCUE.md`、`docs/spec/74-BOOT-CPU-DISPATCH.md`、`docs/spec/78-APFS-VOLUME-CONSTRUCTION.md`
+自有工具：`tools/ci/mkgpt.py`（1.3 新增，离线写 GPT）
 
 ## 0. 本文作用与写作约束
 
@@ -98,6 +99,45 @@
 >
 > **本修订不改选定路径。** R1（克隆运行器）仍是**先做**的那条，因为它的未知只有三个数（`P-001`/`P-002`/`P-003`）且都能在一次 job 里测掉；R6 的未知是一个逆向工程量。正确顺序是 **R1 先跑通把管线打直，再用 R6 把 build 从 25G76 换成 25G325**。
 
+### 0.0.0 1.3 修订：分区表不能用 `gpt(8)` 写，而且 p2 的类型 GUID 要反着写
+
+> [!CAUTION]
+> **本节改的是 §0.0.1 那段脚本里的前两条命令，依据是 CI 实测（run `41274204499`，
+> 运行器 25G76 / x86_64 / SIP disabled）。详细证据在 `78` 第 A.1.0、A.1.1、A.1.2 节，
+> 这里只写要改成什么。**
+>
+> | 原写法 | 实测 | 改成 |
+> |---|---|---|
+> | `sudo gpt destroy` / `gpt create -f` / `gpt add` / `gpt recover` | **`gpt` 的任何修改类子命令一律 `operation not permitted`。** 带不带 `sudo`、关不关 SIP、先不先 `diskutil unmountDisk` 全都一样；而 `gpt -r show` 正常，`dd` 对同一个裸设备读写也都 `rc=0`（**不带 `sudo` 也是**）—— 所以不是权限问题，是 `gpt` 自己的护栏 | **`python3 tools/ci/mkgpt.py create <img> --part …`**，在 `hdiutil attach` **之前**把表离线写进那个普通文件。`gpt recover` 不再需要：`mkgpt.py` 一次就把备份头与备份项数组写在真实盘尾 |
+> | `gpt add … -t 7C3457EF-0000-11AA-AA11-00306543ECAC`（p2 预设成 APFS） | `diskutil apfs createContainer` 报 **`Error: -69614: The disk is already in use by APFS`**（它看见分区自称 APFS 就去找容器超级块，找不到于是拒绝覆盖） | **p2 写成 `Apple_HFS`（`48465300-0000-11AA-AA11-00306543ECAC`）**，让 `createContainer` 自己改类型 —— 它确实会改，建完容器后 `gpt -r show` 回读到的就是 `7C3457EF-…` |
+> | `newfs_msdos -F 32 -v OPENCORE "${RAW}s1"` | **这条没问题，继续用。** 但**不要**换成 `diskutil eraseVolume FAT32`：后者虽然也返回 0，却会把 p1 的类型 GUID 改成 `Microsoft Basic Data`，固件就不再把它当 ESP 去找 `\EFI\BOOT\BOOTX64.EFI` | 不变 |
+>
+> **顺序也跟着变了：** 原来是「建稀疏 raw → attach → 写表」，现在必须是
+> **「建文件 → 写表 → attach」**。`hdiutil` 一旦 attach，MediaKit 就按它当时看到的
+> 分区表建设备节点，之后在文件里改表它不会重新解析。
+>
+> 改完的序列（替换 §0.0.1 脚本的第 1、2 段）：
+>
+> ```bash
+> IMG="$RUNNER_TEMP/macos-golden.raw"
+> : > "$IMG"
+> python3 tools/ci/mkgpt.py create "$IMG" \
+>         --size "$(( SIZE_GB * 1024 * 1024 * 1024 ))" \
+>         --part "auto:$(( 512 * 1024 * 1024 )):efi:EFI" \
+>         --part "auto:auto:hfs:Macintosh HD"
+> python3 tools/ci/mkgpt.py verify "$IMG"
+> DEV=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount "$IMG" \
+>       | awk '/^\/dev\/disk/{print $1; exit}')
+> RAW="${DEV/disk/rdisk}"
+> diskutil list "$DEV"                       # 必须看到 s1=EFI、s2=Apple_HFS
+> sudo newfs_msdos -F 32 -v OPENCORE "${RAW}s1"
+> sudo diskutil apfs createContainer "${DEV}s2"
+> ```
+>
+> **`mkgpt.py` 的正确性**由 `check.yml` 里三道必过检查守：UEFI 2.x 规范的 GUID 混合
+> 字节序与 CRC32 已知向量、几何断言与 1 字节篡改必须被检出的往返测试、
+> 以及 `gptdump.py` 的独立哑读复核。最终判据是 MediaKit 认不认，而这一条实测通过。
+
 ### 0.0.1 1.2 修订：整条打包改成单 job 全 CI，三段职责划分作废
 
 > [!IMPORTANT]
@@ -113,7 +153,7 @@
 >
 > | 1.0 的理由 | 重判 |
 > |---|---|
-> | 「`diskutil partitionDisk` 会自动生成它自己选定大小的 EFI 分区，改不了」 | **绕得过。** 不用 `diskutil partitionDisk`，用 `/usr/sbin/gpt create` + `gpt add -b <起始扇区> -s <扇区数> -t <type GUID>` 逐个分区显式布，尺寸与类型完全可控。`gpt(8)` 是 macOS 自带的底层 GPT 工具 |
+> | 「`diskutil partitionDisk` 会自动生成它自己选定大小的 EFI 分区，改不了」 | **绕得过，但不是用 `gpt`。** 1.2 当时写的是 `/usr/sbin/gpt create` + `gpt add`，**1.3 实测那条路被 `gpt` 自己的护栏拒掉**（见上面第 0.0.0 节）。改成 `tools/ci/mkgpt.py` 把表离线写进镜像文件，尺寸与类型同样完全可控，而且不需要 `sudo` |
 > | 「运行器上没有 OpenCore 的文件树」 | **CI 自己下。** OpenCorePkg 与 OcBinaryData 都是 GitHub public release，`curl` 直接取；`config.plist` 由 `74` 第 5 节的 `make-oc-config.py` 在 CI 里生成。**不需要从开发机上传任何东西** |
 > | 「rescue 分区是 ext4，macOS 造不出来」 | **这条成立，所以改设计：放弃 ext4。** 见下 |
 >
@@ -143,11 +183,11 @@
 > | 任务 | 工具 | 在位 |
 > |---|---|---|
 > | 建稀疏 raw 并当块设备挂起 | `hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount` | 自带（1.0 第 2.3.3 节已确证） |
-> | 写 GPT、显式布分区 | `/usr/sbin/gpt create` / `gpt add` | 自带 |
+> | 写 GPT、显式布分区 | ~~`/usr/sbin/gpt create` / `gpt add`~~ → **`tools/ci/mkgpt.py`**（1.3 修订，第 0.0.0 节） | 自有，纯 Python，无第三方依赖 |
 > | 造 FAT32 | `newfs_msdos -F 32 -v OPENCORE` | 自带 |
 > | 往 FAT 分区写文件 | `diskutil mount` + `ditto` | 自带。**不需要 `mtools`** |
 > | APFS 容器与卷 | `diskutil apfs` / `asr restore` | 自带 |
-> | 修 GPT 备份表到盘尾 | `gpt recover` | 自带（替代 Linux 的 `sgdisk -e`） |
+> | 修 GPT 备份表到盘尾 | ~~`gpt recover`~~ → **不需要这一步**：`mkgpt.py` 一次就把备份头与备份项数组写在真实盘尾（1.3 修订） | — |
 > | 压缩流出 | `zstd`（brew 有 bottle）或 `gzip`（预装） | 1.0 第 3.4 节已定 |
 >
 > #### 输入侧：上传量为零
@@ -181,19 +221,23 @@
 >       | head -1 | awk '{print $1}')
 > RAW="${DEV/disk/rdisk}"            # 裸设备，写 GPT 要用它
 >
-> # --- 2. GPT：两个分区，起始与长度都显式给 ---
+> # --- 2. GPT：两个分区 ---
+> # !! 1.3 已替换这一整段，见第 0.0.0 节。下面是 1.2 的原文，保留只为对照。
+> #    实测 `gpt` 的修改类子命令一律 operation not permitted，而且 p2 不能预设成
+> #    APFS 类型（createContainer 会报 -69614）。
+> #    正确的做法是：建文件 → mkgpt.py 离线写表（p2 写成 hfs）→ 才 attach。
 > ESP_START=2048                                     # 1 MiB 对齐
 > ESP_SIZE=$(( ESP_MIB * 1024 * 1024 / SECT ))
 > APFS_START=$(( ESP_START + ESP_SIZE ))
 > TOTAL_SECT=$(( SIZE_GB * 1024 * 1024 * 1024 / SECT ))
 > APFS_SIZE=$(( TOTAL_SECT - APFS_START - 2048 ))    # 盘尾留 1 MiB 给 GPT 备份表
 >
-> sudo gpt destroy "$RAW" 2>/dev/null || true
+> sudo gpt destroy "$RAW" 2>/dev/null || true        # ← 1.3：以下五条全部作废
 > sudo gpt create -f "$RAW"
 > sudo gpt add -b "$ESP_START"  -s "$ESP_SIZE"  -t efi  "$RAW"
 > sudo gpt add -b "$APFS_START" -s "$APFS_SIZE" \
 >      -t 7C3457EF-0000-11AA-AA11-00306543ECAC "$RAW"
-> sudo gpt show "$RAW"
+> sudo gpt show "$RAW"                               # ← 只有这一条（只读）仍可用
 >
 > # --- 3. ESP：造 FAT32 并铺内容 ---
 > sudo newfs_msdos -F 32 -v OPENCORE "${RAW}s1"
@@ -210,7 +254,9 @@
 > #     ... 见第 2.3.3 节（已据此修订）
 >
 > # --- 5. 收尾 ---
-> sudo gpt recover "$RAW" || true     # 备份表挪到真实盘尾
+> # 1.3：`gpt recover` 作废（它也被拒，而且本来就不需要 —— mkgpt.py 一次就把
+> #      备份头与备份项数组写在真实盘尾）。换成一次只读复核。
+> python3 tools/ci/mkgpt.py verify "$IMG"
 > sudo hdiutil detach "$DEV"
 > ```
 >

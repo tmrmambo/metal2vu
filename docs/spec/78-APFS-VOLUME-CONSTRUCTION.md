@@ -1471,9 +1471,10 @@ set -euo pipefail
 IMG="${1:?out.raw}"; SIZE_GB="${2:-16}"
 STAGE="${3:?payload stage dir}"; IDX="${4:?index tsv}"
 
+REPO="${REPO:-$(cd "$(dirname "$0")/.." && pwd)}"   # 仓库根，用来找 tools/ci/mkgpt.py
 ESP_MIB=512
 SECT=512
-APFS_PART=2            # A.1.1：加回 BaseSystem 分区时改成 3
+APFS_PART=2            # A.1.3：加回 BaseSystem 分区时改成 3
 MNT_SYS=/System/Volumes/Update/mnt1          # 与 OCLP 同一个位置（0.2 节）
 MNT_DATA=$(mktemp -d /tmp/d8data.XXXXXX)
 MNT_PRE=$(mktemp -d /tmp/d8pre.XXXXXX)
@@ -1483,61 +1484,79 @@ LABEL="macOS 26.7.2"
 
 log() { printf '\n=== [%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 
-# ───────────────────────── 步 1：空 raw + attach ─────────────────────────
-# 工具：dd + hdiutil（自带）。换不了：没有别的办法把一个普通文件当块设备。
-# 失败表现：hdiutil 报 "no mountable file systems" 是正常的（我们给了 -nomount）；
-#           报 "image not recognized" 说明漏了 CRawDiskImage imagekey。
-log "1  造稀疏 raw 并 attach"
+# ───────────────────────── 步 1：只造空 raw，**先不 attach** ─────────────────────────
+# 1.1 改动：attach 挪到步 2 之后。理由是分区表现在离线写进这个普通文件（A.1.0），
+# 而 hdiutil 一旦 attach，MediaKit 就按它当时看到的（空）分区表建设备节点，
+# 之后在文件里改表它不会重新解析。顺序必须是 建文件 → 写表 → attach。
+# 工具：mkgpt.py 自己会 truncate 到指定大小，所以连 dd 都不需要。
+log "1  造稀疏 raw"
 mkdir -p "$(dirname "$IMG")"
-dd if=/dev/zero of="$IMG" bs=1 count=0 seek=$((SIZE_GB * 1024 * 1024 * 1024))
-DEV=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount "$IMG" \
-      | head -1 | awk '{print $1}')
-RAW="${DEV/disk/rdisk}"
+: > "$IMG"
 trap 'sudo diskutil unmount force "$MNT_PRE" 2>/dev/null || true;
       sudo diskutil unmount force "$MNT_DATA" 2>/dev/null || true;
       sudo diskutil unmount force "$MNT_SYS" 2>/dev/null || true;
-      hdiutil detach "$DEV" 2>/dev/null || true' EXIT
-echo "DEV=$DEV  RAW=$RAW"
+      [ -n "${DEV:-}" ] && hdiutil detach "$DEV" 2>/dev/null || true' EXIT
 
-# ──────────────────── 步 2：GPT 两分区（75 §0.0.1 的序列）────────────────────
-# 工具：gpt(8)（自带）。换不了 diskutil partitionDisk：它会自己决定 ESP 大小。
-# 失败表现：gpt add 报 "not enough space"，说明扇区算术错了。
+# ──────────────────── 步 2：GPT 两分区（A.1，1.1 已改工具）────────────────────
+# 工具：tools/ci/mkgpt.py（自有，纯 Python）。
+#   换不了 gpt(8)：它的修改类子命令在 25G76 上一律 operation not permitted（A.1.0）。
+#   换不了 diskutil partitionDisk：它会自己决定 ESP 大小。
+# 注意两件事（都是 1.1 的实测结论）：
+#   (a) 这一步必须在 hdiutil attach **之前**做 —— 它写的是普通文件。
+#       所以步 1 的 attach 要挪到这一步之后。
+#   (b) p2 写成 hfs 而不是 apfs，让步 3 的 createContainer 自己改类型（A.1 约束 3）。
+# 失败表现：mkgpt.py verify 报边界/重叠 → 扇区算术错了，它会指出是哪一条。
 log "2  GPT"
-ESP_START=2048
-ESP_SIZE=$(( ESP_MIB * 1024 * 1024 / SECT ))
-APFS_START=$(( ESP_START + ESP_SIZE ))
-TOTAL_SECT=$(( SIZE_GB * 1024 * 1024 * 1024 / SECT ))
-APFS_SIZE=$(( TOTAL_SECT - APFS_START - 2048 ))
-sudo gpt destroy "$RAW" 2>/dev/null || true
-sudo gpt create -f "$RAW"
-sudo gpt add -b "$ESP_START"  -s "$ESP_SIZE"  -t efi "$RAW"
-sudo gpt add -b "$APFS_START" -s "$APFS_SIZE" \
-     -t 7C3457EF-0000-11AA-AA11-00306543ECAC "$RAW"
-sudo gpt show "$RAW"
+python3 "$REPO/tools/ci/mkgpt.py" create "$IMG" \
+        --size "$(( SIZE_GB * 1024 * 1024 * 1024 ))" \
+        --part "auto:$(( ESP_MIB * 1024 * 1024 )):efi:EFI" \
+        --part "auto:auto:hfs:$VOLNAME_SYS"
+python3 "$REPO/tools/ci/mkgpt.py" verify "$IMG"
+
+# 现在才 attach。-nomount 是必须的：此刻 p2 只是一个声称自己是 HFS+ 的空分区。
+# 失败表现：报 "image not recognized" 说明漏了 CRawDiskImage imagekey；
+#           "no mountable file systems" 是正常的（我们给了 -nomount）。
+DEV=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount "$IMG" \
+      | awk '/^\/dev\/disk/{print $1; exit}')
+RAW="${DEV/disk/rdisk}"
+echo "DEV=$DEV  RAW=$RAW"
+diskutil list "$DEV"     # 这里必须看到 s1=EFI、s2=Apple_HFS
 
 # ESP 的内容不是本文的事（75 §0.0.1 + 76 §3.2）。这里只建文件系统占位。
+# 必须用 newfs_msdos，不能用 diskutil eraseVolume FAT32 —— 后者会把 p1 的
+# 类型 GUID 改成 Microsoft Basic Data，固件就不再把它当 ESP（A.1.2）。
 sudo newfs_msdos -F 32 -v OPENCORE "${RAW}s1"
 
 # ───────────────────── 步 3：APFS container（A.2）─────────────────────
 # 工具：diskutil apfs（自带）。换不了：Linux 侧没有能建带 role 的多卷容器的实现（75 §0.0）。
-# 失败表现：报 "could not create APFS container" 多半是分区类型 GUID 不对（V-001）。
+# 失败表现：报 -69614 "The disk is already in use by APFS" → 步 2 把 p2 写成了
+#           APFS 类型。它必须是 Apple_HFS（A.1 约束 3）。
 log "3  APFS container"
 sudo diskutil apfs createContainer "${DEV}s${APFS_PART}"
 CNT=$(diskutil info -plist "${DEV}s${APFS_PART}" \
       | plutil -extract APFSContainerReference raw -o - - 2>/dev/null \
       || diskutil list "${DEV}" | awk '/APFS Container Scheme/{print $NF}')
 echo "CNT=$CNT"
+# createContainer 会自己把 p2 的类型改成 7C3457EF-…。确认一下（只读，gpt show 可用）。
+sudo gpt -r show "$RAW" | grep -F 7C3457EF-0000-11AA-AA11-00306543ECAC \
+  || { echo "FATAL(V-001): 建完容器后 p2 的类型 GUID 不是 APFS"; exit 1; }
 
 # ─────────────────────── 步 4：四个卷（A.3）───────────────────────
 # 工具：diskutil apfs addVolume（自带）。
-# 失败表现：-role B 或 -role V 被拒 → 走 A.3.3 的退路 R-a（changeVolumeRole）。
+# 实测（A.3.3）：-role S / -role B / -role V 三条都成；
+#               -role D -groupWith 报 -69624（V-031，未解决）。
 log "4  四个卷"
 vol_of() { diskutil list "$CNT" | awk -v n="$1" '$0 ~ ("APFS Volume " n " "){print $NF}' | head -1; }
 
 sudo diskutil apfs addVolume "$CNT" APFS "$VOLNAME_SYS"  -role S -nomount
 SYS=$(vol_of "$VOLNAME_SYS")
+# !! V-031：下面这一条在 25G76 上实测失败（-69624）。A.3.3a 的 D2..D7 待试。
+#    在它解决之前整个脚本停在这里 —— 不要注释掉这条断言绕过去，
+#    没有成组的 Data 卷，firmlink 建不起来，启动会停在早期用户态（A.5.2）。
 sudo diskutil apfs addVolume "$CNT" APFS "$VOLNAME_DATA" -role D -groupWith "$SYS" -nomount
 DATA=$(vol_of "$VOLNAME_DATA")
+diskutil apfs listVolumeGroups "$CNT" | grep -qF "$DATA" \
+  || { echo "FATAL(V-031): Data 卷没和 System 卷成组"; exit 1; }
 sudo diskutil apfs addVolume "$CNT" APFS "Preboot" -role B -nomount
 PRE=$(vol_of "Preboot")
 sudo diskutil apfs addVolume "$CNT" APFS "VM"      -role V -nomount
@@ -1663,7 +1682,10 @@ log "14  收尾"
 sudo diskutil unmount "$MNT_PRE"  || sudo diskutil unmount force "$MNT_PRE"
 sudo diskutil unmount "$MNT_DATA" || sudo diskutil unmount force "$MNT_DATA"
 sudo diskutil unmount "$MNT_SYS"  || sudo diskutil unmount force "$MNT_SYS"
-sudo gpt recover "$RAW" || true    # 备份表挪到真实盘尾（75 §0.0.1）
+# 1.1：不再需要 `gpt recover` —— 一则它和 gpt 的其余修改类子命令一样被拒（A.1.0），
+# 二则 mkgpt.py 一次就把备份头与备份项数组写在真实盘尾，本来就不需要事后搬。
+# 只做一次只读复核：mkgpt.py verify 会重新从字节核对两个头的 CRC 与几何。
+python3 "$REPO/tools/ci/mkgpt.py" verify "$IMG"
 trap - EXIT
 hdiutil detach "$DEV"
 echo "DONE: $IMG"
@@ -1991,16 +2013,26 @@ exit "$FAIL"
 第 A.6.2 节事实 3 已论证它的价值。实验设计：
 
 ```text
-1. 在 $RUNNER_TEMP 下造一个 2 GB 的 raw，attach
-2. gpt create + gpt add -t 48465300-0000-11AA-AA11-00306543ECAC（Apple HFS）
+1. 在 $RUNNER_TEMP 下造一个 2 GB 的 raw
+2. mkgpt.py create --part auto:1800MiB:hfs:ScratchHFS   ← 离线写表，然后才 attach
+                     （1.1：原先写的 gpt create + gpt add 在 25G76 上被拒，A.1.0）
 3. newfs_hfs 建一个 HFS+ 卷（若 newfs_hfs 不在，用 diskutil eraseVolume JHFS+）
 4. mkdir 一个空的暂存目录 $STAGE_PB
-5. sudo diskutil apfs convert -dryrun -prebootSource "$STAGE_PB" <hfs-dev>
+5. sudo diskutil apfs convert <hfs-dev> -dryrun -prebootSource "$STAGE_PB"
+                     ↑ disk 在前。1.1：前两轮把它写在选项后面，diskutil 报
+                       "Could not find disk for -dryrun"，这个实验从未真正跑过。
+                       用法串原文：convert <disk> [-dryrun] [-prebootSource <dir>]
 6. ls -lhO@R "$STAGE_PB"    ← diskutil 往里加了什么，就是答案
 7. 若 -dryrun 下不加件，去掉 -dryrun 重跑（目标是我们自己的 scratch 镜像，不是运行器的盘）
 8. 转换完 diskutil apfs list <新容器>：看它建出来的 Preboot role 卷里有什么
 9. detach，删 raw
 ```
+
+**`diskutil apfs convert` 的用法串在 25G76 上实测取到了，它比手册更具体（`TESTED(25G76)`）：**
+指定 `-prebootSource` 并给自己的暂存目录时，**会建出一个带 UUID 目录的 Preboot role APFS 卷**
+以促成 macOS 的 bootstrap；那个目录通常要可写，因为**转换之前会自动往里加入额外的件，
+而且转换完不会删掉它们**；`-noPrebootAdditions` 可以关掉自动添加。
+这正是第 A.6.2 节事实 3 的来源，现在有了这个 build 自己的原话。
 
 **这个实验的产出是本 workflow 最值得期待的一项**，因为它不是「观察一个已经装好的系统」，而是「让 Apple 的工具在一块空盘上从零做一次 Preboot」。两者的差别正是第 A.6.3 节那张表里「现在能写出规格吗」一列的全部缺口。
 
@@ -2125,9 +2157,31 @@ for path in sys.argv[1:]:
 
 按 `00-OVERVIEW` 第 7 节补充规则第 4 条：「没查」不等于「被阻断」，能用现有材料查清的一律不标 `BLOCKED`。
 
+#### E.3.0 已关闭的（1.1，两轮 CI 取证）
+
+**这张表是权威的。下面那张原表里同编号的行已被它取代，保留只为看得见「原来以为是什么」。**
+
+| # | 答案 | 标签 | 证据 |
+|---|---|---|---|
+| **V-001** | **会，而且必须由它改。** 事先把 p2 写成 APFS 类型反而让 `createContainer` 报 `-69614 The disk is already in use by APFS`；写成 `Apple_HFS` 则成功，并由它把类型改成 `7C3457EF-…` | `TESTED(25G76)` | `B4-scratch.txt`（P0 对照 vs P1），第 A.1 节约束 3 |
+| **V-003** | **是 `APFSContainerReference`。** 退路的 grep 串要按 `Created new APFS Container ([a-z0-9]+)` 写（1.0 写的 "with disk identifier" 对不上） | `TESTED(25G76)` | `23-container-ref.txt` + `B4-scratch.txt`，第 A.2 节 |
+| **V-006** | **`FilesystemName = APFS`**（非大小写敏感），与规格一致 | `TESTED(25G76)` | `24-case-sensitivity.txt` |
+| **V-007** | **`-role B` 与 `-role V` 都能设，不需要退路。** `addVolume` 的用法串列出的允许集是 `B\|R\|V\|I\|T\|S\|D\|E\|X\|H\|C\|Y` | `TESTED(25G76)` | `B0-tool-usage.txt` + `B4-scratch.txt`，第 A.3.3 节 |
+| **V-009** | **`chflags restricted` 可用**（回读 `flags=80000 restricted`）；**`chflags 0x80000` 不存在**（`invalid flags`）；`chflags compressed` 在 APFS 上置不上 `UF_COMPRESSED` | `TESTED(25G76)` | `B3-chflags.txt`，第 A.4.2 节 |
+| **V-014** | **Preboot 全树已取到，679 条。** 卷根下四项：`.TemporaryItems/`、`<VG_UUID>/`、`com.apple.security.cryptexd/`、**`Cryptexes/`**（与 per-UUID 目录同级）。**没有 `i386/` 这一项**（1.0 从野外文档推测的那一条不成立） | `TESTED(25G76)` | 第 A.6.7 节 |
+| **V-016** | **有。** `<VG_UUID>/Library/Preferences/SystemConfiguration/com.apple.Boot.plist`，来源是 payload 的 Data 模板里那份 232 字节的。**但本项目不往那里写**：boot-args 走 OpenCore `NVRAM/Add` | `TESTED(25G76)` | 第 A.6.7 节 |
+| **V-017** | **问题消失。** 三份 `boot.efi`（Preboot、System `CoreServices`、`usr/standalone/i386`）SHA-256 完全相同（`5783955a…c64060`，723,512 字节），所以默认源取哪一份都一样。三份都**未经代码签名**，`file` 报 `PE32+ executable (EFI application) x86-64` | `TESTED(25G76)` | `76-bootefi.txt`，第 A.6.6 节 |
+| **V-021** | **一半关闭。** `bless --info /` 直接给出：blessed folder = `/System/Volumes/Preboot/<VG>/System/Library/CoreServices`，blessed file = 同目录下的 `boot.efi`，两者记成 APFS 文件 ID（`12884902198` / `12884902278`）。**文件清单也已拿到**（第 A.6.7 节的 10 类件）。**仍缺的只是「bless 这一条命令在一块空盘上会不会把这些都铺出来」** | `TESTED(25G76)` 清单；`INFERRED` 生成 | `44-bless-info-root.txt`，第 A.6.7 节 |
+| **V-029**（新） | **ESP 建得出来，但只能用 `newfs_msdos -F 32`。** `diskutil eraseVolume FAT32` 虽然也返回 0，却会把 p1 的类型 GUID 改成 `Microsoft Basic Data`，固件就不再把它当 ESP | `TESTED(25G76)` | 第 A.1.2 节 |
+| **V-030**（新） | **`gpt(8)` 的修改类子命令被它自己的护栏拒掉，与权限无关。** `dd` 对同一裸设备读写都 `rc=0`（**不带 sudo 也是**），`gpt -r show` 正常，`gpt create -f` 一律 `operation not permitted`。连带结论：`newfs_msdos` / `asr` / `dd` 这些不受影响 | `TESTED(25G76)` | 第 A.1.0 节的七条探针表 |
+
+#### E.3.1 仍未关闭的（原表，1.0 的措辞保留）
+
 | # | 问题 | 标签 | 查清方法 | 在 D 节范围内 | 阻塞什么 |
 |---|---|---|---|---|---|
-| **V-001** | `diskutil apfs createContainer` 会不会替我们把分区类型 GUID 改成 `7C3457EF-…` | `INFERRED` | 建完容器 `gpt show <rdisk>` 看 p2 类型。不一致就 `gpt remove` + `gpt add -t …` 重写 | **是**（`tooling`） | 类型不对 OpenCore 可能扫不到 p2。表现是「选择器里没有 macOS」 |
+| **V-031**（新，**现在的第一优先**） | `addVolume … -role D -groupWith <sysvol>` 报 `Error: -69624`，而同一容器上 `-role S`/`-role B`/`-role V` 全成。到底是 role、是成组、还是两者的组合被拒 | `TESTED(25G76)` 现象；`BLOCKED` 原因 | 第 A.3.3a 节的 D2..D7 六条变体阶梯，已写进 `tooling` job | **是**（`tooling`） | **整条装配链。** 没有成组的 Data 卷，firmlink 建不起来（第 A.5.2 节），启动停在早期用户态 |
+| **V-032**（新） | Preboot 卷根上那个 16 字节的 `com.apple.BootInfo` xattr 是什么、谁写的 | `BLOCKED` | `xattr -px com.apple.BootInfo /System/Volumes/Preboot` 的 16 字节原文；与 volume group UUID 比对 | **是**（`preboot`，下一轮加一条） | 不阻塞（我们不写它）。若它是启动链的输入，缺它的表现会是「选择器里没有 macOS」 |
+| **V-001** | `diskutil apfs createContainer` 会不会替我们把分区类型 GUID 改成 `7C3457EF-…` | ~~`INFERRED`~~ **已关闭，见 E.3.0** | 建完容器 `gpt show <rdisk>` 看 p2 类型。不一致就 `gpt remove` + `gpt add -t …` 重写 | **是**（`tooling`） | 类型不对 OpenCore 可能扫不到 p2。表现是「选择器里没有 macOS」 |
 | **V-002** | `75` §0.0.1（两分区）与 `76` §3.1（三分区）的最终分区数 | 设计冲突 | 由 `75` 或 `76` 下一轮修订定版。**本文第 A.1.1 节已论证这个选择对本文零影响** | 否（文档工作） | 不阻塞本文。影响的是 BaseSystem 恢复环境在不在盘上 |
 | **V-003** | `diskutil info -plist <分区>` 里取容器引用 disk 号的键名是不是 `APFSContainerReference` | `INFERRED` | `diskutil info -plist` 全文落盘后读键名 | **是**（`volumes`） | 不阻塞。第 A.2 节已给确定可用的退路（抓 `createContainer` 的 stdout） |
 | **V-004** | macOS 的 `cp` 在跨卷拷一个 decmpfs 文件时的实际产物（是否带 `UF_COMPRESSED`） | `INFERRED` | 在运行器上对一个已知压缩的系统文件 `cp` 到 scratch 卷，`ls -lO` + `stat -f '%z %b %Xf'` 看结果 | **是**（`compression`） | 不阻塞（我们用 `ditto`）。它决定第 0.3.1 节 (f) 的那句判断对不对 |
@@ -2160,10 +2214,12 @@ for path in sys.argv[1:]:
 
 从上表挑出「在 D 节范围内」且「阻塞下游」的，按优先级：
 
+> **1.1 更新：原来列的三条（`V-007`、`V-014`、`V-021`）已全部关闭。** 换上来的三条如下。
+
 | # | 为什么必须先做 | 成本 |
 |---|---|---|
-| **V-007** | 它决定第 A.3 节那段命令序列成不成立。`-role B` 被拒的话整个卷层要换成 A.3.3 的退路 | 一个 job，两条命令 |
-| **V-014** | 它是第 A.6 节（Preboot）唯一真正缺的那一格。缺它的后果是「选择器里没有 macOS」，而那在无头机器上无法归因 | 一个 job，一次 `find` |
-| **V-021** | 它把第 A.6 节从「机制已知」升级为「清单已知」，同时顺手关掉 `V-016`、`V-020`、`V-022` | 一个 job，一块 2 GB 的 scratch 镜像 |
+| **V-031** | **它决定第 A.3 节那段命令序列成不成立，而且现在是已知不通而不是未知。** 没有成组的 Data 卷，整块盘启动不到用户态。第 A.3.3a 节已写出六条待试变体 | 一个 job，六次 `addVolume` |
+| **V-020 / V-023** | 前两轮它们都因为自家护栏的一个 shell 写法错误而从未真正跑过（第 A.10.2 节的 1.1 注记）。护栏已修，这两条现在是「跑一次就知道」 | 一个 job，一块 4 GB 的 scratch 镜像 |
+| **V-028** | 前两轮 `diskutil apfs convert` 的参数顺序写反（`disk` 必须在前），所以**Apple 自己认为的 Preboot 必需件清单**一次都没取到。参数已修。它的价值是把第 A.6.7 节的「谁铺什么」净表从推断变成 Apple 的自述 | 一个 job，一块 2 GB 的 HFS+ scratch |
 
 **`V-015`（cryptex）排第四而不是前三**，理由：它的体量最大（2.4 GB），但它与 `77` 的 `U-001` 共享同一条未知，而 `77` 已经把那条未知排了期。先把前三条关掉、造出一块「除 cryptex 之外都对」的镜像跑一次 E0-L1，**cryptex 缺失的表现（第 C.2 节 L1-4）本身就是关于它的最强证据**。
