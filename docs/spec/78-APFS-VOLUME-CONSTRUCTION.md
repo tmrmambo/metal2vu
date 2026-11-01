@@ -1877,6 +1877,138 @@ close(fd);
 程序落在 `tools/seal/apfs_seal.c`，由 `tooling` job 现场 `cc` 编译 —— 它只用公开头文件，
 没有任何第三方依赖。
 
+#### A.10.2d-bis 实测结果：两条 syscall 都返回 `EPERM`，而根因指向 AMFI 而不是 root
+
+`TESTED(25G76)`，run `41282957904`。`tools/seal/apfs_seal.c` 编译干净
+（`-Wall -Wextra -Werror` 零告警），`nm -u` 确认四个 `fs_snapshot_*` 都正常链接。
+在 scratch 容器的 role S 卷（已挂载、护栏通过：scratch 整盘 `disk3` vs 根卷 `disk1`）上：
+
+```text
+apfs_seal: fs_snapshot_create("<mnt>", "com.apple.os.update-MSUPrepareUpdate", 0)
+           失败：rc=-1 errno=1 (Operation not permitted)
+apfs_seal: fs_snapshot_root(  "<mnt>", "com.apple.os.update-MSUPrepareUpdate", 0)
+           失败：rc=-1 errno=1 (Operation not permitted)
+```
+
+**带 `sudo`，SIP 已 disabled，仍然 `EPERM`。这是本项目撞上的第三道
+「operation not permitted」**（前两道是 `gpt create` 与 `gpt add`，第 A.1.0 节）。
+
+**但这一道和前两道的性质不同，而且差别决定了结论。** 三条证据：
+
+1. **`fs_snapshot_root` 根本不在公开头文件里。** 运行器 SDK 的 `sys/snapshot.h` 里
+   声明了 `create` / `list` / `delete` / `rename` / `mount` / `revert` 六个，**没有 `root`**。
+   它只在 libSystem 的导出表里（我们靠一行 `extern` 原型链接成功）。
+   **即 `fs_snapshot_root` 是 SPI，不是 API。**
+2. **xnu 对这一族 syscall 有 `PRIV_VFS_SNAPSHOT` 特权检查，而特权检查在 macOS 上
+   由 MACF 转给 AMFI，判据是 entitlement 而不是 uid。** 这解释了为什么 root 不够：
+   **`sudo` 给的是 uid 0，给不了 entitlement。**
+3. **`bless --create-snapshot` 在一块已是 ARV 的盘上是能工作的**（OCLP 每天在用）。
+   `bless` 是 Apple 签名的系统二进制，**它带那个 entitlement**。
+   所以 `bless` 不是「能力更强」，是「有票」。
+
+**于是 `V-034` 的裁决要分成两问，而它们的答案不同：**
+
+| 问 | 答 |
+|---|---|
+| 在 **GitHub runner** 上能不能自己封印 | **不能，而且这是结构性的。** runner 只关了 SIP，**AMFI 仍然开着**，所以拿不到 `PRIV_VFS_SNAPSHOT` |
+| 在**我们自己的目标机**上能不能 | **很可能能，但没验过。** 第 0.2 节的研发期设定是 `csr-active-config = 0xFEF` **加 `amfi_get_out_of_my_way=1`**（`70` §5.2、`71` §6.7）。AMFI 关掉之后 `priv_check_cred` 的 MACF 钩子不再拒，`EPERM` 应当消失 |
+
+**这条区分此前本项目一次都没做过，而它改变了「自己造」这条路的形状：**
+
+> **自己造一块盘，不能在一台只关了 SIP 的机器上完成；它需要一台 AMFI 也关掉的 macOS。**
+> 而那台机器正是我们最终要造出来的东西 —— 所以第一块盘必须来自别处（克隆），
+> **从第二块起才能自己造。**
+
+**这不是死局，是一个引导（bootstrap）顺序：**
+
+```
+第 1 块盘：asr 克隆 runner（75 的 R1）→ 25G76，封印是 Apple 的
+                    │
+                    ▼  在它上面用 OpenCore 注入 amfi_get_out_of_my_way=1 启动
+第 2 块盘起：在这台机器上跑第 B 节的脚本 → 25G325，封印是我们自己的
+```
+
+**待验三条（已写进 workflow，下一轮出结果）：**
+
+| # | 探针 | 验什么 |
+|---|---|---|
+| `V-035` | `codesign -d --entitlements - /usr/sbin/bless` / `/usr/bin/tmutil` | 确认它们带的是不是 `com.apple.private.vfs.snapshot` 一类的 entitlement。**这一条直接证实或推翻上面整段推理** |
+| `V-036` | `nvram boot-args` + AMFI 相关 `sysctl` | 确认 runner 的 AMFI 确实开着（目前只有「SIP disabled」这一条是实测的） |
+| `V-037` | 给 `apfs_seal` 做 ad-hoc 签名并塞上那个 entitlement，再试一次 | 若在 AMFI 开着的 runner 上就能过，那第 1 块盘也不必靠克隆 |
+
+#### A.10.2f 一条致命的不一致：`bless` 与 `updatePreboot` 用的不是同一个 UUID
+
+`TESTED(25G76)`，run `41282957904`。同一块 scratch 盘上，两个 Apple 工具往
+Preboot 的**两个不同目录**写东西：
+
+| 工具 | 它用的目录名 | 日志原文 |
+|---|---|---|
+| `bless` | 系统卷自己的 **Volume UUID**（`6049DE0D-…`） | `Found system volume UUID path in preboot for disk3s2` |
+| `diskutil apfs updatePreboot` | **Volume Group UUID**（`B09151E5-…`） | `The Target Volume is part of APFS Volume Group B09151E5-…` / `Preboot Volume Target Directory = <mp>/B09151E5-…` |
+
+**而启动链读的是 group UUID 那一个。** 依据是运行器自己那块盘：Preboot 下只有**一个**
+UUID 目录，名字 `0F9D8E91-834F-3213-9298-BA3FF72476FE`，而 `diskutil apfs list` 回报
+Data 卷 `disk1s1` 的 Volume UUID **就是**这一串（第 A.3.3a 节已证组 UUID == Data 卷 UUID）。
+
+**`bless` 之所以没报错，是因为它两种都接受。** 对照两轮的措辞：
+
+- run `41279550835`（我们建的是组 UUID 目录）→ `Found **volume group** UUID path in preboot`
+- run `41282957904`（我们建的是卷 UUID 目录）→ `Found **system volume** UUID path in preboot`
+- run `41278014136`（两个都没建）→ `No valid **group or volume** UUID folder`
+
+**第三条的措辞是决定性的：`bless` 找的是「group 或 volume」两者之一。**
+
+**而 `updatePreboot` 自己就说了哪个是「现代」的：**
+
+```text
+UpdatePreboot: Commanded moving Preboot/etc UUID dirs from old to modern
+               = MigrateSubjectDir = 1; MigrationEnabled
+UpdatePreboot: If Current != Modern, and target >= 10.16.0, then will additively
+               migrate and refresh Subject UUID Folder path
+```
+
+即 **旧式命名 = 系统卷 UUID，现代命名（10.16 / Big Sur 起）= volume group UUID**，
+而 `updatePreboot` 带着一个把旧迁到新的逻辑。
+
+> **写进规格：Preboot 的 per-UUID 目录一律用 volume group UUID，
+> 也就是 Data 卷的 Volume UUID（第 A.3.3a 节给了怎么取）。**
+> 用系统卷 UUID 也能让 `bless` 不报错，**但 `updatePreboot` 会另建一个目录，
+> 结果是 Preboot 里两个目录各有一半内容，而启动链只读其中一个。**
+> 这正是「选择器里有 macOS 但选了起不来」那一类最难归因的故障。
+
+**第 B 节步 11 据此加一条断言**：建目录之前先确认 `$VG` 取到的是组 UUID 而不是卷 UUID
+（两者在只有一个卷组的容器里可能相同，也可能不同 —— 本轮就不同）。
+
+#### A.10.2g `V-023` 关闭：`updatePreboot` 成功了，而且它写的就是 EFI 登录资源
+
+同一轮。上一轮（run `41278014136`）它报 `-69808: Some information was unavailable
+during an internal lookup`；这一轮成功。**差别只有一个：这一轮有 volume group。**
+它的日志逐条说明了为什么：
+
+```text
+UpdatePreboot: The Data-sibling or self of the target is disk3s1 err=0
+UpdatePreboot: The Target (normalized to Data-role) Volume's non-special-kind-
+               probably-OD user count is 0 and the Recovery user count is 0
+UpdatePreboot: Open Directory Database Search Path = <ms>/private/var/db/dslocal/nodes/Default
+UpdatePreboot: Unable to open Open Directory database; setting AuthODNodeOrNil accordingly
+```
+
+**三条结论：**
+
+1. **它要求目标卷有 Data sibling**（`The Data-sibling or self of the target`）。
+   没有 volume group 时这一步就返回 —— 这就是 `-69808` 的来源。
+   **所以 `V-023` 与 `V-031` 是同一条依赖的两端。**
+2. **没有 Open Directory 数据库它不会失败**，只是把 `AuthODNodeOrNil` 置空后继续。
+   所以第 B 节步 10 的顺序约束（预配用户在它之前）是**为了拿到登录账户**，
+   不是为了让它不报错。
+3. **它实际写进 Preboot 的是**（从 Preboot 全树 diff 读出）：
+   `<VG_UUID>/System/Library/Caches/com.apple.corestorage/EFILoginLocalizations/`
+   下的 12 个 `.efires`（`appleLogo` `battery` `disk_passwordUI` `flag_picker`
+   `guest_userUI` `loginui` `Lucida13` `Lucida13White` `preferences`
+   `unknown_userUI` 等）**加一个 `EncryptedRoot.plist.wipekey`**。
+   **这与第 A.6.7 节在运行器上实测到的那一棵完全同构** —— 所以第 A.6.6 节
+   第 5 步「我们自己拷 `EfiLoginUI/`」可以改成「交给 `updatePreboot`」。
+
 #### A.10.2e 顺带关掉的两条：`V-018` 与 `.disk_label.contentDetails`
 
 同一次反编译还解决了两件此前标 `BLOCKED` 的事。

@@ -1779,10 +1779,47 @@ jobs:
           }
 
           SYS=$(vol_of "Macintosh HD"); PRE=$(vol_of "Preboot")
+          DATA=$(vol_of "Macintosh HD - Data")
           MS="$RUNNER_TEMP/seal-ms"; MP="$RUNNER_TEMP/seal-mp"
           mkdir -p "$MS" "$MP"
 
           (
+            echo "########## V-035 / V-036：EPERM 的根因是 entitlement 还是 uid ##########"
+            # run 41282957904 实测：fs_snapshot_create / fs_snapshot_root 带 sudo 仍 EPERM。
+            # 推理（78 §A.10.2d-bis）：xnu 对这一族 syscall 有 PRIV_VFS_SNAPSHOT 检查，
+            # 而 macOS 上它由 MACF 转给 AMFI，判据是 entitlement 不是 uid。
+            # 下面三条探针直接证实或推翻这段推理。
+            echo "---- V-036：运行器的 boot-args 与保护状态 ----"
+            nvram boot-args 2>&1 || echo "（boot-args 未设）"
+            csrutil status 2>&1
+            csrutil authenticated-root status 2>&1 || echo "（无此子命令）"
+            for k in kern.bootargs security.mac.amfi.allow_any_signature \
+                     security.mac.amfi.allow_invalid_signature vm.cs_enforcement_disable \
+                     security.mac.amfi.unrestrict_task_for_pid; do
+              printf '  %-48s ' "$k"; sysctl -n "$k" 2>&1
+            done
+            echo
+            echo "---- V-035：Apple 自己那几个能建快照的二进制带什么 entitlement ----"
+            for b in /usr/sbin/bless /usr/bin/tmutil /usr/sbin/diskutil \
+                     /usr/libexec/storagekitd /sbin/apfs_hfs_convert; do
+              echo "===== $b"
+              [ -e "$b" ] || { echo "   （不存在）"; continue; }
+              codesign -d --entitlements :- "$b" 2>&1 \
+                | grep -iE 'snapshot|vfs|rootless|storage|key>' | head -20 \
+                || echo "   （无 entitlement 输出）"
+            done
+            echo
+            echo "---- V-035：哪些系统二进制声明了 vfs.snapshot 类 entitlement（全盘检索代价太大，只查这几个目录）----"
+            for d in /usr/sbin /usr/bin /sbin /usr/libexec; do
+              find "$d" -maxdepth 1 -type f -perm -u+x 2>/dev/null | while read -r f; do
+                if codesign -d --entitlements :- "$f" 2>/dev/null | grep -qi 'vfs.snapshot'; then
+                  echo "   带 vfs.snapshot: $f"
+                fi
+              done
+            done
+            echo "   （以上为空说明这个 entitlement 名字猜错了，看 V-035 的第一段输出）"
+            echo
+
             echo "########## 编译 tools/seal/apfs_seal.c ##########"
             cc -O2 -Wall -Wextra -o "$RUNNER_TEMP/apfs_seal" tools/seal/apfs_seal.c 2>&1
             echo "   cc 退出码 = $?"
@@ -1849,10 +1886,25 @@ jobs:
             echo "# --snapshotname 是「指定一个已有快照」而不是「创建」，"
             echo "# 所以它可能不触发 ARV 检查（78 §A.10.2d 的 S2a）。"
             if [ -n "$PRE" ]; then
-              VGU=$(diskutil info "$SYS" 2>/dev/null \
-                    | awk -F': *' '/Volume Group UUID/{gsub(/[ \t]+$/,"",$2); print $2; exit}')
-              [ -n "$VGU" ] || VGU=$(diskutil info "$SYS" 2>/dev/null \
+              # 必须是 **volume group** UUID，不是系统卷自己的 Volume UUID。
+              # 两者在本轮实测里是不同的值，而 updatePreboot 只认组 UUID、
+              # 启动链也只读组 UUID 那个目录（78 §A.10.2f）。
+              # 首选键名 APFSVolumeGroupID —— bake 的 probe 在运行器上实测它存在。
+              VGP="$RUNNER_TEMP/vg.$$.plist"
+              diskutil info -plist "$SYS" > "$VGP" 2>/dev/null
+              VGU=$(plutil -extract APFSVolumeGroupID raw -o - "$VGP" 2>/dev/null)
+              rm -f "$VGP"
+              # 退路：Data 卷的 Volume UUID（78 §A.3.3a 已证两者相等）
+              if [ -z "$VGU" ] && [ -n "${DATA:-}" ]; then
+                VGU=$(diskutil info "$DATA" 2>/dev/null \
+                      | awk -F': *' '/^ *Volume UUID/{gsub(/[ \t]+$/,"",$2); print $2; exit}')
+              fi
+              VOLU=$(diskutil info "$SYS" 2>/dev/null \
                     | awk -F': *' '/^ *Volume UUID/{gsub(/[ \t]+$/,"",$2); print $2; exit}')
+              echo "   组 UUID（要用这个）= '${VGU:-取不到}'"
+              echo "   系统卷 UUID（不要用）= '${VOLU:-}'"
+              [ "$VGU" = "$VOLU" ] && echo "   注意：本轮两者相同，看不出差别"
+              [ -n "$VGU" ] || { echo "   取不到组 UUID，这一节跳过"; exit 0; }
               sudo mkdir -p "$MP/$VGU/System/Library/CoreServices"
               sudo bless --folder "$MS/System/Library/CoreServices" \
                          --bootefi --snapshotname "$SNAP" \
