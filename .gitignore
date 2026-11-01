@@ -85,7 +85,9 @@ __pycache__/
 /artifacts/
 
 # CI 取回的产物：含 Apple 二进制的派生分析，不进仓（见 docs/spec/91 第 6 节）
+# 结论要抄进 docs/spec/ 的分册里，原始 dump 留在 GitHub 的 artifact 上。
 /ci-evidence/
+/ci-forensics/
 
 # 上游只在本地 clone 供阅读，不 vendor 进仓（吸收是 upstream-check 通过之后的事）
 /upstream/

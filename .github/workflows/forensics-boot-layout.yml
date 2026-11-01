@@ -22,14 +22,37 @@
 #    没有一处写文件、没有一处 --setBoot、没有一处 chflags 作用于系统路径。
 #    `nvram <变量名>` 只读一个变量（写要 `nvram name=value` 或 `-d`，本文件里没有）。
 #    `dd if=/dev/rdiskN … of=` 不存在：只有 `if=` 读，输出全部进 strings/xxd。
-# 2. 唯一有写操作的 job 是 `tooling`，它的写全部落在 $RUNNER_TEMP 下的一个
+# 2. 唯一有写操作的 job 是 `tooling`，它的写全部落在 $RUNNER_TEMP 下的
 #    scratch 磁盘镜像里，而且 bless 的目标是那个镜像里的卷，不是 /。
 #    78 §A.10.2 的「同一块物理盘」护栏在那个 job 里也跑。
+#    `tooling` 的 D0 步里有 `dd of=/dev/rdiskN`，那个 N 是 hdiutil 刚 attach
+#    的 scratch 镜像，取值来自同一条命令的输出，不是写死的盘号；
+#    上面第 1 条的「只读」说的是运行器自己那块盘。
 # 3. 每个纯诊断步骤末尾 `exit 0`。依据是 91 §5.4/5.5 的 R-004：
 #    `set +e` 只关 errexit，**步骤退出码仍取最后一条命令**，
 #    所以 find/stat 碰到权限错误返回非零会让整个 job 报 failure，
 #    而 artifact 其实已经产出。
 # =================================================================
+#
+# ======================= 第二轮的改动（run 41271530800 之后）=======================
+# 上一轮六个只读 job 全绿，Preboot 骨架与 cryptex1/current 清单全部拿到。
+# 但 `tooling` job 的整条写链死在第一条命令上：
+#       gpt create: operation not permitted: create
+#       gpt add:    operation not permitted: add
+# 当时 SIP 已 disabled、命令带 sudo、目标是刚 attach 的空镜像（无可卸载的卷），
+# 所以常规的三条解释全部不成立。连带后果：V-007（role B/V 能不能设）、
+# V-020/V-021/V-023（bless 往 Preboot 写了什么）一个都没关。
+#
+# 本轮三处改动：
+#   (1) 新增 `V-030` 诊断步骤 D0：把「读/写 × 整盘裸节点/块节点 × 有无 sudo」
+#       拆开逐条量，定死到底什么被拒。
+#   (2) 分区表改为**离线写进镜像文件**（`tools/ci/mkgpt.py`，纯 Python，
+#       不碰 /dev、不需要 sudo），并保留五级退路阶梯 P1/P1b/P2/P3/P4，
+#       最后一级就是上一轮失败的原路，留作对照。
+#   (3) 新增 `V-029`：FAT32 的 ESP 到底建不建得出来（`newfs_msdos` 直写分区
+#       裸节点 vs `diskutil eraseVolume` 走 diskarbitrationd）。这一条上一轮
+#       根本没问过，而它决定 75 §0.0.1 的 ESP 那一步成不成立。
+# ==============================================================================
 
 name: forensics-boot-layout
 
@@ -38,6 +61,8 @@ on:
   push:
     paths:
       - '.github/workflows/forensics-boot-layout.yml'
+      - 'tools/ci/mkgpt.py'
+      - 'tools/ci/gptdump.py'
 
 permissions:
   contents: read
@@ -872,8 +897,9 @@ jobs:
 
   # ═══════════════════════════════════════════════════════════════════
   # job 6  tooling：工具面与 scratch 镜像实验
-  # 对准 78 §A.3.3 / §A.6.2 / §A.9 / §D.5。
+  # 对准 78 §A.1 / §A.3.3 / §A.6.2 / §A.9 / §D.5。
   # 回填 V-001 / V-007 / V-009 / V-018 / V-020 / V-021 / V-023 / V-028
+  #      / V-029（ESP 建不建得出来）/ V-030（裸设备写权限）
   #
   # 这是唯一有写操作的 job。全部写落在 $RUNNER_TEMP 下的 scratch 磁盘镜像里。
   # ═══════════════════════════════════════════════════════════════════
@@ -1001,43 +1027,273 @@ jobs:
           rm -rf "$W" 2>/dev/null
           exit 0
 
-      - name: V-001 / V-007  scratch 镜像：建容器与四个卷
+      # ─────────────────────────────────────────────────────────────────
+      # D0 是本轮新加的。上一轮（run 41271530800）这个 job 的整条链死在
+      #     gpt create: operation not permitted: create
+      # 而且当时 SIP 已 disabled、命令带 sudo、磁盘是刚 attach 的空镜像。
+      # 「关 SIP」「加 sudo」「先 unmount」三条常规解释全部不成立，
+      # 所以必须先把「到底什么被拒了」拆开量：是 gpt 这个二进制被拒，
+      # 还是对 /dev/rdiskN 的任何写入都被拒，还是只有整盘节点被拒而
+      # 分区节点可写。三者对 75/78 的后果完全不同：
+      #   - 只有 gpt 被拒        → 换别的写表方式即可
+      #   - 整盘裸写被拒         → 分区表必须离线写进镜像文件（mkgpt.py）
+      #   - 分区裸写也被拒       → newfs_msdos 与 asr 也会倒，R1 要重做
+      # 登记为 V-030。
+      # ─────────────────────────────────────────────────────────────────
+      - name: V-030  裸设备写权限诊断（定位上一轮 gpt EPERM 的根因）
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p out
+          IMG="$RUNNER_TEMP/permprobe.raw"; rm -f "$IMG"
+          dd if=/dev/zero of="$IMG" bs=1m count=64 2>/dev/null
+          {
+            echo "########## 身份与保护状态 ##########"
+            echo "whoami : $(whoami)"
+            echo "id     : $(id)"
+            sudo -n true 2>&1; echo "sudo -n 退出码 = $?"
+            echo "csrutil: $(csrutil status 2>&1)"
+            echo "SW     : $(sw_vers -productVersion) / $(sw_vers -buildVersion)"
+
+            echo
+            echo "########## attach（这次把 hdiutil 的完整输出留下）##########"
+            AO=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount "$IMG" 2>&1)
+            echo "$AO"
+            DEV=$(printf '%s\n' "$AO" | awk '/^\/dev\/disk/{print $1; exit}')
+            RAW="${DEV/disk/rdisk}"
+            echo "DEV=$DEV  RAW=$RAW"
+            [ -n "$DEV" ] || { echo "attach 没拿到设备，后面全跳过"; exit 0; }
+
+            echo
+            echo "########## 设备自己说它可不可写 ##########"
+            diskutil info "$DEV" 2>&1 | grep -iE 'Writ|Read-Only|Virtual|Ejectable|Whole|Block Size|Content'
+            ls -l@ "$DEV" "$RAW" 2>&1
+
+            echo
+            echo "########## 逐级试：读 / 写 × 整盘裸节点 / 整盘块节点 ##########"
+            probe() {  # probe <说明> <命令...>
+              local what="$1"; shift
+              "$@" >/dev/null 2>"$RUNNER_TEMP/probe.err"
+              local rc=$?
+              printf '%-46s rc=%-3s %s\n' "$what" "$rc" \
+                     "$(head -1 "$RUNNER_TEMP/probe.err" 2>/dev/null)"
+            }
+            probe "dd 读 $RAW（1 扇区）"      sudo dd if="$RAW" of=/dev/null bs=512 count=1
+            probe "dd 读 $DEV（1 扇区）"      sudo dd if="$DEV" of=/dev/null bs=512 count=1
+            probe "dd 写 $RAW（1 扇区 零）"   sudo dd if=/dev/zero of="$RAW" bs=512 count=1 conv=notrunc
+            probe "dd 写 $DEV（1 扇区 零）"   sudo dd if=/dev/zero of="$DEV" bs=512 count=1 conv=notrunc
+            probe "gpt -r show $RAW（只读）"  sudo gpt -r show "$RAW"
+            probe "gpt create -f $RAW"        sudo gpt create -f "$RAW"
+            probe "gpt create -f $DEV"        sudo gpt create -f "$DEV"
+
+            echo
+            echo "---- 先 unmountDisk 再重试（排除 DiskArbitration 占用这一解释）----"
+            sudo diskutil unmountDisk force "$DEV" 2>&1
+            probe "unmount 后 gpt create -f $RAW" sudo gpt create -f "$RAW"
+            probe "unmount 后 dd 写 $RAW"          sudo dd if=/dev/zero of="$RAW" bs=512 count=1 conv=notrunc
+
+            echo
+            echo "---- 不带 sudo 的同样两条（看 EPERM 是不是和 euid 无关）----"
+            probe "无 sudo gpt create -f $RAW"  gpt create -f "$RAW"
+            probe "无 sudo dd 写 $RAW"          dd if=/dev/zero of="$RAW" bs=512 count=1 conv=notrunc
+
+            echo
+            echo "########## gpt -r show 的全文（它读得到什么）##########"
+            sudo gpt -r show "$RAW" 2>&1 | head -20
+
+            echo
+            echo "########## 结论判据 ##########"
+            echo "若「dd 写 \$RAW」rc=0 而「gpt create」rc!=0 → 是 gpt 自己的护栏"
+            echo "若两者都 rc!=0 且 Operation not permitted → 裸设备写被 TCC/内核拦，"
+            echo "   分区表必须离线写（见下一步 mkgpt.py），且 newfs_msdos/asr 需单独验"
+
+            hdiutil detach "$DEV" 2>/dev/null || hdiutil detach -force "$DEV" 2>/dev/null
+          } > out/D0-rawdev-permission.txt 2>&1
+          cat out/D0-rawdev-permission.txt
+          rm -f "$IMG"
+          exit 0
+
+      - name: V-001 / V-007 / V-029  scratch 镜像：建容器与四个卷（五级退路阶梯）
         id: scratch
         continue-on-error: true
         run: |
           set +e
           mkdir -p out
           IMG="$RUNNER_TEMP/scratch.raw"
-          rm -f "$IMG"
-          dd if=/dev/zero of="$IMG" bs=1 count=0 seek=$((4 * 1024 * 1024 * 1024)) 2>/dev/null
-          DEV=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount "$IMG" | head -1 | awk '{print $1}')
-          RAW="${DEV/disk/rdisk}"
-          echo "DEV=$DEV RAW=$RAW" | tee out/B4-scratch.txt
-          echo "scratch_dev=$DEV" >> "$GITHUB_OUTPUT"
+          SIZE=$((4 * 1024 * 1024 * 1024))
+          ESP_BYTES=$((512 * 1024 * 1024))
+          : > out/B4-scratch.txt
+
+          # —— 公共小工具 ——
+          log() { echo "$@" >> out/B4-scratch.txt; }
+          attach() {  # 回显设备名到 stdout，完整输出进日志
+            local ao
+            ao=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount "$1" 2>&1)
+            log "    hdiutil attach: $(printf '%s' "$ao" | tr '\n' '|')"
+            printf '%s\n' "$ao" | awk '/^\/dev\/disk/{print $1; exit}'
+          }
+          detach_all() {
+            hdiutil info 2>/dev/null \
+              | awk -v t="$RUNNER_TEMP" '/^image-path/{p=$0} /^\/dev\/disk[0-9]+[ \t]/{if (index(p,t)) print $1}' \
+              | sort -u | while read -r d; do
+                  hdiutil detach "$d" >/dev/null 2>&1 || hdiutil detach -force "$d" >/dev/null 2>&1
+                done
+          }
+          container_of() {  # $1=整盘设备 → APFS 容器引用（diskN）或空
+                            # 两条独立读法，哪条先出结果用哪条（V-003）
+            local dev="$1" cnt=""
+            cnt=$(diskutil info -plist "${dev}s2" 2>/dev/null \
+                  | plutil -extract APFSContainerReference raw -o - - 2>/dev/null)
+            [ -n "$cnt" ] || cnt=$(diskutil list "$dev" 2>/dev/null \
+                  | awk '/APFS Container Scheme/{print $NF}' | head -1)
+            [ -n "$cnt" ] || cnt=$(diskutil list "$dev" 2>/dev/null \
+                  | awk '/Apple_APFS/{print $NF}' | head -1 \
+                  | xargs -I{} diskutil info -plist {} 2>/dev/null \
+                  | plutil -extract APFSContainerReference raw -o - - 2>/dev/null)
+            printf '%s' "$cnt"
+          }
+
+          WINNER=""; DEV=""; CNT=""
+
+          log "########## 阶梯 P1：离线写 GPT（mkgpt.py）+ diskutil 建容器 ##########"
+          log "# 这是本轮的主路。分区表以普通文件写入，不碰 /dev，不需要 sudo。"
+          detach_all; rm -f "$IMG"
+          {
+            python3 tools/ci/mkgpt.py selftest
+            echo "--- selftest 退出码 = $? ---"
+            python3 tools/ci/mkgpt.py create "$IMG" --size "$SIZE" --esp "$ESP_BYTES" \
+                    --disk-guid 4D324755-0000-4000-8000-000000000001
+            echo "--- create 退出码 = $? ---"
+            python3 tools/ci/gptdump.py "$IMG"
+          } >> out/B4-scratch.txt 2>&1
+          DEV=$(attach "$IMG")
+          log "    DEV=$DEV"
+          if [ -n "$DEV" ]; then
+            log "---- MediaKit 认不认我们写的表 ----"
+            diskutil list "$DEV" >> out/B4-scratch.txt 2>&1
+            log "---- V-001：建容器（分区类型事先已是 APFS）----"
+            sudo diskutil apfs createContainer "${DEV}s2" >> out/B4-scratch.txt 2>&1
+            log "    createContainer 退出码 = $?"
+            CNT=$(container_of "$DEV")
+            log "    CNT=$CNT"
+            [ -n "$CNT" ] && WINNER="P1"
+          fi
+
+          if [ -z "$WINNER" ]; then
+            log ""
+            log "########## 阶梯 P1b：同上，但 s2 先写成 Apple_HFS 让 createContainer 自己改类型 ##########"
+            detach_all; rm -f "$IMG"
+            python3 tools/ci/mkgpt.py create "$IMG" --size "$SIZE" \
+                    --part "auto:${ESP_BYTES}:efi:EFI" --part "auto:auto:hfs:Scratch" \
+                    >> out/B4-scratch.txt 2>&1
+            DEV=$(attach "$IMG")
+            if [ -n "$DEV" ]; then
+              diskutil list "$DEV" >> out/B4-scratch.txt 2>&1
+              sudo diskutil apfs createContainer "${DEV}s2" >> out/B4-scratch.txt 2>&1
+              log "    createContainer 退出码 = $?"
+              CNT=$(container_of "$DEV")
+              log "    CNT=$CNT"
+              [ -n "$CNT" ] && WINNER="P1b"
+            fi
+          fi
+
+          if [ -z "$WINNER" ]; then
+            log ""
+            log "########## 阶梯 P2：diskutil partitionDisk 自己写 GPT ##########"
+            log "# 代价：GPT 布局由 Apple 决定（它会自动塞一个 ~200 MiB 的 EFI 分区）。"
+            detach_all; rm -f "$IMG"
+            dd if=/dev/zero of="$IMG" bs=1m count=$((SIZE / 1024 / 1024)) 2>/dev/null
+            DEV=$(attach "$IMG")
+            if [ -n "$DEV" ]; then
+              sudo diskutil partitionDisk "$DEV" GPT APFS Scratch R >> out/B4-scratch.txt 2>&1
+              log "    partitionDisk 退出码 = $?"
+              diskutil list "$DEV" >> out/B4-scratch.txt 2>&1
+              CNT=$(container_of "$DEV")
+              [ -n "$CNT" ] || CNT=$(diskutil list "$DEV" | awk '/APFS Container Scheme/{print $NF}' | head -1)
+              log "    CNT=$CNT"
+              [ -n "$CNT" ] && WINNER="P2"
+              log "---- Apple 自己写的 GPT 逐字段（读的是镜像文件，不是 /dev）----"
+              python3 tools/ci/gptdump.py "$IMG" >> out/B4-scratch.txt 2>&1
+            fi
+          fi
+
+          if [ -z "$WINNER" ]; then
+            log ""
+            log "########## 阶梯 P3：diskutil apfs create 整盘（放弃对 GPT 的控制）##########"
+            detach_all; rm -f "$IMG"
+            dd if=/dev/zero of="$IMG" bs=1m count=$((SIZE / 1024 / 1024)) 2>/dev/null
+            DEV=$(attach "$IMG")
+            if [ -n "$DEV" ]; then
+              sudo diskutil apfs create "$DEV" Scratch >> out/B4-scratch.txt 2>&1
+              log "    apfs create 退出码 = $?"
+              diskutil list "$DEV" >> out/B4-scratch.txt 2>&1
+              CNT=$(container_of "$DEV")
+              log "    CNT=$CNT"
+              [ -n "$CNT" ] && WINNER="P3"
+            fi
+          fi
+
+          if [ -z "$WINNER" ]; then
+            log ""
+            log "########## 阶梯 P4：上一轮失败的那条原路（留着做对照）##########"
+            detach_all; rm -f "$IMG"
+            dd if=/dev/zero of="$IMG" bs=1m count=$((SIZE / 1024 / 1024)) 2>/dev/null
+            DEV=$(attach "$IMG")
+            RAW="${DEV/disk/rdisk}"
+            if [ -n "$DEV" ]; then
+              sudo gpt destroy "$RAW" >> out/B4-scratch.txt 2>&1
+              sudo gpt create -f "$RAW" >> out/B4-scratch.txt 2>&1
+              log "    gpt create 退出码 = $?"
+              sudo gpt add -b 2048 -s $((ESP_BYTES / 512)) -t efi "$RAW" >> out/B4-scratch.txt 2>&1
+              sudo gpt add -b $((2048 + ESP_BYTES / 512)) \
+                   -t 7C3457EF-0000-11AA-AA11-00306543ECAC "$RAW" >> out/B4-scratch.txt 2>&1
+              sudo diskutil apfs createContainer "${DEV}s2" >> out/B4-scratch.txt 2>&1
+              CNT=$(container_of "$DEV")
+              log "    CNT=$CNT"
+              [ -n "$CNT" ] && WINNER="P4"
+            fi
+          fi
+
+          log ""
+          log "########## 阶梯结果 ##########"
+          log "LADDER_WINNER=${WINNER:-NONE}"
+          log "SCRATCH_DEV=${DEV:-}"
+          log "SCRATCH_CNT=${CNT:-}"
+          echo "scratch_dev=${DEV:-}"   >> "$GITHUB_OUTPUT"
+          echo "scratch_cnt=${CNT:-}"   >> "$GITHUB_OUTPUT"
+          echo "ladder=${WINNER:-NONE}" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$CNT" ]; then
+            log "五级全败 —— 这个运行器上造不出 APFS 容器。V-007/V-020/V-021/V-023 本轮无法关闭。"
+            cat out/B4-scratch.txt
+            exit 0
+          fi
 
           {
-            echo "########## GPT：ESP 512 MiB + APFS 余下（75 §0.0.1 的序列）##########"
-            ESP_START=2048; ESP_SIZE=$((512*1024*1024/512))
-            APFS_START=$((ESP_START+ESP_SIZE))
-            TOTAL=$((4*1024*1024*1024/512)); APFS_SIZE=$((TOTAL-APFS_START-2048))
-            sudo gpt destroy "$RAW" 2>/dev/null
-            sudo gpt create -f "$RAW" 2>&1
-            sudo gpt add -b "$ESP_START"  -s "$ESP_SIZE"  -t efi "$RAW" 2>&1
-            sudo gpt add -b "$APFS_START" -s "$APFS_SIZE" -t 7C3457EF-0000-11AA-AA11-00306543ECAC "$RAW" 2>&1
-            sudo gpt show "$RAW" 2>&1
-
             echo
             echo "########## V-001：建容器之后分区类型 GUID 还对不对 ##########"
-            sudo diskutil apfs createContainer "${DEV}s2" 2>&1
-            sudo gpt show "$RAW" 2>&1
+            echo "---- 从镜像文件重读 GPT（不碰 /dev）----"
+            python3 tools/ci/gptdump.py "$IMG" 2>&1 | grep -A3 -E 'entry [0-9]+ \(s[0-9]+\)' | head -40
+            sudo gpt -r show "${DEV/disk/rdisk}" 2>&1 | head -20
             diskutil info -plist "${DEV}s2" > out/B5-phys-info.plist 2>&1
             echo "---- V-003：APFSContainerReference 这个键在不在 ----"
             plutil -p out/B5-phys-info.plist 2>/dev/null | grep -iE 'APFSContainer|APFSPhysical|DeviceIdentifier'
 
-            CNT=$(plutil -extract APFSContainerReference raw -o - out/B5-phys-info.plist 2>/dev/null)
-            [ -n "$CNT" ] || CNT=$(diskutil list "$DEV" | awk '/APFS Container Scheme/{print $NF}')
-            echo "CNT=$CNT"
-            echo "scratch_cnt=$CNT" >> "$GITHUB_OUTPUT"
+            echo
+            echo "########## V-029：FAT32 的 ESP 到底建不建得出来（两条路都试）##########"
+            echo "# 这一条上一轮根本没问过。若两条都倒，75 §0.0.1 的 ESP 一步要重做。"
+            if diskutil list "$DEV" | grep -q "${DEV#/dev/}s1"; then
+              echo "---- 路 a：newfs_msdos 直写分区裸节点 ----"
+              sudo newfs_msdos -F 32 -v EFI "${DEV/disk/rdisk}s1" 2>&1
+              echo "   退出码 = $?"
+              echo "---- 路 b：diskutil eraseVolume（走 diskarbitrationd）----"
+              sudo diskutil eraseVolume FAT32 EFI "${DEV}s1" 2>&1
+              echo "   退出码 = $?"
+              echo "---- 结果 ----"
+              diskutil info "${DEV}s1" 2>&1 | grep -iE 'Type \(Bundle\)|Name|Partition Type|Mounted|Mount Point'
+            else
+              echo "（这一级阶梯没有 s1 分区，跳过。WINNER=$WINNER）"
+            fi
 
             echo
             echo "########## V-007：四个 role 逐个试 ##########"
@@ -1087,16 +1343,46 @@ jobs:
           mkdir -p out
           DEV="${{ steps.scratch.outputs.scratch_dev }}"
           CNT="${{ steps.scratch.outputs.scratch_cnt }}"
-          [ -n "$DEV" ] && [ -n "$CNT" ] || { echo "上一步没产出 scratch 设备，跳过"; exit 0; }
+          # 没拿到容器也要落一个文件：summary 里「缺」与「做不到」是两回事，
+          # 上一轮就是因为文件根本不存在，看不出到底是哪一种。
+          if [ -z "$DEV" ] || [ -z "$CNT" ]; then
+            {
+              echo "SKIPPED: 上一步的五级阶梯没能造出 APFS 容器"
+              echo "LADDER_WINNER=${{ steps.scratch.outputs.ladder }}"
+              echo "DEV='$DEV'  CNT='$CNT'"
+              echo "→ V-020 / V-021 / V-023 本轮无法关闭。根因见 D0-rawdev-permission.txt。"
+            } > out/C0-bless-experiment.txt
+            cat out/C0-bless-experiment.txt
+            exit 0
+          fi
 
           MS="$RUNNER_TEMP/ms"; MP="$RUNNER_TEMP/mp"
           mkdir -p "$MS" "$MP"
           vol_of() { diskutil list "$CNT" | awk -v n="$1" '$0 ~ ("APFS Volume " n " "){print $NF}' | head -1; }
           SYS=$(vol_of "Macintosh HD"); PRE=$(vol_of "Preboot")
+          echo "阶梯胜者 = ${{ steps.scratch.outputs.ladder }}"
           echo "SYS=$SYS PRE=$PRE"
+          if [ -z "$SYS" ]; then
+            {
+              echo "SKIPPED: 容器建起来了，但容器里没有 role S 卷"
+              echo "LADDER_WINNER=${{ steps.scratch.outputs.ladder }}"
+              echo "CNT=$CNT"
+              diskutil apfs list "$CNT" 2>&1
+              echo "→ bless 实验无从下手。先看 B4-scratch.txt 里 -role S 那一段的退出码。"
+            } > out/C0-bless-experiment.txt
+            cat out/C0-bless-experiment.txt
+            exit 0
+          fi
 
           sudo mount -o nobrowse -t apfs "/dev/$SYS" "$MS" 2>&1
-          sudo mount -o nobrowse -t apfs "/dev/$PRE" "$MP" 2>&1
+          if [ -n "$PRE" ]; then
+            sudo mount -o nobrowse -t apfs "/dev/$PRE" "$MP" 2>&1
+          else
+            # role B 与 changeVolumeRole 都没成的情形。bless 不会往任何 Preboot 写，
+            # 但 `bless --verbose` 自己的输出仍然是 V-020（铺不铺 boot objects）的证据，
+            # 所以这一步照跑，只是 V-021 的文件清单这一轮拿不到。
+            echo "WARN: 容器里没有 Preboot 卷 → V-021 的文件清单本轮取不到，V-020 仍可取"
+          fi
 
           # A.10.2 的护栏：确认目标不在运行器的根盘上
           SD=$(diskutil info -plist "$MS" | plutil -extract DeviceIdentifier raw -o - - 2>/dev/null)
@@ -1180,30 +1466,37 @@ jobs:
           mkdir -p out
           IMG="$RUNNER_TEMP/hfs.raw"; rm -f "$IMG"
           STAGE="$RUNNER_TEMP/preboot-stage"; rm -rf "$STAGE"; mkdir -p "$STAGE"
-          {
+          # 子壳而不是 { } 组：里面的提前 `exit 0` 只结束这一节，
+          # 外面的 cat / rm 还要跑（R-004 的同一类教训）。
+          (
             echo "########## V-028：HFS+ 还能不能建 ##########"
             diskutil listFilesystems 2>&1 | grep -iE 'HFS|APFS'
             command -v newfs_hfs 2>&1 || echo "newfs_hfs 不在"
 
-            dd if=/dev/zero of="$IMG" bs=1 count=0 seek=$((2 * 1024 * 1024 * 1024)) 2>/dev/null
-            DEV2=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount "$IMG" | head -1 | awk '{print $1}')
+            # 分区表离线写（上一轮 `gpt create` 在这里也是 EPERM，见 D0 步）
+            python3 tools/ci/mkgpt.py create "$IMG" --size 2GiB \
+                    --part auto:1800MiB:hfs:ScratchHFS 2>&1
+            echo "   mkgpt 退出码 = $?"
+            DEV2=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount "$IMG" 2>&1 \
+                   | awk '/^\/dev\/disk/{print $1; exit}')
             RAW2="${DEV2/disk/rdisk}"
             echo "DEV2=$DEV2"
-
-            sudo gpt destroy "$RAW2" 2>/dev/null
-            sudo gpt create -f "$RAW2" 2>&1
-            sudo gpt add -b 2048 -s $((1800*1024*1024/512)) \
-                 -t 48465300-0000-11AA-AA11-00306543ECAC "$RAW2" 2>&1
-            sudo gpt show "$RAW2" 2>&1
+            [ -n "$DEV2" ] || { echo "attach 失败，这一节跳过"; exit 0; }
+            diskutil list "$DEV2" 2>&1
 
             echo
-            echo "########## 建 HFS+ 卷 ##########"
+            echo "########## 建 HFS+ 卷（两条路都试，与 V-029 同一个问题）##########"
             if command -v newfs_hfs >/dev/null 2>&1; then
               sudo newfs_hfs -J -v ScratchHFS "${RAW2}s1" 2>&1
+              echo "   newfs_hfs 退出码 = $?"
             else
-              sudo diskutil eraseVolume JHFS+ ScratchHFS "${DEV2}s1" 2>&1
+              echo "   newfs_hfs 不在"
             fi
-            echo "   退出码 = $?"
+            if ! diskutil info "${DEV2}s1" 2>/dev/null | grep -qi 'HFS'; then
+              sudo diskutil eraseVolume JHFS+ ScratchHFS "${DEV2}s1" 2>&1
+              echo "   eraseVolume 退出码 = $?"
+            fi
+            diskutil info "${DEV2}s1" 2>&1 | grep -iE 'Type \(Bundle\)|Name|Mounted|Mount Point'
 
             echo
             echo "########## 暂存目录（给之前是空的）##########"
@@ -1237,7 +1530,7 @@ jobs:
             fi
 
             hdiutil detach "$DEV2" 2>/dev/null
-          } > out/C1-prebootsource.txt 2>&1
+          ) > out/C1-prebootsource.txt 2>&1
           cat out/C1-prebootsource.txt
           rm -f "$IMG"
           exit 0
@@ -1326,6 +1619,42 @@ jobs:
             chk V-023 'C0-bless-experiment.txt'
             chk V-024 '60-stat-format.txt'
             chk V-028 'C1-prebootsource.txt'
+            chk V-029 'B4-scratch.txt'
+            chk V-030 'D0-rawdev-permission.txt'
+            echo
+            echo "## V-030  裸设备写权限：到底什么被拒了"
+            echo
+            echo "上一轮（run 41271530800）整条 tooling 链死在 \`gpt create: operation not permitted\`。"
+            echo "下面这张表把「读/写 × 整盘裸节点/块节点 × 有无 sudo」拆开量。"
+            echo '```text'
+            sed -n '/逐级试/,/gpt -r show 的全文/p' \
+              all/tooling/D0-rawdev-permission.txt 2>/dev/null || echo "（缺）"
+            echo '```'
+            echo
+            echo "## 容器装配阶梯：哪一级赢了"
+            echo
+            echo '```text'
+            grep -E '^(LADDER_WINNER|SCRATCH_DEV|SCRATCH_CNT)=' \
+              all/tooling/B4-scratch.txt 2>/dev/null || echo "（缺）"
+            echo '```'
+            echo
+            echo "- \`P1\`  = 离线写 GPT（\`tools/ci/mkgpt.py\`）+ \`diskutil apfs createContainer\`　← 期望的主路"
+            echo "- \`P1b\` = 同上，但 s2 先写成 Apple_HFS 让 \`createContainer\` 自己改类型"
+            echo "- \`P2\`  = \`diskutil partitionDisk\` 自己写 GPT（放弃对布局的控制）"
+            echo "- \`P3\`  = \`diskutil apfs create\` 整盘（连 ESP 都没有）"
+            echo "- \`P4\`  = 上一轮那条 \`gpt create\` 原路（留作对照，预期仍失败）"
+            echo
+            echo "## V-007  四个 role 的实际接受情况"
+            echo '```text'
+            sed -n '/V-007：四个 role 逐个试/,/V-006：新建卷的 case sensitivity/p' \
+              all/tooling/B4-scratch.txt 2>/dev/null | head -60 || echo "（缺）"
+            echo '```'
+            echo
+            echo "## V-029  FAT32 的 ESP 建不建得出来"
+            echo '```text'
+            sed -n '/V-029/,/V-007：四个 role/p' \
+              all/tooling/B4-scratch.txt 2>/dev/null | head -30 || echo "（缺）"
+            echo '```'
             echo
             echo "## Preboot 路径骨架（直接可写进 78 §A.6.3）"
             echo '```text'
