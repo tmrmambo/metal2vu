@@ -20,6 +20,10 @@ on:
         description: '是否执行 bake job（默认只跑 probe）'
         type: boolean
         default: false
+      run_asr_probe:
+        description: '执行 asr-probe job（验 asr --erase 到分区的实际行为，约 20 分钟）'
+        type: boolean
+        default: false
       image_size_gb:
         description: '镜像虚拟容量 GB（75 §4.1 推荐 32，下限 28）'
         type: string
@@ -258,6 +262,351 @@ jobs:
           name: probe-report
           path: probe/
           retention-days: 30
+          if-no-files-found: warn
+
+  # ===========================================================================
+  # asr-probe —— 回答一个问题，它决定 bake 的第 7 步怎么写：
+  #
+  #   `asr restore --target <分区> --erase` 到底会不会把我们自己建的
+  #   APFS 容器与四个卷整个覆盖掉？
+  #
+  # asr(8) 的原话（75 §2.3.2 事实 3）是「目标是分区且带 --erase 时，asr 会
+  # 抹掉该分区、新建 container 与新卷，再做卷恢复」。如果字面成立，那
+  # 「我们自己控制卷布局、只借 asr 造封印快照」这个设想不成立 ——
+  # 我们只能控制 GPT 与 ESP，容器以内全是 asr 的。
+  #
+  # 本 job 的做法：先自己建一套可辨认的容器与四个卷（卷名带 PROBE 前缀、
+  # 记下全部 UUID），往 ESP 写一个标记文件，然后跑 asr，再逐项回读。
+  # 「我们建的东西还在不在」就是答案。
+  #
+  # 顺带关掉：
+  #   V-034 的 S1（asr 造出来的系统卷是不是 Sealed + 有 root snapshot）
+  #   V-018（bless --apfsdriver 能不能让容器的 jumpstart 非空）
+  #   P-002（asr 能不能落到一块从未装过 macOS 的空盘上）
+  #   P-005（asr 有没有连带造 Data 卷与 volume group）
+  #   75 §2.3.3 的 --noprompt 是否对 APFS erase 的交互确认生效
+  # ===========================================================================
+  asr-probe:
+    name: asr-probe (asr --erase 到分区的实际行为)
+    runs-on: macos-26-intel
+    needs: probe
+    if: inputs.run_asr_probe
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 用法串与版本（先读，不猜参数）
+        run: |
+          set +e
+          mkdir -p out
+          {
+            echo "########## asr 的版本与用法串 ##########"
+            asr --version 2>&1 | head -5
+            echo
+            echo "---- asr --help ----"
+            asr --help 2>&1 | head -120
+            echo
+            echo "---- asr restore 的用法串 ----"
+            asr restore 2>&1 | head -60
+            echo
+            echo "---- 与封印/快照/个性化相关的选项有哪些 ----"
+            asr --help 2>&1 | grep -iE 'snapshot|seal|personal|erase|noprompt|target|source' || echo "（无命中）"
+            echo
+            echo "########## asr 的 entitlements（V-035 已证它带 vfs.snapshot）##########"
+            codesign -d --entitlements :- /usr/sbin/asr 2>&1 | head -40
+          } > out/A0-asr-usage.txt 2>&1
+          cat out/A0-asr-usage.txt
+          exit 0
+
+      - name: 找源：系统卷与它的封印快照
+        id: src
+        run: |
+          set +e
+          mkdir -p out
+          ROOTDEV=$(diskutil info -plist / | plutil -extract DeviceIdentifier raw -o - - 2>/dev/null)
+          # / 是以快照形式挂的，设备名形如 diskNsMsK；去掉最后一段得到宿主卷
+          SRC_VOL=$(printf '%s' "$ROOTDEV" | sed -E 's/^(disk[0-9]+s[0-9]+)s[0-9]+$/\1/')
+          # 取封印快照的 UUID。首选 diskutil info 的 APFSSnapshotUUID 键 ——
+          # bake 的 probe 已在运行器上实测它存在（值 0ACACAD0-…）。
+          # 退路才用 listSnapshots 的数组下标（那个路径没实测过）。
+          diskutil info -plist / > "$RUNNER_TEMP/root.plist" 2>/dev/null
+          SNAP=$(plutil -extract APFSSnapshotUUID raw -o - "$RUNNER_TEMP/root.plist" 2>/dev/null)
+          SNAPN=$(plutil -extract APFSSnapshotName raw -o - "$RUNNER_TEMP/root.plist" 2>/dev/null)
+          if [ -z "$SNAP" ]; then
+            SNAP=$(diskutil apfs listSnapshots -plist / 2>/dev/null \
+                   | plutil -extract Snapshots.0.SnapshotUUID raw -o - - 2>/dev/null)
+            SNAPN=$(diskutil apfs listSnapshots -plist / 2>/dev/null \
+                   | plutil -extract Snapshots.0.SnapshotName raw -o - - 2>/dev/null)
+          fi
+          {
+            echo "ROOTDEV  = $ROOTDEV"
+            echo "SRC_VOL  = $SRC_VOL"
+            echo "SNAP_UUID= $SNAP"
+            echo "SNAP_NAME= $SNAPN"
+            echo "---- 两种取法的对照（确认键名可靠）----"
+            echo "  info 的 APFSSnapshotUUID : $(plutil -extract APFSSnapshotUUID raw -o - "$RUNNER_TEMP/root.plist" 2>&1)"
+            echo "  listSnapshots 的 .0      : $(diskutil apfs listSnapshots -plist / 2>/dev/null | plutil -extract Snapshots.0.SnapshotUUID raw -o - - 2>&1)"
+            echo "---- listSnapshots 全文 ----"
+            diskutil apfs listSnapshots / 2>&1
+            echo
+            echo "---- 源系统卷的状态（必须 Sealed: Yes）----"
+            diskutil info "$SRC_VOL" 2>&1 | grep -iE 'Volume Name|Role|Sealed|Capacity Consumed|Volume UUID|Mounted'
+            echo
+            echo "---- 源容器全景 ----"
+            diskutil apfs list 2>&1
+          } > out/A1-source.txt 2>&1
+          cat out/A1-source.txt
+          echo "src_vol=$SRC_VOL" >> "$GITHUB_OUTPUT"
+          echo "snap=$SNAP"       >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: 造镜像、自己建容器与四个卷、往 ESP 写标记
+        id: build
+        run: |
+          set +e
+          mkdir -p out
+          IMG="$RUNNER_TEMP/asrprobe.raw"
+          SIZE=$((24 * 1024 * 1024 * 1024))   # 源 System 12.6 + Preboot 2.8 + Recovery 1.5 ≈ 17 GB，留余量
+          rm -f "$IMG"; : > "$IMG"
+
+          # GPT：ESP 512 MiB + 其余。p2 写成 Apple_HFS（78 §A.1 约束 3）
+          python3 tools/ci/mkgpt.py create "$IMG" --size "$SIZE" \
+                  --part "auto:$((512*1024*1024)):efi:EFI" \
+                  --part "auto:auto:hfs:Macintosh HD" > out/A2-mkgpt.txt 2>&1
+          python3 tools/ci/mkgpt.py verify "$IMG" >> out/A2-mkgpt.txt 2>&1
+          DEV=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount "$IMG" 2>&1 \
+                | awk '/^\/dev\/disk/{print $1; exit}')
+          RAW="${DEV/disk/rdisk}"
+          echo "dev=$DEV" >> "$GITHUB_OUTPUT"
+          echo "img=$IMG" >> "$GITHUB_OUTPUT"
+
+          vol_of() {
+            local want="$1" v n
+            for v in $(diskutil list "$CNT" 2>/dev/null | awk '/APFS Volume/{print $NF}'); do
+              n=$(diskutil info "$v" 2>/dev/null \
+                  | awk -F': *' '/^ *Volume Name/{gsub(/[ \t]+$/,"",$2); print $2; exit}')
+              if [ "$n" = "$want" ]; then printf '%s' "$v"; return 0; fi
+            done
+            return 1
+          }
+
+          (
+            echo "DEV=$DEV  RAW=$RAW  IMG=$IMG"
+            echo
+            echo "########## ESP：newfs_msdos + 写一个标记文件 ##########"
+            echo "# 标记文件用来验「--erase 到 s2 会不会连 s1 一起抹」。"
+            sudo newfs_msdos -F 32 -v OPENCORE "${RAW}s1" 2>&1
+            EM="$RUNNER_TEMP/espmnt"; mkdir -p "$EM"
+            sudo diskutil mount -mountPoint "$EM" "${DEV}s1" 2>&1
+            sudo mkdir -p "$EM/EFI/PROBE"
+            printf 'asr-probe-marker-%s\n' "${{ github.run_id }}" \
+              | sudo tee "$EM/EFI/PROBE/MARKER.TXT" >/dev/null
+            sudo ls -lR "$EM/EFI" 2>&1
+            shasum -a 256 "$EM/EFI/PROBE/MARKER.TXT" 2>&1
+            sudo diskutil unmount "$EM" 2>&1
+
+            echo
+            echo "########## 自己建容器与四个卷（78 §A.3.3a 的顺序：Data 先）##########"
+            sudo diskutil apfs createContainer "${DEV}s2" 2>&1
+            CNT=$(diskutil info -plist "${DEV}s2" 2>/dev/null \
+                  | plutil -extract APFSContainerReference raw -o - - 2>/dev/null)
+            [ -n "$CNT" ] || CNT=$(diskutil list "$DEV" | awk '/APFS Container Scheme/{print $NF}' | head -1)
+            echo "CNT=$CNT"
+            echo "cnt=$CNT" >> "$GITHUB_OUTPUT"
+
+            # 卷名刻意带 PROBE 前缀：asr 之后一眼就能看出谁是谁建的
+            sudo diskutil apfs addVolume "$CNT" APFS "PROBE Data"    -role D -nomount 2>&1
+            PD=$(vol_of "PROBE Data")
+            sudo diskutil apfs addVolume "$CNT" APFS "PROBE System"  -role S -groupWith "$PD" -nomount 2>&1
+            sudo diskutil apfs addVolume "$CNT" APFS "PROBE Preboot" -role B -nomount 2>&1
+            sudo diskutil apfs addVolume "$CNT" APFS "PROBE VM"      -role V -nomount 2>&1
+
+            echo
+            echo "########## asr 之前的完整状态（这是对照基线）##########"
+            diskutil list "$DEV" 2>&1
+            diskutil apfs list "$CNT" 2>&1
+            diskutil apfs listVolumeGroups "$CNT" 2>&1
+            echo "---- 逐卷 UUID，asr 之后要比对 ----"
+            for v in $(diskutil list "$CNT" 2>/dev/null | awk '/APFS Volume/{print $NF}'); do
+              diskutil info "$v" 2>&1 \
+                | awk -F': *' '/Volume Name|Volume UUID|^ *Role|APFSVolumeGroupID/{print "   " $0}'
+            done
+            echo "---- GPT 回读（p1 必须还是 ESP 类型）----"
+            python3 tools/ci/gptdump.py "$IMG" 2>&1 | grep -E 'entry|type_guid|name|LBA' | head -24
+          ) > out/A3-before.txt 2>&1
+          cat out/A3-before.txt
+          exit 0
+
+      - name: 核心实验  asr restore --target <分区> --erase
+        id: asr
+        run: |
+          set +e
+          mkdir -p out
+          DEV="${{ steps.build.outputs.dev }}"
+          SRC="${{ steps.src.outputs.src_vol }}"
+          SNAP="${{ steps.src.outputs.snap }}"
+          [ -n "$DEV" ] && [ -n "$SRC" ] || { echo "SKIPPED: 缺 DEV 或源卷" > out/A4-asr.txt; cat out/A4-asr.txt; exit 0; }
+
+          # 护栏：目标必须不是运行器的根盘
+          whole_of() {
+            diskutil info "$1" 2>/dev/null \
+              | awk -F': *' '/^ *Part of Whole/{gsub(/[ \t]+$/,"",$2); print $2; exit}'
+          }
+          TD=$(whole_of "${DEV}s2"); RD=$(whole_of /)
+          if [ -z "$TD" ] || [ -z "$RD" ] || [ "$TD" = "$RD" ]; then
+            { echo "FATAL: 护栏未通过 TD='$TD' RD='$RD'"; } > out/A4-asr.txt
+            cat out/A4-asr.txt; exit 0
+          fi
+
+          (
+            echo "护栏：目标整盘=$TD  根卷整盘=$RD"
+            echo "命令：sudo asr restore --source /dev/$SRC --target ${DEV}s2 \\"
+            echo "            --toSnapshot $SNAP --erase --noprompt --verbose"
+            echo "# Intel 上不要加 --no-personalization（那是 Apple Silicon 专用，75 §2.3.3）"
+            echo
+            date -u '+开始 %H:%M:%S'
+            # --noprompt 对 APFS erase 的交互确认是否生效未实测（P-002 的一部分），
+            # 所以同时从 stdin 喂一个 y 作为退路。
+            printf 'y\n' | sudo asr restore \
+                 --source "/dev/$SRC" --target "${DEV}s2" \
+                 --toSnapshot "$SNAP" --erase --noprompt --verbose 2>&1
+            echo "   asr 退出码 = $?"
+            date -u '+结束 %H:%M:%S'
+          ) > out/A4-asr.txt 2>&1
+          tail -80 out/A4-asr.txt
+          exit 0
+
+      - name: 回读：我们建的东西还在不在
+        run: |
+          set +e
+          mkdir -p out
+          DEV="${{ steps.build.outputs.dev }}"
+          IMG="${{ steps.build.outputs.img }}"
+          [ -n "$DEV" ] || { echo "SKIPPED" > out/A5-after.txt; cat out/A5-after.txt; exit 0; }
+
+          (
+            echo "########## 核心一问：PROBE 开头的四个卷还在吗 ##########"
+            diskutil list "$DEV" 2>&1
+            echo
+            if diskutil list "$DEV" 2>/dev/null | grep -q PROBE; then
+              echo ">>> 判定：**我们建的卷还在**。asr 没有重建容器。"
+              echo ">>> 后果：bake 可以「自己建卷 + 只让 asr 填系统卷」。"
+            else
+              echo ">>> 判定：**我们建的卷没了**。asr 重建了容器与卷。"
+              echo ">>> 后果：容器以内全由 asr 决定，我们只能控制 GPT 与 ESP。"
+            fi
+            echo
+            echo "########## ESP 的标记文件还在吗（验 --erase 有没有越界到 s1）##########"
+            EM="$RUNNER_TEMP/espmnt2"; mkdir -p "$EM"
+            sudo diskutil mount -mountPoint "$EM" "${DEV}s1" 2>&1
+            if [ -f "$EM/EFI/PROBE/MARKER.TXT" ]; then
+              echo ">>> ESP 完好："
+              cat "$EM/EFI/PROBE/MARKER.TXT"
+              shasum -a 256 "$EM/EFI/PROBE/MARKER.TXT" 2>&1
+            else
+              echo ">>> **ESP 的标记文件不见了** —— --erase 越界了，bake 必须把 ESP 放在 asr 之后"
+              sudo ls -lR "$EM" 2>&1 | head -20
+            fi
+            sudo diskutil unmount "$EM" 2>/dev/null
+
+            echo
+            echo "########## asr 造出来的容器长什么样 ##########"
+            CNT=$(diskutil list "$DEV" | awk '/APFS Container Scheme/{print $NF}' | head -1)
+            echo "CNT=$CNT"
+            diskutil apfs list "$CNT" 2>&1
+            echo
+            echo "---- P-005：有没有连带造 Data 卷与 volume group ----"
+            diskutil apfs listVolumeGroups "$CNT" 2>&1
+            echo
+            echo "---- V-034 的 S1：系统卷是不是 Sealed + 有 root snapshot ----"
+            for v in $(diskutil list "$CNT" 2>/dev/null | awk '/APFS Volume/{print $NF}'); do
+              echo "===== $v"
+              diskutil info "$v" 2>&1 \
+                | grep -iE 'Volume Name|^ *Role|Sealed|Snapshot|Volume UUID|APFSVolumeGroupID|Capacity Consumed'
+            done
+            echo
+            echo "---- Recovery 卷在不在（完整版镜像的关键一问）----"
+            diskutil apfs list "$CNT" 2>&1 | grep -iE 'Recovery|\(Recovery\)' || echo "（没有 Recovery 卷）"
+
+            echo
+            echo "########## Preboot 里有什么（UUID 目录 / cryptex）##########"
+            PRE=$(diskutil apfs list "$CNT" 2>/dev/null \
+                  | awk '/\(Preboot\)/{print $5}' | head -1)
+            echo "PRE=$PRE"
+            if [ -n "$PRE" ]; then
+              PM="$RUNNER_TEMP/pre2"; mkdir -p "$PM"
+              sudo mount -o nobrowse -t apfs "/dev/$PRE" "$PM" 2>&1
+              sudo ls -la "$PM" 2>&1
+              echo "---- 第二层 ----"
+              sudo find "$PM" -maxdepth 2 2>/dev/null | sort | head -40
+              echo "---- 总条目数 ----"
+              sudo find "$PM" 2>/dev/null | wc -l
+              echo "---- cryptex 在不在 ----"
+              sudo find "$PM" -maxdepth 3 -iname '*cryptex*' 2>/dev/null | head -10 \
+                || echo "（无 cryptex）"
+              sudo diskutil unmount force "$PM" 2>/dev/null
+            fi
+
+            echo
+            echo "########## V-018：bless --apfsdriver 能不能让 jumpstart 非空 ##########"
+            echo "# 判据是 diskutil info -plist 的 MacOSSystemAPFSEFIDriverVersion 键"
+            echo "# （运行器自己那块盘上它是 2811160007000004，bake 的 probe 实测）。"
+            SYSV=$(diskutil apfs list "$CNT" 2>/dev/null | awk '/\(System\)/{print $5}' | head -1)
+            echo "SYSV=$SYSV"
+            if [ -n "$SYSV" ]; then
+              echo "---- bless --apfsdriver 之前 ----"
+              diskutil info -plist "$SYSV" > "$RUNNER_TEMP/js1.plist" 2>&1
+              plutil -extract MacOSSystemAPFSEFIDriverVersion raw -o - "$RUNNER_TEMP/js1.plist" 2>&1 \
+                || echo "（键不存在 → jumpstart 为空）"
+              SM="$RUNNER_TEMP/sys2"; mkdir -p "$SM"
+              sudo mount -o nobrowse -t apfs "/dev/$SYSV" "$SM" 2>&1
+              if [ -d "$SM/System/Library/CoreServices" ]; then
+                sudo bless --folder "$SM/System/Library/CoreServices" \
+                           --apfsdriver /usr/standalone/i386/apfs.efi --verbose 2>&1 | tail -20
+                echo "   bless --apfsdriver 退出码 = $?"
+              else
+                echo "（系统卷上没有 CoreServices，跳过）"
+              fi
+              sudo diskutil unmount force "$SM" 2>/dev/null
+              echo "---- bless --apfsdriver 之后 ----"
+              diskutil info -plist "$SYSV" > "$RUNNER_TEMP/js2.plist" 2>&1
+              plutil -extract MacOSSystemAPFSEFIDriverVersion raw -o - "$RUNNER_TEMP/js2.plist" 2>&1 \
+                || echo "（键仍不存在）"
+            fi
+
+            echo
+            echo "########## GPT 回读：p1 的类型 GUID 有没有被 asr 改掉 ##########"
+            python3 tools/ci/gptdump.py "$IMG" 2>&1 | grep -E 'entry|type_guid|name|LBA' | head -24
+            echo
+            echo "########## 容量：asr 实际写了多少 ##########"
+            ls -lh "$IMG" 2>&1
+            du -h "$IMG" 2>&1
+            df -h / 2>&1
+          ) > out/A5-after.txt 2>&1
+          cat out/A5-after.txt
+          exit 0
+
+      - name: 收尾：卸载并删镜像
+        if: always()
+        run: |
+          set +e
+          for m in "$RUNNER_TEMP/espmnt" "$RUNNER_TEMP/espmnt2" "$RUNNER_TEMP/pre2" "$RUNNER_TEMP/sys2"; do
+            sudo diskutil unmount force "$m" 2>/dev/null
+          done
+          hdiutil info 2>/dev/null \
+            | awk -v t="$RUNNER_TEMP" '/^image-path/{p=$0} /^\/dev\/disk[0-9]+[ \t]/{if (index(p,t)) print $1}' \
+            | sort -u | while read -r d; do
+                hdiutil detach "$d" 2>/dev/null || hdiutil detach -force "$d" 2>/dev/null
+              done
+          rm -f "$RUNNER_TEMP/asrprobe.raw"
+          df -h / 2>&1
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: asr-probe-report
+          path: out/
           if-no-files-found: warn
 
   # ===========================================================================
