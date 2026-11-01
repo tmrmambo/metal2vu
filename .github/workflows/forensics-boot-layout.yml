@@ -1,0 +1,1361 @@
+# 在 macos-26-intel 运行器上把它自己那块已装好的盘读个透。
+#
+# 目的：运行器自身就是一套装好的、封印完好的、能启动的 macOS 26 x86_64
+# （docs/spec/91-RUNTIME-EVIDENCE.md 第 1 节：25G76、SIP 已关、Apple Paravirtual
+# device），即它是 docs/spec/78-APFS-VOLUME-CONSTRUCTION.md 第 A 节那份 on-disk
+# 规格的一个活实例。把它读透，78 第 A 节里标 BLOCKED 的几格就能填上。
+#
+# 产出的是**可直接写进 78 第 A 节的事实**，不是一堆原始 dump。
+#
+# ============================ 发布边界 ============================
+# 本仓库是公开仓库，artifact 对任何能看到仓库的人可见。
+# 因此本 workflow **只上传派生的文本清单与哈希**，
+# **绝不上传任何 Apple 的二进制本体**（boot.efi、apfs.efi、.disk_label 的位图、
+# kernel collection、cryptex 的内容，一个都不上传）。
+# plist 类同样只上传键名结构与哈希，不上传全文。
+# 这与 .gitignore 顶部的边界是同一条规则。
+# =================================================================
+#
+# ============================= 纪律 ==============================
+# 1. 对运行器自己那块盘**全程只读**：ls / stat / shasum / codesign -d /
+#    diskutil …(list|info) / bless --info / readlink / cat / find / du。
+#    没有一处写文件、没有一处 --setBoot、没有一处 chflags 作用于系统路径。
+#    `nvram <变量名>` 只读一个变量（写要 `nvram name=value` 或 `-d`，本文件里没有）。
+#    `dd if=/dev/rdiskN … of=` 不存在：只有 `if=` 读，输出全部进 strings/xxd。
+# 2. 唯一有写操作的 job 是 `tooling`，它的写全部落在 $RUNNER_TEMP 下的一个
+#    scratch 磁盘镜像里，而且 bless 的目标是那个镜像里的卷，不是 /。
+#    78 §A.10.2 的「同一块物理盘」护栏在那个 job 里也跑。
+# 3. 每个纯诊断步骤末尾 `exit 0`。依据是 91 §5.4/5.5 的 R-004：
+#    `set +e` 只关 errexit，**步骤退出码仍取最后一条命令**，
+#    所以 find/stat 碰到权限错误返回非零会让整个 job 报 failure，
+#    而 artifact 其实已经产出。
+# =================================================================
+
+name: forensics-boot-layout
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/forensics-boot-layout.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: forensics-boot-layout-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ═══════════════════════════════════════════════════════════════════
+  # job 1  volumes：容器、卷、role、volume group、快照、封印状态、设备号
+  # 对准 78 §A.2 / §A.3。回填 V-003 / V-006 / V-019 / V-022 / V-024
+  # ═══════════════════════════════════════════════════════════════════
+  volumes:
+    name: 容器与卷：role、volume group、快照、封印状态
+    runs-on: macos-26-intel
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 运行器身份（与 91 第 1 节对账）
+        run: |
+          set +e
+          mkdir -p out
+          { sw_vers; echo; uname -a; echo; sysctl -n machdep.cpu.brand_string; } | tee out/00-identity.txt
+          csrutil status 2>&1 | tee -a out/00-identity.txt
+          echo "---- authenticated-root（78 §0.2 事实 2 的实测面）----" | tee -a out/00-identity.txt
+          csrutil authenticated-root status 2>&1 | tee -a out/00-identity.txt
+          nvram csr-active-config 2>&1 | tee -a out/00-identity.txt
+          nvram boot-args 2>&1 | tee -a out/00-identity.txt
+          exit 0
+
+      - name: diskutil 全景（list / apfs list / listVolumeGroups）
+        run: |
+          set +e
+          mkdir -p out
+          diskutil list                            > out/10-diskutil-list.txt            2>&1
+          diskutil apfs list                       > out/11-apfs-list.txt                2>&1
+          diskutil apfs list -plist                > out/12-apfs-list.plist              2>&1
+          diskutil apfs listVolumeGroups           > out/13-volumegroups.txt             2>&1
+          diskutil apfs listVolumeGroups -plist    > out/14-volumegroups.plist           2>&1
+          echo "========== 人读的 apfs list =========="
+          cat out/11-apfs-list.txt
+          echo "========== volume groups =========="
+          cat out/13-volumegroups.txt
+          exit 0
+
+      - name: 每个卷的 info（role、case sensitivity、实占、FileVault、Sealed）
+        run: |
+          set +e
+          mkdir -p out
+          # V-003：确认 APFSContainerReference 这个键名真不真
+          echo "---- / 的 info ----"                     >  out/20-volinfo.txt
+          diskutil info -plist /                         >  out/20-root-info.plist 2>&1
+          diskutil info /                                >> out/20-volinfo.txt     2>&1
+
+          # 枚举全部 APFS 卷的 BSD 名
+          diskutil list | awk '/APFS Volume/ {print $NF}' | sort -u > out/21-apfs-volumes.txt
+          echo "---- 发现的 APFS 卷 ----"; cat out/21-apfs-volumes.txt
+
+          while read -r v; do
+            [ -n "$v" ] || continue
+            {
+              echo "################ $v ################"
+              diskutil info "$v"
+            } >> out/22-each-volume.txt 2>&1
+            diskutil info -plist "$v" > "out/22-info-$v.plist" 2>&1
+          done < out/21-apfs-volumes.txt
+
+          # 容器的 physical store 与 container reference（V-003）
+          echo "---- 容器引用与 physical store ----" > out/23-container-ref.txt
+          for p in $(diskutil list | awk '/Apple_APFS/ {print $NF}' | sort -u); do
+            echo "== physical store candidate: $p" >> out/23-container-ref.txt
+            diskutil info -plist "$p" > "out/23-phys-$p.plist" 2>&1
+            plutil -p "out/23-phys-$p.plist" 2>/dev/null \
+              | grep -iE 'APFSContainerReference|APFSPhysicalStore|Content|DeviceIdentifier' \
+              >> out/23-container-ref.txt 2>&1
+          done
+          cat out/23-container-ref.txt
+
+          # V-006：大小写敏感性
+          echo "---- case sensitivity（V-006）----" > out/24-case-sensitivity.txt
+          plutil -p out/20-root-info.plist 2>/dev/null \
+            | grep -iE 'CaseSensitive|CaseFold|FilesystemName|FilesystemType|FilesystemUserVisibleName' \
+            >> out/24-case-sensitivity.txt 2>&1
+          cat out/24-case-sensitivity.txt
+          exit 0
+
+      - name: 快照清单与封印状态（V-019 / V-022）
+        run: |
+          set +e
+          mkdir -p out
+          # 根是以快照形式挂在 / 的，所以要先剥掉快照后缀拿宿主卷（75 §2.3.3 的做法）
+          ROOTDEV=$(diskutil info -plist / | plutil -extract DeviceIdentifier raw -o - - 2>/dev/null)
+          SYSVOL=$(printf '%s' "$ROOTDEV" | sed -E 's/^(disk[0-9]+s[0-9]+)s[0-9]+$/\1/')
+          {
+            echo "ROOTDEV = $ROOTDEV"
+            echo "SYSVOL  = $SYSVOL"
+            echo
+            echo "---- mount 前三行 ----"; mount | head -3
+            echo
+            echo "---- diskutil info / 里与封印/快照相关的行 ----"
+            diskutil info / | grep -iE 'Snapshot|Sealed|Read-Only|Physical Store|Mounted|Volume Name'
+            echo
+            echo "---- diskutil info \$SYSVOL ----"
+            diskutil info "$SYSVOL"
+          } > out/30-root-shape.txt 2>&1
+          cat out/30-root-shape.txt
+
+          # V-019：bless --create-snapshot 取的名字是什么格式
+          diskutil apfs listSnapshots "$SYSVOL"        > out/31-snapshots.txt        2>&1
+          diskutil apfs listSnapshots -plist "$SYSVOL" > out/32-snapshots.plist      2>&1
+          echo "========== 快照清单 =========="; cat out/31-snapshots.txt
+          echo "========== 快照 plist 的全部键（V-022）=========="
+          plutil -p out/32-snapshots.plist 2>&1 | head -60
+          exit 0
+
+      - name: bless --info（78 §A.10.4，V-022）
+        run: |
+          set +e
+          mkdir -p out
+          sudo bless --version                 > out/40-bless-version.txt 2>&1
+          # 不给目录 = 读当前选定的启动设备。只读。
+          sudo bless --info --plist            > out/41-bless-info-firmware.plist 2>&1
+          sudo bless --info --getBoot          > out/42-bless-getboot.txt 2>&1
+          # 给 / = 读根卷的 blessed folder
+          sudo bless --info / --plist          > out/43-bless-info-root.plist 2>&1
+          sudo bless --info / --verbose        > out/44-bless-info-root.txt 2>&1
+          for f in out/41-bless-info-firmware.plist out/43-bless-info-root.plist; do
+            echo "########## $f ##########"
+            plutil -p "$f" 2>&1 | head -40
+          done
+          cat out/42-bless-getboot.txt
+          cat out/44-bless-info-root.txt
+          exit 0
+
+      - name: 设备号探针：哪些路径在哪个卷上（78 §D.4）
+        run: |
+          set +e
+          mkdir -p out
+          printf 'st_dev\tinode\tpath\n' > out/50-devno.tsv
+          probe() {
+            for p in "$@"; do
+              d=$(stat -f '%d' "$p" 2>/dev/null); i=$(stat -f '%i' "$p" 2>/dev/null)
+              printf '%s\t%s\t%s\n' "${d:--}" "${i:--}" "$p" >> out/50-devno.tsv
+            done
+          }
+          # 预期在 System 卷（SSV 快照）上
+          probe / /System /System/Library /System/Library/CoreServices \
+                /System/Library/Extensions /System/Library/KernelCollections \
+                /System/Library/Kernels /usr /usr/share/firmlinks \
+                /usr/standalone /usr/standalone/i386 /bin /sbin \
+                /System/Library/Templates/Data
+          # 预期在 Data 卷上（经 firmlink 投射）—— 这一组正好是 firmlink 表的左列
+          probe /Users /Library /private /private/var /private/var/db /opt /cores \
+                /Volumes /usr/local /usr/libexec/cups /usr/share/snmp /Applications \
+                /System/Library/Caches /System/Library/Assets /System/Library/AssetsV2 \
+                /System/Library/PreinstalledAssets /System/Library/PreinstalledAssetsV2 \
+                /System/Library/Speech \
+                /System/Library/CoreServices/CoreTypes.bundle/Contents/Library \
+                /System/Volumes/Data
+          # 预期在各自独立卷上
+          probe /System/Volumes/Preboot /System/Volumes/VM /System/Volumes/Update \
+                /System/Volumes/Recovery
+          # 预期在 cryptex 里
+          probe /System/Cryptexes/OS /System/Cryptexes/App \
+                /System/Volumes/Preboot/Cryptexes/OS
+
+          column -t -s "$(printf '\t')" out/50-devno.tsv 2>/dev/null || cat out/50-devno.tsv
+
+          # 判据：Data 组的 st_dev 是否全部等于 /System/Volumes/Data 的（V-013 的 (a) 段）
+          DATADEV=$(stat -f '%d' /System/Volumes/Data 2>/dev/null)
+          echo; echo "---- /System/Volumes/Data 的 st_dev = ${DATADEV:-未取到} ----"
+          awk -F'\t' -v d="$DATADEV" 'NR>1 && $1==d {print "  在 Data 卷上: " $3}' out/50-devno.tsv
+          exit 0
+
+      - name: V-024  stat 格式与 mode 表示
+        run: |
+          set +e
+          mkdir -p out
+          {
+            echo "---- stat -f '%p %Sp %z %b %f %Xf' 的实际输出格式 ----"
+            for p in /etc/hosts /System/Library/CoreServices/SystemVersion.plist /usr/bin/true; do
+              printf '%s :: ' "$p"
+              stat -f '%p | %Sp | z=%z | b=%b | f=%f | Xf=%Xf | u=%u g=%g | %Su:%Sg' "$p" 2>&1
+              echo
+            done
+            echo
+            echo "---- chflags 用法串（V-009）----"
+            chflags 2>&1 | head -30
+          } > out/60-stat-format.txt 2>&1
+          cat out/60-stat-format.txt
+          exit 0
+
+      - name: V-008  System 卷内容的所有者分布
+        run: |
+          set +e
+          mkdir -p out
+          {
+            echo "---- /System/Library/CoreServices 的 uid:gid 直方图 ----"
+            find /System/Library/CoreServices -maxdepth 2 2>/dev/null \
+              | head -4000 | xargs -n 50 stat -f '%Su:%Sg' 2>/dev/null \
+              | sort | uniq -c | sort -rn | head -20
+            echo
+            echo "---- /System/Library/Extensions 的 uid:gid 直方图 ----"
+            find /System/Library/Extensions -maxdepth 2 2>/dev/null \
+              | head -4000 | xargs -n 50 stat -f '%Su:%Sg' 2>/dev/null \
+              | sort | uniq -c | sort -rn | head -20
+            echo
+            echo "---- 非 root:wheel 的样本（最多 40 条）----"
+            find /System/Library -maxdepth 3 \( ! -user root -o ! -group wheel \) 2>/dev/null | head -40
+          } > out/61-ownership.txt 2>&1
+          cat out/61-ownership.txt
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: volumes
+          path: out/
+          if-no-files-found: warn
+
+  # ═══════════════════════════════════════════════════════════════════
+  # job 2  preboot：/System/Volumes/Preboot 的完整清单 ← 本 workflow 的重点
+  # 对准 78 §A.6。回填 V-014 / V-016 / V-021（观察侧）
+  # ═══════════════════════════════════════════════════════════════════
+  preboot:
+    name: Preboot 卷全树（含大小、权限、标志、xattr）
+    runs-on: macos-26-intel
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: V-014  Preboot 卷根下有什么（不进 Cryptexes，那是 job 3 的事）
+        run: |
+          set +e
+          mkdir -p out
+          {
+            echo "########## /System/Volumes/Preboot 的第一层 ##########"
+            ls -lahO@ /System/Volumes/Preboot/ 2>&1
+            echo
+            echo "########## 第二层（排除 Cryptexes）##########"
+            for d in /System/Volumes/Preboot/*/; do
+              case "$d" in */Cryptexes/) echo "== $d  （见 cryptex job）"; continue ;; esac
+              echo "== $d"
+              ls -lahO@ "$d" 2>&1
+            done
+            echo
+            echo "########## 顶层的隐藏项 ##########"
+            ls -lahO@d /System/Volumes/Preboot/.* 2>&1 | head -30
+          } > out/70-preboot-top.txt 2>&1
+          cat out/70-preboot-top.txt
+          exit 0
+
+      - name: V-014  Preboot 全树（排除 Cryptexes），逐项 stat
+        run: |
+          set +e
+          mkdir -p out
+          # 纯路径清单
+          sudo find /System/Volumes/Preboot -path '*/Cryptexes' -prune -o -print 2>/dev/null \
+            | sort > out/71-preboot-tree.txt
+          wc -l < out/71-preboot-tree.txt | tr -d ' ' > out/71-preboot-count.txt
+          echo "---- Preboot（排除 Cryptexes）条目数：$(cat out/71-preboot-count.txt) ----"
+          head -200 out/71-preboot-tree.txt
+
+          # 逐项 stat：类型、mode、owner、字节、块、BSD flags
+          printf 'type\tmode\towner\tbytes\tblocks\tflags\tpath\n' > out/72-preboot-stat.tsv
+          while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            stat -f '%HT	%Sp	%Su:%Sg	%z	%b	%Xf	%N' "$p" 2>/dev/null >> out/72-preboot-stat.tsv
+          done < out/71-preboot-tree.txt
+          echo; echo "---- stat 表前 120 行 ----"
+          head -120 out/72-preboot-stat.tsv
+
+          # 按目录深度做一张结构摘要，这是最容易写进 78 §A.6.3 的形式
+          echo; echo "---- 相对 Preboot 根的路径骨架（把 UUID 换成 <VG_UUID>）----"
+          sed 's|^/System/Volumes/Preboot/||' out/71-preboot-tree.txt \
+            | sed -E 's|^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}|<VG_UUID>|' \
+            | sort -u | tee out/73-preboot-skeleton.txt | head -120
+          exit 0
+
+      - name: V-014  Preboot 全树的 xattr 与 ACL
+        run: |
+          set +e
+          mkdir -p out
+          : > out/74-preboot-xattr.txt
+          while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            X=$(xattr "$p" 2>/dev/null)
+            [ -n "$X" ] || continue
+            {
+              echo "== $p"
+              xattr -l "$p" 2>/dev/null | sed -n '1,20p'
+            } >> out/74-preboot-xattr.txt
+          done < out/71-preboot-tree.txt
+          echo "---- 带 xattr 的 Preboot 条目（前 150 行）----"
+          head -150 out/74-preboot-xattr.txt
+          echo
+          echo "---- xattr 名字直方图 ----"
+          grep -oE '^[a-zA-Z0-9_.]+:' out/74-preboot-xattr.txt 2>/dev/null | sort | uniq -c | sort -rn | head -20
+          echo
+          echo "---- ACL（ls -le）----"
+          ls -le /System/Volumes/Preboot/*/System/Library/CoreServices/ 2>&1 | head -40
+          exit 0
+
+      - name: V-016  Preboot 里有没有 com.apple.boot.* 类的 plist
+        run: |
+          set +e
+          mkdir -p out
+          {
+            echo "---- Preboot 全树里匹配 'boot' 的路径（不区分大小写）----"
+            grep -iE 'boot' out/71-preboot-tree.txt 2>/dev/null || echo "（无）"
+            echo
+            echo "---- Preboot 全树里的 .plist ----"
+            grep -E '\.plist$' out/71-preboot-tree.txt 2>/dev/null || echo "（无）"
+            echo
+            echo "---- Preboot 全树里的 .im4* / ticket / manifest ----"
+            grep -iE '\.im4|ticket|manifest|\.der$|\.sig$' out/71-preboot-tree.txt 2>/dev/null || echo "（无）"
+            echo
+            echo "---- Preboot 全树里的点文件（.disk_label 等）----"
+            grep -E '/\.[^/]+$' out/71-preboot-tree.txt 2>/dev/null || echo "（无）"
+            echo
+            echo "---- V-014：Preboot 里有没有 i386 目录 ----"
+            grep -iE '/i386(/|$)' out/71-preboot-tree.txt 2>/dev/null || echo "（无 i386 目录）"
+          } > out/75-preboot-classify.txt 2>&1
+          cat out/75-preboot-classify.txt
+          exit 0
+
+      - name: boot.efi：路径、大小、哈希、签名状态（只上传派生信息）
+        run: |
+          set +e
+          mkdir -p out
+          {
+            echo "########## 全盘 boot.efi 的位置 ##########"
+            sudo find /System/Volumes/Preboot /System/Library/CoreServices /usr/standalone \
+                 -name 'boot.efi' 2>/dev/null
+            echo
+            echo "########## 每一份的 stat + sha256 + codesign ##########"
+            for f in $(sudo find /System/Volumes/Preboot /System/Library/CoreServices /usr/standalone \
+                            -name 'boot.efi' 2>/dev/null); do
+              echo "================ $f"
+              stat -f 'bytes=%z blocks=%b mode=%Sp owner=%Su:%Sg flags=%Xf' "$f" 2>&1
+              shasum -a 256 "$f" 2>&1
+              echo "---- codesign -dvvv ----"
+              codesign -dvvv "$f" 2>&1 | sed -n '1,25p'
+              echo "---- file ----"
+              file "$f" 2>&1
+              echo
+            done
+            echo "########## 78 §A.6.3 的期望值：723512 字节（25G325 的 payload 索引）##########"
+            echo "注意运行器是 25G76，字节数可能不同；差异本身就是一条证据。"
+          } > out/76-bootefi.txt 2>&1
+          cat out/76-bootefi.txt
+          exit 0
+
+      - name: usr/standalone/i386 的清单（V-017：bless --bootefi 的默认源）
+        run: |
+          set +e
+          mkdir -p out
+          {
+            echo "---- ls -lahO@R /usr/standalone/i386 ----"
+            ls -lahO@R /usr/standalone/i386/ 2>&1
+            echo
+            echo "---- 逐项 stat + sha256（不上传本体）----"
+            for f in $(find /usr/standalone/i386 -type f 2>/dev/null); do
+              printf '%s\t' "$(stat -f '%z	%Sp	%Xf' "$f" 2>/dev/null)"
+              shasum -a 256 "$f" 2>/dev/null
+            done
+            echo
+            echo "---- V-017：man bless 的 FILES 一节（在线镜像把路径常量丢了，本地不丢）----"
+            # col -b 去掉 groff 的 overstrike，否则 ^FILES 匹配不上
+            MANPAGER=cat MANWIDTH=200 man bless 2>/dev/null | col -b \
+              | sed -n '/^FILES/,/^EXAMPLES/p' | head -40
+          } > out/77-standalone-i386.txt 2>&1
+          cat out/77-standalone-i386.txt
+          exit 0
+
+      - name: 两个关键 plist 的结构（只上传键名与哈希，不上传全文）
+        run: |
+          set +e
+          mkdir -p out
+          {
+            for f in $(sudo find /System/Volumes/Preboot /System/Library/CoreServices \
+                            \( -name 'SystemVersion.plist' -o -name 'PlatformSupport.plist' \) 2>/dev/null); do
+              echo "================ $f"
+              stat -f 'bytes=%z mode=%Sp owner=%Su:%Sg flags=%Xf' "$f" 2>&1
+              shasum -a 256 "$f" 2>&1
+              echo "---- 顶层键名（只键名）----"
+              plutil -p "$f" 2>/dev/null | grep -oE '^\s+"[^"]+"' | tr -d ' "' | sort
+              echo "---- 数组/字典元素计数 ----"
+              plutil -p "$f" 2>/dev/null | grep -cE '=>' | sed 's/^/entries: /'
+              echo
+            done
+          } > out/78-plists.txt 2>&1
+          cat out/78-plists.txt
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: preboot
+          path: out/
+          if-no-files-found: warn
+
+  # ═══════════════════════════════════════════════════════════════════
+  # job 3  cryptex：位置、形态、挂载方式、manifest
+  # 对准 78 §A.6.5。回填 V-015
+  # ═══════════════════════════════════════════════════════════════════
+  cryptex:
+    name: cryptex 的位置、形态与挂载方式
+    runs-on: macos-26-intel
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 挂载表里的 cryptex
+        run: |
+          set +e
+          mkdir -p out
+          {
+            echo "---- mount 全文 ----"; mount
+            echo
+            echo "---- mount | grep -i cryptex ----"; mount | grep -i cryptex || echo "（无命中）"
+            echo
+            echo "---- mount | grep -i preboot ----"; mount | grep -i preboot || echo "（无命中）"
+            echo
+            echo "---- hdiutil info（cryptex 若是 sealed DMG，这里会出现）----"
+            hdiutil info 2>&1 | head -80
+          } > out/80-mount.txt 2>&1
+          cat out/80-mount.txt
+          exit 0
+
+      - name: /System/Cryptexes 的符号链接目标（78 §A.6.5 的关键一问）
+        run: |
+          set +e
+          mkdir -p out
+          {
+            echo "---- ls -lahO@ /System/Cryptexes ----"
+            ls -lahO@ /System/Cryptexes/ 2>&1
+            echo
+            echo "---- 逐个 readlink（payload 索引里这三项是 type L）----"
+            for l in /System/Cryptexes/OS /System/Cryptexes/App /System/Cryptexes/ExclaveOS; do
+              printf '%-36s -> ' "$l"
+              readlink "$l" 2>&1 || echo "（不是符号链接或不存在）"
+            done
+            echo
+            echo "---- 它们的 xattr（payload 索引记 OS 带 70 字节 xattr）----"
+            for l in /System/Cryptexes/OS /System/Cryptexes/App /System/Cryptexes/ExclaveOS; do
+              echo "== $l"; xattr -l "$l" 2>/dev/null | head -10
+            done
+            echo
+            echo "---- st_dev 对照：链接目标与 Preboot 卷是不是同一个卷 ----"
+            for p in /System/Cryptexes/OS /System/Volumes/Preboot /System/Volumes/Preboot/Cryptexes/OS /; do
+              printf '%-46s st_dev=%s\n' "$p" "$(stat -f '%d' "$p" 2>/dev/null || echo -)"
+            done
+          } > out/81-cryptex-links.txt 2>&1
+          cat out/81-cryptex-links.txt
+          exit 0
+
+      - name: V-015  Preboot 卷根下 Cryptexes 的结构（深度受限，只要骨架）
+        run: |
+          set +e
+          mkdir -p out
+          {
+            echo "---- 第一到第四层 ----"
+            sudo find /System/Volumes/Preboot/Cryptexes -maxdepth 4 2>/dev/null | sort
+            echo
+            echo "---- 第一层详表 ----"
+            ls -lahO@ /System/Volumes/Preboot/Cryptexes/ 2>&1
+            echo
+            echo "---- 每个子项的详表 ----"
+            for d in /System/Volumes/Preboot/Cryptexes/*/; do
+              echo "== $d"; ls -lahO@ "$d" 2>&1 | head -30
+            done
+            echo
+            echo "---- 整棵树的条目数与体积 ----"
+            sudo find /System/Volumes/Preboot/Cryptexes 2>/dev/null | wc -l
+            sudo du -sh /System/Volumes/Preboot/Cryptexes 2>/dev/null
+            echo
+            echo "---- 76 §1.2 引的「Preboot 约 350 MB」在 macOS 26 上还成立吗 ----"
+            sudo du -sh /System/Volumes/Preboot 2>/dev/null
+            for d in /System/Volumes/Preboot/*/; do sudo du -sh "$d" 2>/dev/null; done
+          } > out/82-cryptex-tree.txt 2>&1
+          cat out/82-cryptex-tree.txt
+          exit 0
+
+      - name: V-015  cryptex 的 manifest / ticket / trust cache（只记路径与哈希）
+        run: |
+          set +e
+          mkdir -p out
+          {
+            echo "---- Cryptexes 树里的 ticket / manifest / im4 / trustcache ----"
+            sudo find /System/Volumes/Preboot/Cryptexes -maxdepth 6 \
+                 \( -iname '*ticket*' -o -iname '*manifest*' -o -iname '*.im4*' \
+                    -o -iname '*trustcache*' -o -iname '*.plist' -o -iname '*.dmg' \) 2>/dev/null \
+              | while IFS= read -r f; do
+                  printf '%s\t' "$(stat -f '%HT	%z	%Sp	%Xf' "$f" 2>/dev/null)"
+                  shasum -a 256 "$f" 2>/dev/null || echo "$f"
+                done
+            echo
+            echo "---- /private/preboot 下的同类（evidence workflow 探过这个路径）----"
+            sudo find /private/preboot -maxdepth 4 2>/dev/null | head -60
+            echo
+            echo "---- dyld shared cache 的位置（91 已知 25G76 上在 Preboot/Cryptexes/OS 下）----"
+            for d in /System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld \
+                     /System/Library/dyld \
+                     /private/preboot/Cryptexes/OS/System/Library/dyld ; do
+              echo "== $d"; ls -lah "$d" 2>/dev/null || echo "  absent"
+            done
+          } > out/83-cryptex-manifest.txt 2>&1
+          cat out/83-cryptex-manifest.txt
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cryptex
+          path: out/
+          if-no-files-found: warn
+
+  # ═══════════════════════════════════════════════════════════════════
+  # job 4  compression：decmpfs / AppleFSCompression 的实况
+  # 对准 78 §0.3.1。回填 V-004 / V-005
+  # ═══════════════════════════════════════════════════════════════════
+  compression:
+    name: decmpfs 占比与 type code
+    runs-on: macos-26-intel
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 抽样统计：带 UF_COMPRESSED 的文件占比
+        run: |
+          set +e
+          mkdir -p out
+          # 取一组有代表性的目录做抽样。每个目录取前 3000 个常规文件。
+          : > out/90-sample-paths.txt
+          for d in /System/Library/CoreServices /System/Library/Extensions \
+                   /System/Library/Frameworks /System/Library/PrivateFrameworks \
+                   /System/Library/Kernels /System/Library/KernelCollections \
+                   /usr/share /usr/lib /usr/standalone ; do
+            sudo find "$d" -type f 2>/dev/null | head -3000 >> out/90-sample-paths.txt
+          done
+          wc -l < out/90-sample-paths.txt | tr -d ' ' > out/90-sample-count.txt
+          echo "抽样路径数：$(cat out/90-sample-count.txt)"
+
+          # 逐项 stat。%f = flags 十进制，%Xf = 十六进制，%Sf = 符号形式。
+          # UF_COMPRESSED = 0x20（符号名 compressed），SF_RESTRICTED = 0x80000（restricted）。
+          # 判压缩用 %Sf 的符号形式，不用算术：macOS 的 awk 是 BWK awk，没有 strtonum()。
+          printf 'fdec\tfhex\tfsym\tbytes\tblocks\tpath\n' > out/91-sample-stat.tsv
+          while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            stat -f '%f	%Xf	%Sf	%z	%b	%N' "$p" 2>/dev/null >> out/91-sample-stat.tsv
+          done < out/90-sample-paths.txt
+
+          echo; echo "---- BSD flags 直方图（与 78 §0.3.1(b) 的 payload 侧对照）----"
+          awk -F'\t' 'NR>1{h[$2" ("$3")"]++} END{for(k in h) printf "  flags=%-34s count=%d\n", k, h[k]}' \
+            out/91-sample-stat.tsv | sort -k2 -rn
+
+          echo; echo "---- 按目录的压缩占比 ----"
+          awk -F'\t' 'NR>1 {
+              split($6, a, "/"); d=a[2]"/"a[3]"/"a[4];
+              tot[d]++; totb[d]+=$4;
+              if ($3 ~ /compressed/) { c[d]++; cb[d]+=$4 }
+            } END {
+              printf "  %-48s %8s %8s %7s %7s\n", "dir", "files", "comp", "f%", "b%";
+              for (d in tot) printf "  %-48s %8d %8d %6.1f%% %6.1f%%\n",
+                d, tot[d], c[d], 100.0*c[d]/tot[d], (totb[d]?100.0*cb[d]/totb[d]:0)
+            }' out/91-sample-stat.tsv | sort -k2 -rn | head -30
+
+          echo; echo "---- ls -lO 的 compressed 标志抽查 ----"
+          ls -lO /System/Library/Kernels/ 2>&1 | head -20
+          ls -lO /System/Library/KernelCollections/ 2>&1
+          ls -lO /usr/share/firmlinks 2>&1
+          ls -lO /usr/standalone/i386/boot.efi 2>&1
+          ls -lO /System/Library/CoreServices/SystemVersion.plist 2>&1
+          exit 0
+
+      - name: V-005  用 XATTR_SHOWCOMPRESSION 读 com.apple.decmpfs 的 type code
+        run: |
+          set +e
+          mkdir -p out
+          cat > "$RUNNER_TEMP/read_decmpfs.py" <<'PY'
+          # com.apple.decmpfs 是受保护的系统 xattr，普通 getxattr 看不见它，
+          # 必须带 XATTR_SHOWCOMPRESSION (0x0020, 见 <sys/xattr.h>)。
+          # 头 16 字节：magic 'fpmc'(LE) | compression_type(u32) | uncompressed_size(u64)
+          import ctypes, ctypes.util, struct, sys
+          libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+          libc.getxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p,
+                                    ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+          libc.getxattr.restype = ctypes.c_long
+          SHOW = 0x0020
+          buf = ctypes.create_string_buffer(64)
+          print("magic\tctype\tusize\tpath")
+          for line in sys.stdin:
+              path = line.rstrip("\n")
+              if not path:
+                  continue
+              n = libc.getxattr(path.encode(), b"com.apple.decmpfs", buf, 64, 0, SHOW)
+              if n < 16:
+                  continue
+              magic, ctype, usize = struct.unpack_from("<4sIQ", buf.raw, 0)
+              print("%s\t%d\t%d\t%s" % (magic.decode("latin1", "replace"), ctype, usize, path))
+          PY
+          python3 --version 2>&1
+          # 只喂抽样里带 UF_COMPRESSED 的那些（按 %Sf 的符号形式筛，不用 strtonum）
+          awk -F'\t' 'NR>1 && $3 ~ /compressed/ {print $6}' out/91-sample-stat.tsv \
+            | head -6000 > "$RUNNER_TEMP/comp-paths.txt"
+          wc -l < "$RUNNER_TEMP/comp-paths.txt" | tr -d ' '
+          python3 "$RUNNER_TEMP/read_decmpfs.py" < "$RUNNER_TEMP/comp-paths.txt" \
+            > out/92-decmpfs.tsv 2>out/92-decmpfs.err
+          head -30 out/92-decmpfs.tsv
+          echo; echo "---- compression_type 直方图（与 payload 的 AFT: 8→105020 / 9→28913 对照）----"
+          awk -F'\t' 'NR>1 {h[$2]++} END {for (k in h) printf "  compression_type=%-4s count=%d\n", k, h[k]}' \
+            out/92-decmpfs.tsv | sort -t= -k3 -rn
+          echo; echo "---- magic 直方图（期望全部 fpmc）----"
+          awk -F'\t' 'NR>1 {h[$1]++} END {for (k in h) printf "  magic=%-8s count=%d\n", k, h[k]}' \
+            out/92-decmpfs.tsv
+          echo; echo "---- stderr ----"; head -20 out/92-decmpfs.err
+          exit 0
+
+      - name: V-004  cp 与 ditto 对一个 decmpfs 文件的实际产物
+        run: |
+          set +e
+          mkdir -p out
+          W="$RUNNER_TEMP/cmp-test"; rm -rf "$W"; mkdir -p "$W"
+          # 挑一个确定带 UF_COMPRESSED 的系统文件（只读它）
+          SRC=$(awk -F'\t' 'NR>1 && $3 ~ /compressed/ && $4 > 100000 {print $6; exit}' out/91-sample-stat.tsv)
+          {
+            echo "源文件 = ${SRC:-未找到}"
+            if [ -z "${SRC:-}" ]; then
+              echo "抽样里找不到带 UF_COMPRESSED 且 >100 KB 的文件，跳过本步"
+            else
+            echo "---- 源 ----"
+            stat -f 'bytes=%z blocks=%b flags=%Xf  %Sf' "$SRC" 2>&1
+            ls -lO "$SRC" 2>&1
+
+            echo
+            echo "---- cp（默认）----"
+            cp "$SRC" "$W/via-cp.bin" 2>&1
+            stat -f 'bytes=%z blocks=%b flags=%Xf' "$W/via-cp.bin" 2>&1
+            ls -lO "$W/via-cp.bin" 2>&1
+            xattr -l "$W/via-cp.bin" 2>&1 | head -5
+
+            echo
+            echo "---- ditto（默认，即 --preserveHFSCompression）----"
+            ditto "$SRC" "$W/via-ditto.bin" 2>&1
+            stat -f 'bytes=%z blocks=%b flags=%Xf' "$W/via-ditto.bin" 2>&1
+            ls -lO "$W/via-ditto.bin" 2>&1
+
+            echo
+            echo "---- ditto --hfsCompression（78 §0.3.1(e) 说这才是我们要的）----"
+            ditto --hfsCompression "$SRC" "$W/via-ditto-hfsc.bin" 2>&1
+            stat -f 'bytes=%z blocks=%b flags=%Xf' "$W/via-ditto-hfsc.bin" 2>&1
+            ls -lO "$W/via-ditto-hfsc.bin" 2>&1
+
+            echo
+            echo "---- ditto --nopreserveHFSCompression ----"
+            ditto --nopreserveHFSCompression "$SRC" "$W/via-ditto-nop.bin" 2>&1
+            stat -f 'bytes=%z blocks=%b flags=%Xf' "$W/via-ditto-nop.bin" 2>&1
+            ls -lO "$W/via-ditto-nop.bin" 2>&1
+
+            echo
+            echo "---- 四者内容是否一致（只比哈希，不上传内容）----"
+            shasum -a 256 "$SRC" "$W"/*.bin 2>&1
+
+            echo
+            echo "---- 用 XATTR_SHOWCOMPRESSION 看四份产物各自的 decmpfs type（V-004 的判据）----"
+            if [ -f "$RUNNER_TEMP/read_decmpfs.py" ]; then
+              printf '%s\n' "$SRC" "$W"/*.bin | python3 "$RUNNER_TEMP/read_decmpfs.py" 2>&1
+            else
+              echo "（read_decmpfs.py 不在，上一步可能没跑成）"
+            fi
+            fi
+
+            echo
+            echo "---- ditto 自己的选项清单（核对 --hfsCompression 在这个 build 上存在）----"
+            ditto --help 2>&1 | grep -iE 'hfsCompression|persistRootless|preserveHFS|extattr|rsrc|clone'
+          } > out/93-cp-vs-ditto.txt 2>&1
+          cat out/93-cp-vs-ditto.txt
+          rm -rf "$W"
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compression
+          path: out/
+          if-no-files-found: warn
+
+  # ═══════════════════════════════════════════════════════════════════
+  # job 5  firmlinks-data：firmlinks 表与 Data 模板
+  # 对准 78 §A.5。回填 V-011 / V-012 / V-013(a)
+  # ═══════════════════════════════════════════════════════════════════
+  firmlinks-data:
+    name: firmlinks 表与 Data 模板树
+    runs-on: macos-26-intel
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: V-011  两份 firmlinks 的全文与 diff
+        run: |
+          set +e
+          mkdir -p out
+          A=/usr/share/firmlinks
+          B=/System/Library/PrivateFrameworks/SystemMigration.framework/Versions/A/Resources/firmlinks
+          {
+            echo "########## $A ##########"
+            stat -f 'bytes=%z mode=%Sp owner=%Su:%Sg flags=%Xf' "$A" 2>&1
+            shasum -a 256 "$A" 2>&1
+            echo "---- 全文 ----"; cat "$A" 2>&1
+            echo
+            echo "########## $B ##########"
+            stat -f 'bytes=%z mode=%Sp owner=%Su:%Sg flags=%Xf' "$B" 2>&1
+            shasum -a 256 "$B" 2>&1
+            echo "---- 全文 ----"; cat "$B" 2>&1
+            echo
+            echo "########## diff（78 §A.5.2：payload 里两者差 9 字节）##########"
+            diff -u "$A" "$B" 2>&1 || true
+            echo
+            echo "########## 行数 ##########"
+            printf 'A: %s 行\nB: %s 行\n' "$(wc -l < "$A" 2>/dev/null)" "$(wc -l < "$B" 2>/dev/null)"
+            echo
+            echo "########## 全盘还有没有别的 firmlinks ##########"
+            sudo find /System /usr /private/var/db -name 'firmlinks*' 2>/dev/null
+          } > out/A0-firmlinks.txt 2>&1
+          cat out/A0-firmlinks.txt
+          exit 0
+
+      - name: V-013(a)  firmlink 表逐条生效验证（st_dev 对照）
+        run: |
+          set +e
+          mkdir -p out
+          DATADEV=$(stat -f '%d' /System/Volumes/Data 2>/dev/null)
+          ROOTDEV=$(stat -f '%d' / 2>/dev/null)
+          {
+            echo "/ 的 st_dev                    = ${ROOTDEV:--}"
+            echo "/System/Volumes/Data 的 st_dev = ${DATADEV:--}"
+            echo
+            printf '%-10s %-10s %s\n' 'st_dev' '判定' '路径（firmlinks 表的左列）'
+            # 从表里读左列，逐个探
+            cut -d$'\t' -f1 /usr/share/firmlinks 2>/dev/null \
+              | sed 's/[[:space:]].*$//' | grep '^/' | while IFS= read -r p; do
+                  d=$(stat -f '%d' "$p" 2>/dev/null)
+                  if [ -z "$d" ]; then v='不存在'
+                  elif [ "$d" = "$DATADEV" ]; then v='Data 卷'
+                  elif [ "$d" = "$ROOTDEV" ]; then v='System 卷'
+                  else v="其他($d)"; fi
+                  printf '%-10s %-10s %s\n' "${d:--}" "$v" "$p"
+                done
+            echo
+            echo "---- 若上表左列全部判定为 Data 卷，则该表在 25G76 上逐条生效（78 §V-013 的 (a) 段）----"
+          } > out/A1-firmlink-effect.txt 2>&1
+          cat out/A1-firmlink-effect.txt
+          exit 0
+
+      - name: V-012  谁读 /usr/share/firmlinks
+        id: whoreads
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p out
+          {
+            echo "---- 该文件的 atime / mtime / ctime / birthtime ----"
+            stat -f 'a=%Sa m=%Sm c=%Sc B=%SB' /usr/share/firmlinks 2>&1
+            echo
+            echo "---- fs_usage 抓 5 秒（可能需要权限，抓不到不影响）----"
+            sudo timeout 6 fs_usage -w -f filesys 2>/dev/null | grep -i firmlink | head -20 \
+              || echo "（5 秒内无命中，正常：firmlink 在挂载时建立，不是运行期反复读）"
+            echo
+            echo "---- 日志里的 firmlink 相关条目（最近 1 小时）----"
+            sudo log show --last 1h --predicate 'eventMessage CONTAINS "firmlink"' --style compact 2>/dev/null \
+              | head -40 || echo "（无）"
+            echo
+            echo "---- 哪些二进制里出现 firmlink 字符串（线索，不是结论）----"
+            for b in /usr/sbin/diskutil /sbin/mount_apfs /usr/libexec/apfsd /usr/sbin/bless; do
+              [ -f "$b" ] || continue
+              printf '%-28s ' "$b"
+              strings -a "$b" 2>/dev/null | grep -ci firmlink
+            done
+          } > out/A2-firmlink-reader.txt 2>&1
+          cat out/A2-firmlink-reader.txt
+          exit 0
+
+      - name: Data 模板树（78 §A.5.1：payload 里 18,731 条）
+        run: |
+          set +e
+          mkdir -p out
+          T=/System/Library/Templates/Data
+          sudo find "$T" 2>/dev/null | sort > out/A3-datatemplate-tree.txt
+          echo "条目数：$(wc -l < out/A3-datatemplate-tree.txt | tr -d ' ')（payload 索引里是 18731）"
+          printf 'type\tmode\towner\tbytes\tflags\tpath\n' > out/A4-datatemplate-stat.tsv
+          while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            stat -f '%HT	%Sp	%Su:%Sg	%z	%Xf	%N' "$p" 2>/dev/null >> out/A4-datatemplate-stat.tsv
+          done < out/A3-datatemplate-tree.txt
+          echo; echo "---- 前两层 ----"
+          sudo find "$T" -maxdepth 2 2>/dev/null | sort | sed "s|^$T|<Templates/Data>|"
+          echo; echo "---- mode 直方图 ----"
+          awk -F'\t' 'NR>1{h[$2]++} END{for(k in h) printf "  %-12s %d\n", k, h[k]}' \
+            out/A4-datatemplate-stat.tsv | sort -k2 -rn | head -20
+          echo; echo "---- com.apple.Boot.plist 在不在模板里（78 §A.5.1）----"
+          grep -i 'com.apple.Boot.plist' out/A3-datatemplate-tree.txt || echo "（不在）"
+          ls -lahO@ "$T/Library/Preferences/SystemConfiguration/" 2>&1 | head -20
+          exit 0
+
+      - name: 实际 Data 卷与模板的差异（装完之后多了什么）
+        run: |
+          set +e
+          mkdir -p out
+          {
+            echo "---- /System/Volumes/Data 第一层 ----"
+            sudo ls -lahO@ /System/Volumes/Data/ 2>&1
+            echo
+            echo "---- 第二层（只要目录名）----"
+            sudo find /System/Volumes/Data -maxdepth 2 -type d 2>/dev/null | sort | head -120
+            echo
+            echo "---- 体积 ----"
+            sudo du -sh /System/Volumes/Data 2>/dev/null
+          } > out/A5-data-volume.txt 2>&1
+          cat out/A5-data-volume.txt
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: firmlinks-data
+          path: out/
+          if-no-files-found: warn
+
+  # ═══════════════════════════════════════════════════════════════════
+  # job 6  tooling：工具面与 scratch 镜像实验
+  # 对准 78 §A.3.3 / §A.6.2 / §A.9 / §D.5。
+  # 回填 V-001 / V-007 / V-009 / V-018 / V-020 / V-021 / V-023 / V-028
+  #
+  # 这是唯一有写操作的 job。全部写落在 $RUNNER_TEMP 下的 scratch 磁盘镜像里。
+  # ═══════════════════════════════════════════════════════════════════
+  tooling:
+    name: 工具面与 scratch 镜像实验（唯一有写操作的 job）
+    runs-on: macos-26-intel
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: V-007 / V-028  工具的用法串与可用性
+        run: |
+          set +e
+          mkdir -p out
+          {
+            echo "########## diskutil apfs 子动词清单 ##########"
+            diskutil apfs 2>&1 | head -60
+            echo
+            echo "########## addVolume 用法串（V-007：role 取值集）##########"
+            diskutil apfs addVolume 2>&1 | head -30
+            echo
+            echo "########## changeVolumeRole 用法串（A.3.3 退路 R-a）##########"
+            diskutil apfs changeVolumeRole 2>&1 | head -20
+            echo
+            echo "########## updatePreboot 用法串（A.6.2 事实 2）##########"
+            diskutil apfs updatePreboot 2>&1 | head -20
+            echo
+            echo "########## convert 用法串（A.6.2 事实 3：-prebootSource）##########"
+            diskutil apfs convert 2>&1 | head -25
+            echo
+            echo "########## createContainer 用法串 ##########"
+            diskutil apfs createContainer 2>&1 | head -20
+            echo
+            echo "########## V-028  文件系统与建卷工具 ##########"
+            diskutil listFilesystems 2>&1
+            for t in newfs_hfs newfs_apfs newfs_msdos chflags gpt bless asr ditto mount_apfs; do
+              printf '%-14s ' "$t"
+              command -v "$t" 2>&1 || which "$t" 2>&1 || echo "（不在）"
+            done
+            echo
+            echo "########## bless 用法串（禁止清单的对账，A.10.2）##########"
+            bless --help 2>&1 | head -60
+          } > out/B0-tool-usage.txt 2>&1
+          cat out/B0-tool-usage.txt
+          exit 0
+
+      - name: man page 的真实常量（V-017 / 76 的 L-001）
+        run: |
+          set +e
+          mkdir -p out
+          {
+            # col -b 去掉 groff 的 overstrike，否则 ^FILES 一类锚点匹配不上
+            MANPAGER=cat MANWIDTH=200 man bless    2>/dev/null | col -b > "$RUNNER_TEMP/man-bless.txt"
+            MANPAGER=cat MANWIDTH=200 man diskutil 2>/dev/null | col -b > "$RUNNER_TEMP/man-diskutil.txt"
+            wc -l "$RUNNER_TEMP/man-bless.txt" "$RUNNER_TEMP/man-diskutil.txt" 2>&1
+
+            echo "########## man bless 的 FILES 一节（在线镜像把路径常量丢了）##########"
+            sed -n '/^FILES/,/^EXAMPLES/p' "$RUNNER_TEMP/man-bless.txt"
+            echo
+            echo "########## man diskutil 的 APFS VOLUME ROLES 全节（76 的 L-001）##########"
+            sed -n '/APFS VOLUME ROLES/,/^EXAMPLES/p' "$RUNNER_TEMP/man-diskutil.txt"
+            echo
+            echo "########## man bless 的 snapshot 选项（A.9.1 的互斥规则）##########"
+            sed -n '/create-snapshot/,/^MOUNT MODE/p' "$RUNNER_TEMP/man-bless.txt" | head -60
+            echo
+            echo "########## man diskutil 的 convert / updatePreboot 两节（A.6.2 事实 2、3）##########"
+            sed -n '/^     convert/,/^     createContainer/p' "$RUNNER_TEMP/man-diskutil.txt" | head -50
+            sed -n '/^     updatePreboot/,/^     syncPatchUsers/p' "$RUNNER_TEMP/man-diskutil.txt" | head -40
+          } > out/B1-manpages.txt 2>&1
+          cat out/B1-manpages.txt
+          exit 0
+
+      - name: V-018  运行器自己容器的 jumpstart 对照样本
+        run: |
+          set +e
+          mkdir -p out
+          {
+            echo "---- 运行器的 APFS physical store ----"
+            diskutil list | awk '/Apple_APFS/ {print}' 
+            PHYS=$(diskutil list | awk '/Apple_APFS/ {print $NF}' | head -1)
+            echo "PHYS = ${PHYS:-未取到}"
+            if [ -n "${PHYS:-}" ]; then
+              echo
+              echo "---- 容器前 8 MiB 里与 EFI/APFS 相关的字符串（只取匹配行，不 dump 字节）----"
+              sudo dd if="/dev/r$PHYS" bs=1m count=8 2>/dev/null \
+                | strings -a -n 6 \
+                | grep -iE 'apfs|EFI|NXSB|jumpstart|efi_jumpstart|PE32|Microsoft' \
+                | sort -u | head -40
+              echo
+              echo "---- 容器超级块的 NXSB 魔数位置（偏移 32，4 字节）----"
+              sudo dd if="/dev/r$PHYS" bs=1 skip=32 count=4 2>/dev/null | xxd
+              echo
+              echo "---- 78 §C.1 L0-11 的弱判据在这里取到的是「已知良好」的基线 ----"
+            fi
+          } > out/B2-jumpstart.txt 2>&1
+          cat out/B2-jumpstart.txt
+          exit 0
+
+      - name: V-009  chflags restricted 的实测（scratch 文件，不碰系统）
+        run: |
+          set +e
+          mkdir -p out
+          W="$RUNNER_TEMP/chflags-test"; rm -rf "$W"; mkdir -p "$W"
+          {
+            echo hello > "$W/a"
+            echo "---- 置 restricted ----"
+            sudo chflags restricted "$W/a" 2>&1
+            stat -f 'flags=%Xf  %Sf' "$W/a" 2>&1
+            echo "---- 置 0x80000（退路写法）----"
+            echo hello > "$W/b"
+            sudo chflags 0x80000 "$W/b" 2>&1
+            stat -f 'flags=%Xf  %Sf' "$W/b" 2>&1
+            echo "---- 置 compressed（78 §A.4.2 规则 1 禁止的那一条，这里只验证它会不会被接受）----"
+            echo hello > "$W/c"
+            sudo chflags compressed "$W/c" 2>&1
+            stat -f 'flags=%Xf  %Sf' "$W/c" 2>&1
+            echo "---- 置了 UF_COMPRESSED 而无 decmpfs 之后还读得出内容吗 ----"
+            printf '  cat -> '; cat "$W/c" 2>&1 || echo "（读不出，这正是规则 1 的后果）"
+            printf '  stat bytes -> '; stat -f '%z' "$W/c" 2>&1
+            echo "---- 清掉 ----"
+            sudo chflags nocompressed,norestricted "$W"/a "$W"/b "$W"/c 2>&1
+          } > out/B3-chflags.txt 2>&1
+          cat out/B3-chflags.txt
+          sudo chflags -R nouchg,norestricted,nocompressed "$W" 2>/dev/null
+          rm -rf "$W" 2>/dev/null
+          exit 0
+
+      - name: V-001 / V-007  scratch 镜像：建容器与四个卷
+        id: scratch
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p out
+          IMG="$RUNNER_TEMP/scratch.raw"
+          rm -f "$IMG"
+          dd if=/dev/zero of="$IMG" bs=1 count=0 seek=$((4 * 1024 * 1024 * 1024)) 2>/dev/null
+          DEV=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount "$IMG" | head -1 | awk '{print $1}')
+          RAW="${DEV/disk/rdisk}"
+          echo "DEV=$DEV RAW=$RAW" | tee out/B4-scratch.txt
+          echo "scratch_dev=$DEV" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "########## GPT：ESP 512 MiB + APFS 余下（75 §0.0.1 的序列）##########"
+            ESP_START=2048; ESP_SIZE=$((512*1024*1024/512))
+            APFS_START=$((ESP_START+ESP_SIZE))
+            TOTAL=$((4*1024*1024*1024/512)); APFS_SIZE=$((TOTAL-APFS_START-2048))
+            sudo gpt destroy "$RAW" 2>/dev/null
+            sudo gpt create -f "$RAW" 2>&1
+            sudo gpt add -b "$ESP_START"  -s "$ESP_SIZE"  -t efi "$RAW" 2>&1
+            sudo gpt add -b "$APFS_START" -s "$APFS_SIZE" -t 7C3457EF-0000-11AA-AA11-00306543ECAC "$RAW" 2>&1
+            sudo gpt show "$RAW" 2>&1
+
+            echo
+            echo "########## V-001：建容器之后分区类型 GUID 还对不对 ##########"
+            sudo diskutil apfs createContainer "${DEV}s2" 2>&1
+            sudo gpt show "$RAW" 2>&1
+            diskutil info -plist "${DEV}s2" > out/B5-phys-info.plist 2>&1
+            echo "---- V-003：APFSContainerReference 这个键在不在 ----"
+            plutil -p out/B5-phys-info.plist 2>/dev/null | grep -iE 'APFSContainer|APFSPhysical|DeviceIdentifier'
+
+            CNT=$(plutil -extract APFSContainerReference raw -o - out/B5-phys-info.plist 2>/dev/null)
+            [ -n "$CNT" ] || CNT=$(diskutil list "$DEV" | awk '/APFS Container Scheme/{print $NF}')
+            echo "CNT=$CNT"
+            echo "scratch_cnt=$CNT" >> "$GITHUB_OUTPUT"
+
+            echo
+            echo "########## V-007：四个 role 逐个试 ##########"
+            vol_of() { diskutil list "$CNT" | awk -v n="$1" '$0 ~ ("APFS Volume " n " "){print $NF}' | head -1; }
+
+            echo "---- -role S ----"
+            sudo diskutil apfs addVolume "$CNT" APFS "Macintosh HD" -role S -nomount 2>&1
+            SYS=$(vol_of "Macintosh HD"); echo "SYS=$SYS"
+
+            echo "---- -role D -groupWith ----"
+            sudo diskutil apfs addVolume "$CNT" APFS "Macintosh HD - Data" -role D -groupWith "$SYS" -nomount 2>&1
+            echo "---- -role B（V-007 的核心一问）----"
+            sudo diskutil apfs addVolume "$CNT" APFS "Preboot" -role B -nomount 2>&1
+            echo "   退出码 = $?"
+            echo "---- -role V ----"
+            sudo diskutil apfs addVolume "$CNT" APFS "VM" -role V -nomount 2>&1
+            echo "   退出码 = $?"
+
+            echo
+            echo "########## 结果 ##########"
+            diskutil apfs list "$CNT" 2>&1
+            diskutil apfs listVolumeGroups "$CNT" 2>&1
+            diskutil apfs list -plist "$CNT" > out/B6-scratch-apfs.plist 2>&1
+            diskutil apfs listVolumeGroups -plist "$CNT" > out/B7-scratch-groups.plist 2>&1
+
+            echo
+            echo "########## role B / V 若被拒，试退路 R-a（changeVolumeRole）##########"
+            if ! diskutil apfs list "$CNT" | grep -qF '(Preboot)'; then
+              sudo diskutil apfs addVolume "$CNT" APFS "Preboot" -nomount 2>&1
+              P=$(vol_of "Preboot")
+              sudo diskutil apfs changeVolumeRole "$P" B 2>&1
+              echo "   changeVolumeRole 退出码 = $?"
+              diskutil apfs list "$CNT" 2>&1
+            fi
+
+            echo
+            echo "########## V-006：新建卷的 case sensitivity ##########"
+            diskutil info "$SYS" 2>&1 | grep -iE 'Case|Filesystem|Role|Group'
+          } >> out/B4-scratch.txt 2>&1
+          cat out/B4-scratch.txt
+          exit 0
+
+      - name: V-020 / V-021 / V-023  scratch 镜像：bless 与 updatePreboot 的实际产出
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p out
+          DEV="${{ steps.scratch.outputs.scratch_dev }}"
+          CNT="${{ steps.scratch.outputs.scratch_cnt }}"
+          [ -n "$DEV" ] && [ -n "$CNT" ] || { echo "上一步没产出 scratch 设备，跳过"; exit 0; }
+
+          MS="$RUNNER_TEMP/ms"; MP="$RUNNER_TEMP/mp"
+          mkdir -p "$MS" "$MP"
+          vol_of() { diskutil list "$CNT" | awk -v n="$1" '$0 ~ ("APFS Volume " n " "){print $NF}' | head -1; }
+          SYS=$(vol_of "Macintosh HD"); PRE=$(vol_of "Preboot")
+          echo "SYS=$SYS PRE=$PRE"
+
+          sudo mount -o nobrowse -t apfs "/dev/$SYS" "$MS" 2>&1
+          sudo mount -o nobrowse -t apfs "/dev/$PRE" "$MP" 2>&1
+
+          # A.10.2 的护栏：确认目标不在运行器的根盘上
+          SD=$(diskutil info -plist "$MS" | plutil -extract DeviceIdentifier raw -o - - 2>/dev/null)
+          RD=$(diskutil info -plist /    | plutil -extract DeviceIdentifier raw -o - - 2>/dev/null)
+          echo "护栏：SYS_DISK=${SD%%s*}  ROOT_DISK=${RD%%s*}"
+          if [ "${SD%%s*}" = "${RD%%s*}" ]; then
+            echo "FATAL: scratch 卷与 / 在同一块物理盘上，拒绝 bless"
+            sudo diskutil unmount force "$MS"; sudo diskutil unmount force "$MP"
+            exit 0
+          fi
+
+          {
+            echo "########## 铺一个最小的 System 骨架（只从运行器只读拷 4 个小文件）##########"
+            sudo mkdir -p "$MS/System/Library/CoreServices" "$MS/usr/standalone/i386"
+            for f in SystemVersion.plist PlatformSupport.plist boot.efi; do
+              sudo ditto "/System/Library/CoreServices/$f" "$MS/System/Library/CoreServices/$f" 2>&1
+            done
+            sudo ditto /usr/standalone/i386/boot.efi "$MS/usr/standalone/i386/boot.efi" 2>&1
+            sudo ls -lahO@R "$MS/System/Library/CoreServices" 2>&1
+
+            echo
+            echo "########## V-021：bless 之前的 Preboot 全树 ##########"
+            sudo find "$MP" 2>/dev/null | sort | tee "$RUNNER_TEMP/pre-before.txt"
+
+            echo
+            echo "########## bless --folder … --bootefi --create-snapshot --label … --verbose ##########"
+            echo "###### 禁止：--setBoot / --mount / --personalize（78 §A.10.2）######"
+            sudo bless --folder "$MS/System/Library/CoreServices" \
+                       --bootefi --create-snapshot \
+                       --label "forensics-scratch" --verbose 2>&1
+            echo "   bless 退出码 = $?"
+
+            echo
+            echo "########## V-021：bless 之后的 Preboot 全树 ##########"
+            sudo find "$MP" 2>/dev/null | sort | tee "$RUNNER_TEMP/pre-after.txt"
+            echo
+            echo "########## diff ← 这就是 bless 往 Preboot 写了什么 ##########"
+            diff -u "$RUNNER_TEMP/pre-before.txt" "$RUNNER_TEMP/pre-after.txt" 2>&1
+            echo
+            echo "########## 新增项的逐项 stat ##########"
+            comm -13 "$RUNNER_TEMP/pre-before.txt" "$RUNNER_TEMP/pre-after.txt" 2>/dev/null \
+              | while IFS= read -r p; do
+                  [ -n "$p" ] || continue
+                  stat -f '%HT	%Sp	%Su:%Sg	%z	%Xf	%N' "$p" 2>/dev/null
+                done
+
+            echo
+            echo "########## V-022：快照与它的全部键 ##########"
+            diskutil apfs listSnapshots "$SYS" 2>&1
+            diskutil apfs listSnapshots -plist "$SYS" > out/B8-scratch-snapshots.plist 2>&1
+            plutil -p out/B8-scratch-snapshots.plist 2>&1 | head -40
+            echo "---- V-019：bless 给快照取的名字 ----"
+            diskutil apfs listSnapshots "$SYS" 2>&1 | grep -iE 'Name|UUID'
+            echo "---- V-022：卷 info 里与 root snapshot 相关的键 ----"
+            diskutil info -plist "$SYS" > out/B9-scratch-sysvol.plist 2>&1
+            plutil -p out/B9-scratch-sysvol.plist 2>&1 | grep -iE 'Snapshot|Sealed|Role|Group|Case'
+
+            echo
+            echo "########## bless --info 对 scratch 卷 ##########"
+            sudo bless --info "$MS" --plist 2>&1 | head -40
+            sudo bless --info "$MS" --verbose 2>&1 | head -20
+
+            echo
+            echo "########## V-023：updatePreboot 对一个非启动卷 ##########"
+            sudo diskutil apfs updatePreboot "$SYS" 2>&1
+            echo "   退出码 = $?"
+            echo "---- updatePreboot 之后 Preboot 又多了什么 ----"
+            sudo find "$MP" 2>/dev/null | sort > "$RUNNER_TEMP/pre-after2.txt"
+            diff -u "$RUNNER_TEMP/pre-after.txt" "$RUNNER_TEMP/pre-after2.txt" 2>&1
+          } > out/C0-bless-experiment.txt 2>&1
+          cat out/C0-bless-experiment.txt
+
+          sudo diskutil unmount force "$MP" 2>/dev/null
+          sudo diskutil unmount force "$MS" 2>/dev/null
+          exit 0
+
+      - name: V-028 / A.6.2 事实 3  -prebootSource 实验
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p out
+          IMG="$RUNNER_TEMP/hfs.raw"; rm -f "$IMG"
+          STAGE="$RUNNER_TEMP/preboot-stage"; rm -rf "$STAGE"; mkdir -p "$STAGE"
+          {
+            echo "########## V-028：HFS+ 还能不能建 ##########"
+            diskutil listFilesystems 2>&1 | grep -iE 'HFS|APFS'
+            command -v newfs_hfs 2>&1 || echo "newfs_hfs 不在"
+
+            dd if=/dev/zero of="$IMG" bs=1 count=0 seek=$((2 * 1024 * 1024 * 1024)) 2>/dev/null
+            DEV2=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount "$IMG" | head -1 | awk '{print $1}')
+            RAW2="${DEV2/disk/rdisk}"
+            echo "DEV2=$DEV2"
+
+            sudo gpt destroy "$RAW2" 2>/dev/null
+            sudo gpt create -f "$RAW2" 2>&1
+            sudo gpt add -b 2048 -s $((1800*1024*1024/512)) \
+                 -t 48465300-0000-11AA-AA11-00306543ECAC "$RAW2" 2>&1
+            sudo gpt show "$RAW2" 2>&1
+
+            echo
+            echo "########## 建 HFS+ 卷 ##########"
+            if command -v newfs_hfs >/dev/null 2>&1; then
+              sudo newfs_hfs -J -v ScratchHFS "${RAW2}s1" 2>&1
+            else
+              sudo diskutil eraseVolume JHFS+ ScratchHFS "${DEV2}s1" 2>&1
+            fi
+            echo "   退出码 = $?"
+
+            echo
+            echo "########## 暂存目录（给之前是空的）##########"
+            ls -lahO@R "$STAGE" 2>&1
+
+            echo
+            echo "########## diskutil apfs convert -dryrun -prebootSource ##########"
+            sudo diskutil apfs convert -dryrun -prebootSource "$STAGE" "${DEV2}s1" 2>&1
+            echo "   退出码 = $?"
+
+            echo
+            echo "########## 暂存目录（跑完之后）← diskutil 加了什么就是答案 ##########"
+            ls -lahO@R "$STAGE" 2>&1
+            find "$STAGE" 2>/dev/null | sort
+            echo
+            echo "---- 新增项的逐项 stat + sha256（不上传本体）----"
+            find "$STAGE" -type f 2>/dev/null | while IFS= read -r f; do
+              printf '%s\t' "$(stat -f '%z	%Sp	%Xf' "$f" 2>/dev/null)"
+              shasum -a 256 "$f" 2>/dev/null
+            done
+
+            echo
+            echo "########## 若 -dryrun 下不加件，去掉 -dryrun 重跑（目标是 scratch 镜像，无风险）##########"
+            if [ -z "$(find "$STAGE" -type f 2>/dev/null)" ]; then
+              sudo diskutil apfs convert -prebootSource "$STAGE" "${DEV2}s1" 2>&1
+              echo "   退出码 = $?"
+              echo "---- 暂存目录 ----"; find "$STAGE" 2>/dev/null | sort
+              echo "---- 新容器的卷与 role（它应当自己建了一个 Preboot role 卷）----"
+              diskutil list "$DEV2" 2>&1
+              diskutil apfs list 2>&1 | sed -n '1,80p'
+            fi
+
+            hdiutil detach "$DEV2" 2>/dev/null
+          } > out/C1-prebootsource.txt 2>&1
+          cat out/C1-prebootsource.txt
+          rm -f "$IMG"
+          exit 0
+
+      - name: 收尾：detach 全部 scratch 镜像
+        if: always()
+        run: |
+          set +e
+          # hdiutil info 的每一节先打印 image-path，再列它的 /dev/diskN。
+          # 跟踪最近一次 image-path，只 detach 那些 image 落在 $RUNNER_TEMP 下的。
+          hdiutil info 2>/dev/null \
+            | awk -v tmp="$RUNNER_TEMP" '
+                /^image-path/ { p=$0 }
+                /^\/dev\/disk[0-9]+[ \t]/ { if (index(p, tmp)) print $1 }' \
+            | sort -u | while read -r d; do
+                echo "detach $d"
+                hdiutil detach "$d" 2>/dev/null || hdiutil detach -force "$d" 2>/dev/null
+              done
+          hdiutil info 2>&1 | head -40
+          rm -f "$RUNNER_TEMP/scratch.raw" "$RUNNER_TEMP/hfs.raw" 2>/dev/null
+          df -h / 2>&1
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tooling
+          path: out/
+          if-no-files-found: warn
+
+  # ═══════════════════════════════════════════════════════════════════
+  # job 7  summary：把六个 job 的产出收成一份「可直接写进 78 §A 节」的摘要
+  # ═══════════════════════════════════════════════════════════════════
+  summary:
+    name: 回填摘要
+    runs-on: macos-26-intel
+    timeout-minutes: 15
+    needs: [volumes, preboot, cryptex, compression, firmlinks-data, tooling]
+    if: always()
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: all
+        continue-on-error: true
+
+      - name: 生成回填摘要
+        run: |
+          set +e
+          mkdir -p out
+          {
+            echo "# forensics-boot-layout 回填摘要"
+            echo
+            echo "run: ${{ github.run_id }}   ref: ${{ github.ref }}"
+            echo
+            echo "## 收到的 artifact"
+            find all -maxdepth 2 2>/dev/null | sort
+            echo
+            echo "## 78 第 A 节待回填项的状态"
+            echo
+            echo "| V-xxx | 看哪个文件 | 状态 |"
+            echo "|---|---|---|"
+            chk() {  # chk <V编号> <glob> <说明>
+              f=$(ls all/*/$2 2>/dev/null | head -1)
+              if [ -n "$f" ] && [ -s "$f" ]; then printf '| %s | `%s` | 有数据 |\n' "$1" "$2"
+              else printf '| %s | `%s` | **缺** |\n' "$1" "$2"; fi
+            }
+            chk V-003 '20-root-info.plist'
+            chk V-004 '93-cp-vs-ditto.txt'
+            chk V-005 '92-decmpfs.tsv'
+            chk V-006 '24-case-sensitivity.txt'
+            chk V-007 'B4-scratch.txt'
+            chk V-008 '61-ownership.txt'
+            chk V-009 'B3-chflags.txt'
+            chk V-011 'A0-firmlinks.txt'
+            chk V-012 'A2-firmlink-reader.txt'
+            chk V-013 'A1-firmlink-effect.txt'
+            chk V-014 '73-preboot-skeleton.txt'
+            chk V-015 '82-cryptex-tree.txt'
+            chk V-016 '75-preboot-classify.txt'
+            chk V-017 '77-standalone-i386.txt'
+            chk V-018 'B2-jumpstart.txt'
+            chk V-019 '31-snapshots.txt'
+            chk V-020 'C0-bless-experiment.txt'
+            chk V-021 'C0-bless-experiment.txt'
+            chk V-022 '32-snapshots.plist'
+            chk V-023 'C0-bless-experiment.txt'
+            chk V-024 '60-stat-format.txt'
+            chk V-028 'C1-prebootsource.txt'
+            echo
+            echo "## Preboot 路径骨架（直接可写进 78 §A.6.3）"
+            echo '```text'
+            cat all/preboot/73-preboot-skeleton.txt 2>/dev/null | head -80 || echo "（缺）"
+            echo '```'
+            echo
+            echo "## decmpfs compression_type 直方图（对照 payload 的 AFT 8/9）"
+            echo '```text'
+            awk -F'\t' 'NR>1 {h[$2]++} END {for (k in h) printf "compression_type=%-4s count=%d\n", k, h[k]}' \
+              all/compression/92-decmpfs.tsv 2>/dev/null | sort || echo "（缺）"
+            echo '```'
+            echo
+            echo "## firmlink 表逐条生效"
+            echo '```text'
+            cat all/firmlinks-data/A1-firmlink-effect.txt 2>/dev/null | head -40 || echo "（缺）"
+            echo '```'
+            echo
+            echo "## bless 往 Preboot 写了什么（V-021 的 diff 段）"
+            echo '```text'
+            sed -n '/bless 之后的 Preboot 全树/,/V-022/p' \
+              all/tooling/C0-bless-experiment.txt 2>/dev/null | head -60 || echo "（缺）"
+            echo '```'
+          } > out/SUMMARY.md 2>&1
+          cat out/SUMMARY.md
+          cat out/SUMMARY.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: summary
+          path: out/
+          if-no-files-found: warn
