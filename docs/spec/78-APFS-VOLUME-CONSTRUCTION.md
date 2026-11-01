@@ -1967,13 +1967,85 @@ apfs_seal: fs_snapshot_root(  "<mnt>", "com.apple.os.update-MSUPrepareUpdate", 0
 第 2 块盘起：在这台机器上跑第 B 节的脚本 → 25G325，封印是我们自己的
 ```
 
-**待验三条（已写进 workflow，下一轮出结果）：**
+**`V-035` / `V-036` 已实测，上面整段推理全部证实。** `TESTED(25G76)`，run `41283978618`。
 
-| # | 探针 | 验什么 |
-|---|---|---|
-| `V-035` | `codesign -d --entitlements - /usr/sbin/bless` / `/usr/bin/tmutil` | 确认它们带的是不是 `com.apple.private.vfs.snapshot` 一类的 entitlement。**这一条直接证实或推翻上面整段推理** |
-| `V-036` | `nvram boot-args` + AMFI 相关 `sysctl` | 确认 runner 的 AMFI 确实开着（目前只有「SIP disabled」这一条是实测的） |
-| `V-037` | 给 `apfs_seal` 做 ad-hoc 签名并塞上那个 entitlement，再试一次 | 若在 AMFI 开着的 runner 上就能过，那第 1 块盘也不必靠克隆 |
+**（1）`bless` 的 entitlements 里确实有那一条，而且名字就是猜的那个：**
+
+```xml
+<!-- codesign -d --entitlements :- /usr/sbin/bless -->
+<key>com.apple.private.vfs.snapshot</key>          <true/>
+<key>com.apple.private.bootability</key>           <true/>
+<key>com.apple.private.security.bootpolicy</key>   <true/>
+<key>com.apple.private.iokit.system-nvram-allow</key><true/>
+<key>com.apple.rootless.internal-installer-equivalent</key><true/>
+```
+
+**（2）运行器的 AMFI 确实开着。** `nvram boot-args` = **`preempt=10`** ——
+只有这一项，**没有 `amfi_get_out_of_my_way=1`**。
+（`csrutil` 两项是 `SIP: disabled` / `Authenticated Root: disabled`，
+AMFI 相关的四个 `sysctl` 全部 `unknown oid`，即这台机器上没开那些旁路。）
+
+**所以 `EPERM` 的因果链是闭合的：**
+
+```
+apfs_seal 自签名 → 没有 com.apple.private.vfs.snapshot
+                 → AMFI 开着，PRIV_VFS_SNAPSHOT 的 MACF 钩子拒绝
+                 → fs_snapshot_create 返回 EPERM
+sudo 给的是 uid 0，与这条链无关。
+```
+
+**（3）顺带扫出了带这张票的全部二进制**（只扫了 `/usr/sbin` `/usr/bin` `/sbin` `/usr/libexec` 四个目录的第一层）：
+
+```text
+/usr/sbin/asr                  ← 这一条改变了 R1 的定位，见下
+/usr/sbin/bless
+/usr/bin/fileproviderctl
+/usr/libexec/mobile_obliterator
+/usr/libexec/corerepaird
+/usr/libexec/MSUEarlyBootTask
+/usr/libexec/storagekitd
+/usr/libexec/apfsd
+```
+
+**`storagekitd`（`diskutil` 的后端）还带两张更有意思的票：**
+
+```xml
+<key>com.apple.private.apfs.allow-non-sealed</key>     <true/>
+<key>com.apple.private.apfs.revert-to-snapshot</key>   <true/>
+<key>com.apple.rootless.volume.Preboot</key>           <true/>
+<key>com.apple.unencrypted.system-volume</key>         <true/>
+```
+
+`allow-non-sealed` 这个名字说明**「操作一个非封印卷」本身就是一项需要票的能力**，
+而 `diskutil` 的后端有这张票。这解释了为什么 `diskutil apfs` 的那些动词能对
+我们的 scratch 卷工作，而我们自己的二进制不能。
+
+**（4）`V-037` 作废。** 原来的设想是「给 `apfs_seal` ad-hoc 签名并塞上那个
+entitlement」。这条路不成立：`com.apple.private.*` 是 restricted entitlement，
+**AMFI 开着时自签名带它会直接被拒**（这正是 AMFI 的作用）；而 AMFI 关掉之后
+根本不需要 entitlement。所以它没有独立价值，两种情况都归到下面那张表里。
+
+**（5）`asr` 带 `com.apple.private.vfs.snapshot` 这一条改变了 R1 的定位。**
+
+原来把 R1 理解成「复制一块已封印的盘，封印随块级复制过来」。
+现在知道 **`asr` 自己就有建快照的能力** —— 它不是被动搬运封印，它能主动造。
+所以 R1 的正确形态不是「克隆整块盘」，而是：
+
+> **我们自己建 GPT、容器、四个卷、ESP、Data 卷预配（这些第 A 节已全部验证可行），
+> 只把「系统卷的内容 + root snapshot」这一件事交给 `asr`。**
+
+这保留了我们对盘结构的全部控制（分区大小、ESP 里的 OpenCore、Data 卷的预配），
+只借用 Apple 的一张票。`75` 第 2.3.3 节的 `asr --target ${DEV}s2` 本来就是这个形状。
+
+**于是「自己封印」这件事的可行性表是：**
+
+| 环境 | AMFI | 自己跑 `apfs_seal` | 替代手段 |
+|---|---|---|---|
+| **GitHub runner** | **开着**（`boot-args = preempt=10`） | **不行**（已实测 `EPERM`） | 借 `asr`（它有票） |
+| **我们自己的目标机** | **关掉**（`71` §6.7 的 `amfi_get_out_of_my_way=1`） | **很可能行**，未验 | 不需要 |
+
+**`V-034` 因此收敛成一句话：第一块盘的 root snapshot 必须借 `asr`；
+从第二块起，在 AMFI 关掉的那台机器上我们自己造。**
 
 #### A.10.2f 一条致命的不一致：`bless` 与 `updatePreboot` 用的不是同一个 UUID
 
