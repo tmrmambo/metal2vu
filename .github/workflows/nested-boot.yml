@@ -259,6 +259,187 @@ jobs:
           if-no-files-found: warn
 
   # ===========================================================================
+  # kvm —— 同一套探针，换到 ubuntu-latest 上再问一遍。
+  #
+  # 为什么值得多花这一个 job
+  # ----------------------
+  # 本项目的**生产目标就是 Linux + KVM**（一台纯 CPU 云 KVM guest 里的 macOS 26）。
+  # 在 macOS 运行器上用 HVF 测，测的是另一个 hypervisor；凡是碰到半虚拟化设备的
+  # 结论都不能直接搬到生产上去。所以 Linux 侧的能力必须单独摸清，不能靠类推。
+  #
+  # 要问清三件事，而且都只能实测：
+  #   1. /dev/kvm 在不在。GitHub 从没在文档里承诺标准 Linux 运行器有嵌套虚拟化
+  #      （actions/runner-images#12933 至今开着，就是在要这句承诺）；但 Android
+  #      模拟器那套 action 在 ubuntu-latest 上到处在跑，而它要 KVM。所以大概率有，
+  #      「大概率」不是证据。
+  #   2. 真实可用磁盘有多少。文档写的是 14 GB SSD，而根文件系统实测通常比这多，
+  #      另外常有一个更大的临时挂载点。这个数字决定 Linux 侧能不能做镜像 ——
+  #      安装器 17.9 GB + 目标盘 48 GiB，macOS 运行器腾完有 202 GB。
+  #   3. 给 guest 的内存。Linux 宿主自己只吃 ~1 GB，macOS 宿主要 ~4 GB，
+  #      而两边都是 4 vCPU / 14–16 GiB，所以 Linux 能分给 guest 的明显更多。
+  # ===========================================================================
+  kvm:
+    name: kvm (Linux 侧同一套探针)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境事实
+        run: |
+          set +e -u -o pipefail
+          mkdir -p out
+          echo "---- 系统 ----"
+          uname -a; cat /etc/os-release | head -3
+          echo "---- CPU / 内存 ----"
+          lscpu | grep -E 'Model name|^CPU\(s\)|Virtuali|Hypervisor' || true
+          free -h
+          echo "---- 虚拟化位 ----"
+          grep -o -m1 -E 'vmx|svm' /proc/cpuinfo | head -1 || echo "  /proc/cpuinfo 里没有 vmx/svm"
+          echo "---- /dev/kvm ----"
+          ls -l /dev/kvm 2>&1
+          echo "---- 磁盘全景（这是 Linux 侧能不能做镜像的关键数字）----"
+          df -h | tee out/df.txt
+          echo "---- 块设备 ----"
+          lsblk 2>&1 | head -20
+          echo "---- 有没有更大的临时挂载点 ----"
+          for d in /mnt /mnt/storage /datadrive /home/runner/work; do
+            [ -d "$d" ] && df -h "$d" | tail -1
+          done
+          exit 0
+
+      - name: 让当前用户能用 /dev/kvm
+        run: |
+          set +e -u -o pipefail
+          if [ ! -e /dev/kvm ]; then
+            echo "::warning::/dev/kvm 不存在 —— Linux 侧没有嵌套虚拟化，下面必然失败"
+            echo "kvm_device=absent" >> out/kvm.txt
+            exit 0
+          fi
+          # 运行器用户默认不在 kvm 组里。这是跑 Android 模拟器那套 action 时
+          # 人人都要加的一步，记下来「需不需要」本身就是一条结论。
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo ">>> 本来就可读写，不用动权限"
+            echo "kvm_perm=default-ok" >> out/kvm.txt
+          else
+            echo ">>> 默认不可读写，加 udev 规则"
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+            ls -l /dev/kvm
+            echo "kvm_perm=needed-udev-rule" >> out/kvm.txt
+          fi
+          exit 0
+
+      - name: 装 QEMU 并跑同一个引导扇区
+        run: |
+          set +e -u -o pipefail
+          mkdir -p out
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils cpu-checker 2>&1 | tail -3
+          echo "---- kvm-ok ----"
+          kvm-ok 2>&1 | tee out/kvm-ok.txt
+          echo "---- 版本与加速器 ----"
+          qemu-system-x86_64 --version | head -1
+          qemu-system-x86_64 -accel help
+
+          WORK="$RUNNER_TEMP/nested"; mkdir -p "$WORK"
+          MARK="KVMGUEST-${GITHUB_RUN_ID}"
+          python3 tools/ci/mkbootsector.py create "$WORK/boot.img" --message "$MARK"
+          : > "$WORK/verdict.txt"
+
+          run_cfg() {
+            label="$1"; shift
+            ser="$WORK/$label.ser"; : > "$ser"
+            echo "======== $label : qemu $* ========"
+            qemu-system-x86_64 -machine pc -m 256 -display none -no-reboot \
+                    -serial "file:$ser" \
+                    -drive "file=$WORK/boot.img,format=raw,index=0,media=disk" \
+                    "$@" > "$WORK/$label.out" 2> "$WORK/$label.err" &
+            pid=$!
+            i=0
+            while [ "$i" -lt 25 ]; do
+              grep -q "$MARK" "$ser" 2>/dev/null && break
+              kill -0 "$pid" 2>/dev/null || break
+              sleep 1; i=$(( i + 1 ))
+            done
+            kill -9 "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            if grep -q "$MARK" "$ser" 2>/dev/null; then
+              echo ">>> $label PASS（${i}s 内拿到标记）"
+              echo "$label=PASS" >> "$WORK/verdict.txt"
+            else
+              echo ">>> $label FAIL"
+              head -20 "$WORK/$label.err" || true
+              echo "$label=FAIL" >> "$WORK/verdict.txt"
+            fi
+            echo
+          }
+
+          run_cfg tcg -accel tcg
+          run_cfg kvm -accel kvm
+          run_cfg kvm-cpuhost -accel kvm -cpu host
+          cat "$WORK/verdict.txt" | tee -a out/kvm.txt
+          exit 0
+
+      - name: 磁盘能不能放下一份镜像
+        run: |
+          set +e -u -o pipefail
+          mkdir -p out
+          # 和 macOS 侧的 space job 问同一个问题，好直接对比。
+          # macOS 运行器腾完 202 GB，48 GiB 稀疏 + 真写 4 GiB 通过，写速 72 MB/s。
+          IMG="$RUNNER_TEMP/space-check.raw"
+          AVAIL_KB=$(df -k "$RUNNER_TEMP" | tail -1 | awk '{print $4}')
+          echo "RUNNER_TEMP 所在文件系统可用 = $(( AVAIL_KB / 1024 / 1024 )) GiB"
+          truncate -s 48G "$IMG" 2>&1
+          ls -l "$IMG"; du -h "$IMG"
+          echo "---- 往里真写 4 GiB，顺便量写速（对比 macOS 的 72 MB/s）----"
+          dd if=/dev/zero of="$IMG" bs=1M count=4096 conv=notrunc oflag=direct 2>&1 | tail -2 \
+            || dd if=/dev/zero of="$IMG" bs=1M count=4096 conv=notrunc 2>&1 | tail -2
+          du -h "$IMG"
+          df -h "$RUNNER_TEMP" | tee -a out/df.txt
+          rm -f "$IMG"
+          echo "---- 最大的那个挂载点上再试一次 ----"
+          BIG=$(df -k --output=target,avail -x tmpfs -x devtmpfs 2>/dev/null \
+                | tail -n +2 | sort -k2 -n | tail -1 | awk '{print $1}')
+          echo "最大可用挂载点 = ${BIG:-未知}"
+          df -h "${BIG:-/}" | tail -1
+          exit 0
+
+      - name: 判定
+        run: |
+          set +e -u -o pipefail
+          mkdir -p out
+          V="$RUNNER_TEMP/nested/verdict.txt"
+          TCG=$(grep -m1 '^tcg=' "$V" 2>/dev/null | cut -d= -f2)
+          KVM=$(grep -m1 '^kvm=' "$V" 2>/dev/null | cut -d= -f2)
+          HOST=$(grep -m1 '^kvm-cpuhost=' "$V" 2>/dev/null | cut -d= -f2)
+          printf 'tcg=%s  kvm=%s  kvm-cpuhost=%s\n' "${TCG:-缺}" "${KVM:-缺}" "${HOST:-缺}"
+          {
+            echo "# Linux 侧判定（run ${GITHUB_RUN_ID}）"
+            echo "- QEMU -accel tcg: ${TCG:-缺}"
+            echo "- QEMU -accel kvm: ${KVM:-缺}"
+            echo "- QEMU -accel kvm -cpu host: ${HOST:-缺}"
+          } >> out/verdict.md
+          if [ "${TCG:-}" != "PASS" ]; then
+            echo ">>> 对照组没过，本轮 kvm 结果不作为结论"
+          elif [ "${KVM:-}" = "PASS" ] || [ "${HOST:-}" = "PASS" ]; then
+            echo ">>> **Linux 侧嵌套虚拟化可用**，而且这才是生产环境那个 hypervisor。"
+          else
+            echo ">>> Linux 侧 KVM 不可用（对照组过了，架子是好的）。"
+          fi
+          exit 0
+
+      - name: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kvm-report
+          path: out/
+          if-no-files-found: warn
+
+  # ===========================================================================
   # installer-source —— 嵌套可用之后，下一步是在 guest 里跑 Apple 自己的安装器。
   #                     那条路最大的好处是封印、Preboot、bless 全由 Apple 的
   #                     带票二进制在**它自己的环境里**完成，我们一个字节都不用伪造
