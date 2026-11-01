@@ -697,16 +697,22 @@ jobs:
       - name: reclaim space (tolerant)
         if: env.FREE_XCODE == 'true'
         run: |
-          set -uo pipefail
-          sudo rm -rf /Applications/Xcode*.app || true
-          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes || true
-          sudo rm -rf "$HOME/Library/Developer/CoreSimulator" || true
-          sudo rm -rf /Users/runner/Library/Caches || true
-          brew cleanup --prune=all >/dev/null 2>&1 || true
+          # 诊断/容错：步骤名里的 tolerant 就是这个意思，删不掉的项跳过，
+          # 最后由容量门禁决定成败。errexit 必须显式关掉，否则末尾的判断执行不到。
+          set +e -u -o pipefail
+          # 这里原来有一份自己写的 rm 清单，有两个毛病：它把**所有** Xcode 都删掉
+          # （连 xcode-select 指向的那个也删，之后 cc 和 SDK 就都没了），而且只报
+          # 一个总数，看不出哪一项真的腾出了空间。实测里这件事很要紧：运行器上装了
+          # 14 个 Xcode bundle，但它们成对出现（Xcode_26.2.0 与 Xcode_26.2 是同一份），
+          # 删前者 0 GB、删后者 4 GB。
+          # 现在统一走 tools/ci/free_space.sh：保留活动 Xcode，逐项记账，到量就停手。
+          chmod +x tools/ci/free_space.sh
+          tools/ci/free_space.sh "$MIN_FREE_GB"
+          rc=$?
           free_b=$(diskutil info -plist / | plutil -extract APFSContainerFree raw -o - -)
           free_gb=$(( free_b / 1000000000 ))
           echo "free after reclaim = ${free_gb} GB (was ${FREE_GB_BEFORE} GB)"
-          if [ "$free_gb" -lt "$MIN_FREE_GB" ]; then
+          if [ "${rc}" != "0" ]; then
             echo "::error::腾完仍只有 ${free_gb} GB < ${MIN_FREE_GB} GB。走 75 §7 替代 A"
             exit 1
           fi
@@ -1004,7 +1010,9 @@ jobs:
       #     缺件时本步骤只告警，不终止：让流水线走到底，产出一块可检查但【不可部署】的镜像。
       - name: install first-boot LaunchDaemons (75 section 4.4)
         run: |
-          set -uo pipefail
+          # 严格：缺脚本这种预期情况下面用 -f 显式检查并只警告，
+          # 其余任何失败（ditto / chown 写不进去）都该当场停下 —— 那是半成品镜像。
+          set -euo pipefail
           sudo mkdir -p /Volumes/TGTDATA/Library/LaunchDaemons
           sudo mkdir -p /Volumes/TGTDATA/usr/local/libexec
           missing=""

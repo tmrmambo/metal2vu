@@ -53,6 +53,45 @@ VAR_THEN_WIDE = re.compile(r"(?<!\\)\$([A-Za-z_][A-Za-z0-9_]*)([^\x00-\x7f])")
 # 而且那种情况下改成 ${VAR} 本来也无害。
 COMMENT_LINE = re.compile(r"^\s*#")
 
+# GitHub Actions 跑 run 块用的是 `bash -e {0}` —— **errexit 默认就是开着的**。
+# 于是 `set -uo pipefail` 这个写法是个陷阱：看起来像在设置选项，实际上对 errexit
+# 一个字也没说，而它开着。一条返回非零的诊断命令（ls 撞上 Permission denied、
+# grep 没匹配到、find 碰上一个读不了的目录）就会把整步掐掉，末尾那句 exit 0
+# 根本执行不到，于是「跑了但被挡」和「没跑」在日志里分不开。
+#
+# 由来：installer-source 的「Preboot 里的 restore 目录」那步死在
+# `ls: /System/Volumes/Preboot/com.apple.security.cryptexd/: Permission denied`，
+# 而它要找的 BuildManifest.plist 其实已经打印出来了 —— 结论拿到了，步骤却是红的。
+#
+# 所以要求把意图写明白，两种之一：
+#     set -euo pipefail       严格：任何一条命令失败就停（真要做事的步骤）
+#     set +e -u -o pipefail   诊断：容错往下跑，末尾 exit 0 决定退出码
+#
+# 规则只盯「在谈错误处理」的那些 set 行（提到 u 或 pipefail 的）。`set -x` 只是
+# 开命令回显，跟 errexit 无关，不该被拖进来。
+SET_LINE = re.compile(r"^\s*set\s+([-+].*?)\s*$")
+
+
+def set_line_facts(flags: str) -> tuple[str, bool]:
+    """返回 (短选项字母, 是否提到 pipefail)。
+
+    `set -uo pipefail` 里的 `pipefail` 是 `-o` 的参数，不是独立选项；
+    `set +e -u -o pipefail` 里三段分开写。两种都要认。
+    """
+    letters = ""
+    tokens = flags.split()
+    skip_next = False
+    for tok in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok.startswith(("-", "+")):
+            body = tok[1:]
+            letters += body
+            if body.endswith("o"):  # -o / -uo 之后跟的是选项名
+                skip_next = True
+    return letters, "pipefail" in tokens
+
 
 def find_bash() -> str | None:
     found = shutil.which("bash")
@@ -86,7 +125,7 @@ def main(argv: list[str]) -> int:
         print("没有找到要检查的 workflow")
         return 1
 
-    total = bad = wide = 0
+    total = bad = wide = vague = 0
     for path in paths:
         with open(path, encoding="utf-8") as fh:
             doc = yaml.safe_load(fh)
@@ -110,13 +149,26 @@ def main(argv: list[str]) -> int:
             finally:
                 os.unlink(tmp)
             hits = []
+            set_lines: list[tuple[int, str]] = []
             for lineno, line in enumerate(script.splitlines(), 1):
                 if COMMENT_LINE.match(line):
                     continue
                 for m in VAR_THEN_WIDE.finditer(line):
                     hits.append((lineno, m.group(1), m.group(2), line.strip()))
+                m = SET_LINE.match(line)
+                if m:
+                    set_lines.append((lineno, m.group(1)))
 
-            if proc.returncode == 0 and not hits:
+            # errexit 的意图说清楚了没有：任何一条 set 行提到 e（-e 或 +e）就算说清了
+            facts = [(ln, f, *set_line_facts(f)) for ln, f in set_lines]
+            says_e = any("e" in letters for _, _, letters, _ in facts)
+            ambiguous = [
+                (ln, f)
+                for ln, f, letters, pipefail in facts
+                if not says_e and ("u" in letters or pipefail)
+            ]
+
+            if proc.returncode == 0 and not hits and not ambiguous:
                 print(f"  [√] {job} / 步 {idx}  {name}")
                 continue
 
@@ -132,9 +184,19 @@ def main(argv: list[str]) -> int:
                     f"→ bash 会把变量名读成 `{var}{ch}`，改写成 ${{{var}}}"
                 )
                 print(f"          {text}")
+            for lineno, flags in ambiguous:
+                vague += 1
+                print(
+                    f"        第 {lineno} 行  `set {flags}` 没说 errexit —— "
+                    f"而 GitHub 用 bash -e，它默认开着"
+                )
+                print("          严格步骤写 set -euo pipefail；诊断步骤写 set +e -u -o pipefail")
 
-    print(f"\n{total} 个 run 块，{bad} 个有语法错，{wide} 处 $变量紧跟全角字符")
-    return 1 if (bad or wide) else 0
+    print(
+        f"\n{total} 个 run 块，{bad} 个有语法错，"
+        f"{wide} 处 $变量紧跟全角字符，{vague} 处 set 没表态 errexit"
+    )
+    return 1 if (bad or wide or vague) else 0
 
 
 if __name__ == "__main__":

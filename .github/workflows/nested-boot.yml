@@ -69,7 +69,7 @@ jobs:
 
       - name: 环境事实（先记下来，出了岔子才分得清是哪一层）
         run: |
-          set -uo pipefail
+          set +e -u -o pipefail
           echo "---- 系统 ----"
           sw_vers; uname -a
           echo "---- 虚拟化相关 sysctl ----"
@@ -93,7 +93,7 @@ jobs:
 
       - name: 一级探针  hvf_probe（framework 层面）
         run: |
-          set -uo pipefail
+          set +e -u -o pipefail
           OUT="$RUNNER_TEMP/hvf_probe"
           echo "---- 编译 ----"
           # 不加 -Werror：Hypervisor 的 x86 接口在新 SDK 上带 deprecation 注解，
@@ -120,7 +120,7 @@ jobs:
 
       - name: 装 QEMU
         run: |
-          set -uo pipefail
+          set +e -u -o pipefail
           export HOMEBREW_NO_AUTO_UPDATE=1
           export HOMEBREW_NO_INSTALL_CLEANUP=1
           export HOMEBREW_NO_ENV_HINTS=1
@@ -145,7 +145,7 @@ jobs:
 
       - name: 二级探针  让 guest 真跑一段代码
         run: |
-          set -uo pipefail
+          set +e -u -o pipefail
           WORK="$RUNNER_TEMP/nested"; mkdir -p "$WORK"
           # 标记里带 run id：读到的串不可能是上一轮留下来的
           MARK="HVFGUEST-${GITHUB_RUN_ID}"
@@ -203,7 +203,7 @@ jobs:
 
       - name: 判定
         run: |
-          set -uo pipefail
+          set +e -u -o pipefail
           WORK="$RUNNER_TEMP/nested"
           V="$WORK/verdict.txt"
           [ -f "$V" ] || { echo "::error::没有 verdict.txt，上一步根本没跑到"; exit 1; }
@@ -275,7 +275,7 @@ jobs:
     steps:
       - name: 候选一  softwareupdate 的官方全量安装器列表
         run: |
-          set -uo pipefail
+          set +e -u -o pipefail
           mkdir -p out
           echo "---- softwareupdate --list-full-installers ----"
           # 这是 Apple 官方通道。拿到的是 Install macOS *.app（约 15 GB），
@@ -288,7 +288,7 @@ jobs:
 
       - name: 候选二  Preboot 里的 restore 目录（asr-probe 里见过它）
         run: |
-          set -uo pipefail
+          set +e -u -o pipefail
           mkdir -p out
           PRE=$(diskutil info -plist / | plutil -extract DeviceIdentifier raw -o - - \
                 | sed -E 's/s[0-9]+s[0-9]+$//')
@@ -310,7 +310,7 @@ jobs:
 
       - name: 候选三  Recovery 卷里的 BaseSystem（76 §1.5.2 的三道墙）
         run: |
-          set -uo pipefail
+          set +e -u -o pipefail
           mkdir -p out
           RECDEV=$(diskutil info -plist / 2>/dev/null \
                    | plutil -extract RecoveryDeviceIdentifier raw -o - - 2>/dev/null || echo "")
@@ -333,7 +333,7 @@ jobs:
 
       - name: QEMU 侧需要的固件在不在
         run: |
-          set -uo pipefail
+          set +e -u -o pipefail
           mkdir -p out
           export HOMEBREW_NO_AUTO_UPDATE=1
           export HOMEBREW_NO_ENV_HINTS=1
@@ -368,7 +368,7 @@ jobs:
 
       - name: 腾之前的全景
         run: |
-          set -uo pipefail
+          set +e -u -o pipefail
           # out/ 在第一步就建好：artifact 的 upload 步骤是 if: always()，
           # 但目录不存在时它只能 warn 一声什么也不传，于是一次失败的 run
           # 什么证据都留不下 —— 这正是最需要证据的那一次。
@@ -383,7 +383,7 @@ jobs:
 
       - name: 腾
         run: |
-          set -uo pipefail
+          set +e -u -o pipefail
           mkdir -p out
           chmod +x tools/ci/free_space.sh
           NEED="${NEED_GB:-200}"
@@ -397,7 +397,7 @@ jobs:
 
       - name: 腾完之后：造一个 48 GiB 的稀疏镜像看放不放得下
         run: |
-          set -uo pipefail
+          set +e -u -o pipefail
           # 这一步是「账单对不对」的验收：空间数字说够了，就真写一个同样大的
           # 文件出来。稀疏文件只占实际写入的块，所以还要用 dd 往里真写 4 GiB，
           # 确认不是靠稀疏糊过去的。
@@ -416,7 +416,7 @@ jobs:
 
       - name: 判定
         run: |
-          set -uo pipefail
+          set +e -u -o pipefail
           free_b=$(diskutil info -plist / | plutil -extract APFSContainerFree raw -o - -)
           free_gb=$(( free_b / 1000000000 ))
           echo "最终可用 = ${free_gb} GB"
