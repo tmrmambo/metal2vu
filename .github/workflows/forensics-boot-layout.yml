@@ -63,6 +63,7 @@ on:
       - '.github/workflows/forensics-boot-layout.yml'
       - 'tools/ci/mkgpt.py'
       - 'tools/ci/gptdump.py'
+      - 'tools/seal/apfs_seal.c'
 
 permissions:
   contents: read
@@ -1741,6 +1742,147 @@ jobs:
 
           sudo diskutil unmount force "$MP" 2>/dev/null
           sudo diskutil unmount force "$MS" 2>/dev/null
+          exit 0
+
+      # ─────────────────────────────────────────────────────────────────
+      # V-034：`bless --create-snapshot` 封不了第一次印（非 ARV 卷）。
+      # Apple 自己的封印是两条 syscall（78 §A.10.2d，从 UpdateBrainLibrary
+      # 反编译得出），tools/seal/apfs_seal.c 就是它们的直接等价物。
+      # 这一步在 scratch 容器的 role S 卷上实测那两条，并顺带试
+      #   - `bless --snapshotname`（S2a，绕开 --create-snapshot 的 ARV 检查）
+      #   - `bless --apfsdriver`（V-018，help 里没有这个选项）
+      # ─────────────────────────────────────────────────────────────────
+      - name: V-034 / V-018 / V-019  自己封印：fs_snapshot_create + fs_snapshot_root
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p out
+          DEV="${{ steps.scratch.outputs.scratch_dev }}"
+          CNT="${{ steps.scratch.outputs.scratch_cnt }}"
+          if [ -z "$CNT" ]; then
+            echo "SKIPPED: 上游阶梯没造出容器" > out/C2-seal.txt
+            cat out/C2-seal.txt; exit 0
+          fi
+
+          vol_of() {
+            local want="$1" v n
+            for v in $(diskutil list "$CNT" 2>/dev/null | awk '/APFS Volume/{print $NF}'); do
+              n=$(diskutil info "$v" 2>/dev/null \
+                  | awk -F': *' '/^ *Volume Name/{gsub(/[ \t]+$/,"",$2); print $2; exit}')
+              if [ "$n" = "$want" ]; then printf '%s' "$v"; return 0; fi
+            done
+            return 1
+          }
+          whole_of() {
+            diskutil info "$1" 2>/dev/null \
+              | awk -F': *' '/^ *Part of Whole/{gsub(/[ \t]+$/,"",$2); print $2; exit}'
+          }
+
+          SYS=$(vol_of "Macintosh HD"); PRE=$(vol_of "Preboot")
+          MS="$RUNNER_TEMP/seal-ms"; MP="$RUNNER_TEMP/seal-mp"
+          mkdir -p "$MS" "$MP"
+
+          (
+            echo "########## 编译 tools/seal/apfs_seal.c ##########"
+            cc -O2 -Wall -Wextra -o "$RUNNER_TEMP/apfs_seal" tools/seal/apfs_seal.c 2>&1
+            echo "   cc 退出码 = $?"
+            [ -x "$RUNNER_TEMP/apfs_seal" ] || { echo "编译失败，这一节到此为止"; exit 0; }
+            echo "---- 它链了哪些 fs_snapshot_* ----"
+            nm -u "$RUNNER_TEMP/apfs_seal" 2>/dev/null | grep -i snapshot || echo "（nm 无命中）"
+            echo "---- sys/snapshot.h 里声明了什么 ----"
+            SDK=$(xcrun --show-sdk-path 2>/dev/null)
+            grep -nE 'fs_snapshot_[a-z]+' "$SDK/usr/include/sys/snapshot.h" 2>/dev/null \
+              || echo "（SDK 里没有 sys/snapshot.h，但链接成功说明符号在 libSystem 里）"
+            echo "---- 用法串自检（应当退出码 2）----"
+            "$RUNNER_TEMP/apfs_seal" 2>&1 | head -12; echo "   退出码 = $?"
+            echo "---- 护栏自检：对 / 必须被拒 ----"
+            "$RUNNER_TEMP/apfs_seal" create / selftest 2>&1; echo "   退出码 = $?（期望 2）"
+
+            echo
+            echo "########## 挂载 scratch 的 role S 卷 ##########"
+            echo "SYS=$SYS  PRE=$PRE"
+            [ -n "$SYS" ] || { echo "容器里没有 role S 卷，停"; exit 0; }
+            sudo mount -o nobrowse -t apfs "/dev/$SYS" "$MS" 2>&1
+            [ -n "$PRE" ] && sudo mount -o nobrowse -t apfs "/dev/$PRE" "$MP" 2>&1
+
+            SD=$(whole_of "$MS"); RD=$(whole_of /)
+            echo "护栏：scratch 整盘='$SD'  根卷整盘='$RD'"
+            if [ -z "$SD" ] || [ -z "$RD" ] || [ "$SD" = "$RD" ]; then
+              echo "FATAL: 护栏未通过，拒绝封印"
+              sudo diskutil unmount force "$MS" 2>/dev/null
+              exit 0
+            fi
+
+            echo
+            echo "########## 封印之前的基线 ##########"
+            diskutil info "$SYS" 2>&1 | grep -iE 'Sealed|Snapshot|Role|Volume UUID'
+            diskutil apfs listSnapshots "$MS" 2>&1
+            # 铺一点内容，否则快照是空的（Apple 也是铺完内容才封）
+            sudo mkdir -p "$MS/System/Library/CoreServices"
+            sudo ditto /System/Library/CoreServices/SystemVersion.plist \
+                       "$MS/System/Library/CoreServices/SystemVersion.plist" 2>&1
+
+            SNAP="com.apple.os.update-MSUPrepareUpdate"
+            echo
+            echo "########## 第一步：fs_snapshot_create（= createSnapshot:error:）##########"
+            sudo "$RUNNER_TEMP/apfs_seal" create "$MS" "$SNAP" 2>&1
+            echo "   退出码 = $?"
+            echo "---- V-019：快照建出来之后它叫什么、有哪些键 ----"
+            diskutil apfs listSnapshots "$MS" 2>&1
+            diskutil apfs listSnapshots -plist "$MS" > out/C3-seal-snapshots.plist 2>&1
+            plutil -p out/C3-seal-snapshots.plist 2>&1 | head -40
+            echo "---- 卷状态有没有变 ----"
+            diskutil info "$SYS" 2>&1 | grep -iE 'Sealed|Snapshot'
+
+            echo
+            echo "########## 第二步：fs_snapshot_root（= rootToSnapshot:error:）##########"
+            echo "# 这是 V-034 的核心一问：一个本来不是 ARV 的卷，这一条会不会成。"
+            sudo "$RUNNER_TEMP/apfs_seal" root "$MS" "$SNAP" 2>&1
+            echo "   退出码 = $?（0 = V-034 的 S2b 成立）"
+            echo "---- 回读 ----"
+            diskutil info "$SYS" 2>&1 | grep -iE 'Sealed|Snapshot'
+            diskutil info -plist "$SYS" > out/C4-seal-sysvol.plist 2>&1
+            plutil -p out/C4-seal-sysvol.plist 2>&1 | grep -iE 'Seal|Snapshot|Root' 
+
+            echo
+            echo "########## S2a：bless --snapshotname（不是 --create-snapshot）##########"
+            echo "# --snapshotname 是「指定一个已有快照」而不是「创建」，"
+            echo "# 所以它可能不触发 ARV 检查（78 §A.10.2d 的 S2a）。"
+            if [ -n "$PRE" ]; then
+              VGU=$(diskutil info "$SYS" 2>/dev/null \
+                    | awk -F': *' '/Volume Group UUID/{gsub(/[ \t]+$/,"",$2); print $2; exit}')
+              [ -n "$VGU" ] || VGU=$(diskutil info "$SYS" 2>/dev/null \
+                    | awk -F': *' '/^ *Volume UUID/{gsub(/[ \t]+$/,"",$2); print $2; exit}')
+              sudo mkdir -p "$MP/$VGU/System/Library/CoreServices"
+              sudo bless --folder "$MS/System/Library/CoreServices" \
+                         --bootefi --snapshotname "$SNAP" \
+                         --label "seal-test" --verbose 2>&1
+              echo "   bless --snapshotname 退出码 = $?"
+              echo "---- Preboot 里出现了什么 ----"
+              sudo find "$MP" 2>/dev/null | sort
+              echo "---- bless --info 回读 ----"
+              sudo bless --info "$MS" --plist 2>&1 | head -40
+            fi
+
+            echo
+            echo "########## V-018：bless --apfsdriver（help 里没有这个选项）##########"
+            echo "# 从 UpdateBrainLibrary 的 run_bless_with_arguments 参数数组读出来的。"
+            echo "# 它应当把 apfs.efi 装进容器的 jumpstart 区域。"
+            ls -l /usr/standalone/i386/apfs.efi 2>&1
+            sudo bless --folder "$MS/System/Library/CoreServices" \
+                       --apfsdriver /usr/standalone/i386/apfs.efi --verbose 2>&1
+            echo "   bless --apfsdriver 退出码 = $?（非 2 即说明选项存在）"
+            echo "---- 容器头部有没有多出 apfs.efi 的痕迹（读的是镜像文件，不碰 /dev）----"
+            IMG="$RUNNER_TEMP/scratch.raw"
+            if [ -f "$IMG" ]; then
+              strings -a -n 6 "$IMG" 2>/dev/null | grep -iE 'apfs_jumpstart|efi_jumpstart|PE32' \
+                | sort -u | head -10 || echo "（无命中）"
+            fi
+
+            sudo diskutil unmount force "$MP" 2>/dev/null
+            sudo diskutil unmount force "$MS" 2>/dev/null
+          ) > out/C2-seal.txt 2>&1
+          cat out/C2-seal.txt
           exit 0
 
       - name: V-028 / A.6.2 事实 3  -prebootSource 实验

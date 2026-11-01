@@ -1802,7 +1802,7 @@ Couldn't bless the APFS preboot volume for volume mounted at …: No such file o
 | # | 做法 | 为什么可能 | 代价 |
 |---|---|---|---|
 | **S1** | **`asr restore --toSnapshot <源的封印快照 UUID> --erase`**，即 `75` 的 R1 路径 | `75` 第 2.3.2 节已引手册：目标是分区且带 `--erase` 时，**被恢复的卷连同 Preboot/Recovery 一起从源复制**。源是一块已封印的 ARV 卷，**ARV 这个属性随块级复制一起过来** —— 这正是「第一次印」的来源 | 产出的 build 是源那一版（运行器的 25G76，不是 25G325）。**但它不需要我们自己封印** |
-| **S2** | 自己调 `fs_snapshot` 系统调用：`fs_snapshot_create` 之后 `fs_snapshot_root` | `77` 第 D.3 节已证 UpdateBrain 的封印就是 `-[LPStaticAPFSVolume createSnapshot:error:]`（RVA `0x145024`）里一条 `fs_snapshot_create(2)`，**不签名不联网**。`fs_snapshot` 的 op 里有 `SNAPSHOT_OP_ROOT`，正是「把某个快照设成卷的 root snapshot」 | 要写一个几十行的 C 程序。**而且 `fs_snapshot_create` 能不能在一个非 ARV 卷上把它变成 ARV，未知** —— 这是 S2 的核心风险 |
+| **S2** | **自己调两条 syscall：`fs_snapshot_create` 然后 `fs_snapshot_root`。** 下面第 A.10.2d 节给出了 Apple 自己那两个方法的完整反编译，照抄即可 | `TESTED`（反编译）：两条都是 libSystem 的公开导入符号，`flags` 参数都传 **0**，不签名不联网 | **一个 30 行的 C 程序。** 唯一剩下的未知是「`fs_snapshot_create` 能不能让一个本来不是 ARV 的卷变成 ARV」 |
 | **S3** | 不要 ARV：让 `boot.efi` 直接从卷（而不是快照）启动，靠 `csr-active-config` 的 bit 11（`CSR_ALLOW_UNAUTHENTICATED_ROOT`）放行 | 第 0.2 节的研发期设定本来就是 SIP/AMFI 全关。而 bit 11 的用途正是「允许启动一个未经认证的根」。Catalina 之前的 macOS 本来就是从卷启动的 | **只能启动才知道**，与 `V-025` 同级。若成立，整条封印问题消失；若不成立，表现是禁止符号 |
 
 **三条之间不互斥，而且第一块盘的正解很可能是 S1 + S3 并行验证：**
@@ -1818,6 +1818,123 @@ Couldn't bless the APFS preboot volume for volume mounted at …: No such file o
 - **`78` 第 A.9 节（快照层）的规格不变**（它描述的是封印后的状态），
   但第 A.10.1 节那条「`bless --folder … --bootefi --create-snapshot` 一条命令做四件事」
   要加限定：**只在目标已是 ARV 时成立。**
+
+#### A.10.2d `V-034` 的 S2 方案：Apple 自己的封印代码，两条 syscall，可以照抄
+
+`TESTED`（静态），反编译 `UpdateBrainLibrary.x86_64.dylib`（25G325，`analysis/idb/updatebrain/`）。
+`77` 第 D.1 节只写了 `createSnapshot:` 这一半；**另一半在同一个类上，叫
+`-[LPStaticAPFSVolume rootToSnapshot:error:]`（RVA `0x1463b5`）**，本轮反编译出来了。
+
+两个方法去掉日志与错误包装之后，各自只剩四行：
+
+```c
+// -[LPStaticAPFSVolume createSnapshot:error:]   RVA 0x145024
+//   第一步：在卷上造一个快照。APFS 内核在这一刻算 SSV 的 Merkle root hash。
+int fd = open(volume.mountPoint, O_RDONLY);       // 注意：打开的是**挂载点**，不是设备节点
+int rc = fs_snapshot_create(fd, snapshotName, 0);  // flags = 0
+close(fd);
+
+// -[LPStaticAPFSVolume rootToSnapshot:error:]   RVA 0x1463b5
+//   第二步：把那个快照设成这个卷的 root snapshot。这一步就是 bless 拒绝替我们做的那件事。
+int fd = open(volume.mountPoint, O_RDONLY);
+int rc = fs_snapshot_root(fd, snapshotName, 0);    // flags = 0
+close(fd);
+//   失败时它记的日志是 "Could not set root from snapshot. Errno: %d"
+```
+
+**三条关键事实：**
+
+1. **`fs_snapshot_*` 是 libSystem 的公开导入符号，不是私有 SPI 的内联 syscall。**
+   dylib 的 `__stubs` 段里六个都在：`_fs_snapshot_create`、`_fs_snapshot_delete`、
+   `_fs_snapshot_list`、`_fs_snapshot_rename`、`_fs_snapshot_revert`、**`_fs_snapshot_root`**。
+   声明在 `<sys/snapshot.h>`。**所以我们的程序只要 `#include <sys/snapshot.h>` 并正常链接即可**，
+   不需要手写 `syscall()`。
+2. **两处的 `flags` 都是字面 `0`。** 没有「封印模式」之类的隐藏标志要猜。
+3. **打开的是挂载点而不是 `/dev/diskNsM`。** 所以卷必须先挂载 —— 和第 D.5 节
+   那条 `-69854` 的教训同源。
+
+**UpdateBrain 自己的调用布局（`TESTED`，xref）：**
+
+| 方法 | 被谁调 |
+|---|---|
+| `createSnapshot:error:` | `_prepare_snapshot`（`0x5574e`，PREPARE 相位铺完内容之后）与 `_prepare_boot_environment`（`0x852d`，APPLY 相位，日志串是 `Recreate snapshot failed`，前面先 `deleteSnapshots:`） |
+| `rootToSnapshot:error:` | **只有 `_MSUApplySplatOnlyUpdate_server`（`0x4ec5c`）一处** |
+
+**这条不对称值得注意**：正常的 PREPARE/APPLY 流程里 Apple **不**显式调 `fs_snapshot_root`，
+只有 splat-only 更新才调。那正常流程里谁把快照设成 root？看 `_prepare_boot_environment`
+的尾部：它跑的是 `bless --folder … --label … --apfsdriver … --setBoot --verbose`。
+**所以正常路径下这件事是 `bless --setBoot` 连带做的** —— 而 `--setBoot` 在第 A.10.2 节
+是我们的禁止项（它会改本机固件的启动项）。
+
+**于是我们的序列有两种写法，都绕开 `--create-snapshot` 的 ARV 检查：**
+
+| 写法 | 序列 | 风险 |
+|---|---|---|
+| **S2a**（推荐先试） | ① 铺内容 → ② 自己 `fs_snapshot_create` → ③ **`bless --folder … --bootefi --snapshotname <名字> --label …`** | `--snapshotname` 是「指定一个已有快照」而不是「创建」，**所以它很可能不触发 ARV 检查**。这同时就是 `V-020` 要问的那个选项 |
+| **S2b** | ① 铺内容 → ② `fs_snapshot_create` → ③ 自己 `fs_snapshot_root` → ④ `bless --folder … --bootefi --label …`（不带任何快照选项，已实测退出码 0） | 完全不依赖 `bless` 处理快照。但 `fs_snapshot_root` 在一个非 ARV 卷上的行为未知 |
+
+**两种写法共用同一个 30 行 C 程序**，差别只在跑不跑第 ③ 步。
+程序落在 `tools/seal/apfs_seal.c`，由 `tooling` job 现场 `cc` 编译 —— 它只用公开头文件，
+没有任何第三方依赖。
+
+#### A.10.2e 顺带关掉的两条：`V-018` 与 `.disk_label.contentDetails`
+
+同一次反编译还解决了两件此前标 `BLOCKED` 的事。
+
+**（1）`V-018`：`apfs.efi` 怎么进容器的 jumpstart 区域 —— `bless --apfsdriver <path>`。**
+
+`_prepare_boot_environment` 尾部那条 `bless` 的参数数组是（`TESTED`，逐项读出）：
+
+```
+--folder <目标 CoreServices>  --label "macOS Installer"
+--apfsdriver <apfs.efi 的路径>  --setBoot  --verbose
+```
+
+**`--apfsdriver` 在 `bless --help` 的输出里根本没有。** 第一轮取的 help 全文只列了
+`--file` / `--folder` / `--bootefi` / `--setBoot` / `--create-snapshot` / `--snapshot` /
+`--snapshotname` / `--last-sealed-snapshot` / `--verbose`。
+本轮从 dylib 里读出的 `--xxx` 字符串集合是：
+
+```
+--apfsdriver  --check-boot-size  --file  --folder  --label  --load
+--new-rom-nonce  --nextonly  --outfile  --patches  --ping  --preflight
+--restore  --restore+art  --setBoot  --slot=%d  --verbose
+```
+
+（后面一批属于 FDR 与 bridgeOS 的工具，不是 `bless`；但 **`--apfsdriver` 与
+`--nextonly` 确定是 `bless` 的**，因为它们出现在 `run_bless_with_arguments` 的参数数组里。）
+
+**与第 D.5 节那条独立印证对上了**：`diskutil apfs convert` 的日志是
+`Found APFS EFI driver /usr/standalone/i386/apfs.efi to install into the APFS Container`，
+底层命令带 `--efi /usr/standalone/i386/apfs.efi`。**两条路径都用一个显式参数装它，
+所以 `diskutil apfs createContainer` 极可能不装。** 我们的装配链必须自己补这一步，
+手段就是 `bless --apfsdriver /usr/standalone/i386/apfs.efi`。
+`V-018` 从「不知道谁装」变成「知道怎么装，待实测」。
+
+**（2）`.disk_label.contentDetails` 的内容：卷名的 UTF-8 字节，由调用方自己写。**
+
+```objc
+NSString *cs  = [root stringByAppendingPathComponent:@"System/Library/CoreServices"];
+NSString *cd  = [cs   stringByAppendingPathComponent:@".disk_label.contentDetails"];
+run_bless_with_arguments(@[@"--folder", cs, @"--label", volumeName, …]);  // bless 只渲染位图
+NSData *d = [volumeName dataUsingEncoding:4];   // 4 = NSUTF8StringEncoding
+[d writeToFile:cd atomically:NO];               // ← 这一行是 UpdateBrain 自己写的
+```
+
+**所以它就是一个无换行的 UTF-8 纯文本文件，内容等于卷名。** 这印证了第 A.10.2c 节
+实测的「`bless` 不写 `contentDetails`」，并给出了我们该写什么。第 A.6.6 节的脚本据此补：
+
+```bash
+printf '%s' "$VOLNAME_SYS" | sudo tee "$PBCS/.disk_label.contentDetails" >/dev/null
+```
+
+**（3）附带一条对 S3 有利的证据。** dylib 里有这么一条日志串：
+
+> `Skip sealing flag is set. System may not boot after update.`
+
+以及 `skip-sealing`、`ota-arv-mode` 两个键名。**Apple 自己留了「跳过封印」的开关，
+而它的措辞是「可能启动不了」而不是「一定启动不了」。** 这不是证明 S3 成立，
+但它说明「不封印的系统能不能起来」在 Apple 内部也是一个**配置项**而不是一道硬墙。
 
 #### A.10.3 它到底写了什么
 

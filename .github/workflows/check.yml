@@ -39,6 +39,22 @@ jobs:
       - run: rustc --version && cargo --version
       - name: cargo check
         run: cargo check --workspace --all-targets
+      # apfs_seal.c 是 V-034 的实验载体（78 §A.10.2d）。它只在 macOS 上编得过
+      # （要 <sys/snapshot.h>），所以检查放这个 job。语法错不该等到 forensics 那一轮。
+      - name: tools/seal/apfs_seal.c 编译与自检
+        run: |
+          set -euo pipefail
+          cc -O2 -Wall -Wextra -Werror -o /tmp/apfs_seal tools/seal/apfs_seal.c
+          echo "--- 链接到的 fs_snapshot_* 符号 ---"
+          nm -u /tmp/apfs_seal | grep -i snapshot
+          echo "--- 用法串（期望退出码 2）---"
+          /tmp/apfs_seal && rc=0 || rc=$?
+          test "$rc" = "2" || { echo "期望退出码 2，实际 $rc"; exit 1; }
+          echo "--- 护栏：对 / 必须被拒（期望退出码 2）---"
+          /tmp/apfs_seal create / selftest && rc=0 || rc=$?
+          test "$rc" = "2" || { echo "护栏没拦住 /，退出码 $rc"; exit 1; }
+          echo "OK"
+
       - name: cargo clippy
         continue-on-error: true
         run: |
