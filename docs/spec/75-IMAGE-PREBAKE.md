@@ -98,6 +98,128 @@
 >
 > **本修订不改选定路径。** R1（克隆运行器）仍是**先做**的那条，因为它的未知只有三个数（`P-001`/`P-002`/`P-003`）且都能在一次 job 里测掉；R6 的未知是一个逆向工程量。正确顺序是 **R1 先跑通把管线打直，再用 R6 把 build 从 25G76 换成 25G325**。
 
+### 0.0.1 1.2 修订：整条打包改成单 job 全 CI，三段职责划分作废
+
+> [!IMPORTANT]
+> **本节推翻 1.0 第 4.3 节的三段职责划分。** 那一节把 GPT 封装交给「Linux 构建机」，但它和 1.0 自己第 3.4 节的事实冲突：
+>
+> **artifact 配额按账户计（Free 500 MB / Pro 1 GB / Team 2 GB），而 macOS 段的产物是一个 12 到 16 GB 的 APFS container。** 两段之间没有通道。要么各自把 12 GB 推到对象存储再拉回来（两次全量传输，纯浪费），要么合成一段。
+>
+> **选合成一段：整条打包在一个 `macos-26-intel` job 内完成。**
+>
+> #### 为什么原来以为不行
+>
+> 1.0 第 4.3 节给了三个理由，逐条重新判：
+>
+> | 1.0 的理由 | 重判 |
+> |---|---|
+> | 「`diskutil partitionDisk` 会自动生成它自己选定大小的 EFI 分区，改不了」 | **绕得过。** 不用 `diskutil partitionDisk`，用 `/usr/sbin/gpt create` + `gpt add -b <起始扇区> -s <扇区数> -t <type GUID>` 逐个分区显式布，尺寸与类型完全可控。`gpt(8)` 是 macOS 自带的底层 GPT 工具 |
+> | 「运行器上没有 OpenCore 的文件树」 | **CI 自己下。** OpenCorePkg 与 OcBinaryData 都是 GitHub public release，`curl` 直接取；`config.plist` 由 `74` 第 5 节的 `make-oc-config.py` 在 CI 里生成。**不需要从开发机上传任何东西** |
+> | 「rescue 分区是 ext4，macOS 造不出来」 | **这条成立，所以改设计：放弃 ext4。** 见下 |
+>
+> #### 放弃 ext4，Alpine 住在 FAT 里
+>
+> `73` 第 2.4 节已经确立 Alpine netboot **在内存里跑**，本地只需要四个**文件**：`vmlinuz-lts`、`initramfs-lts`、`modloop-lts`、`rescue.apkovl.tar.gz`。四个文件不需要 ext4，FAT32 完全够。
+>
+> 于是分区表从三个变两个，而且两个都是 macOS 能造的：
+>
+> ```text
+> macos-golden.raw        GPT
+> ├─ p1  EFI System Partition    FAT32  512 MiB  label OPENCORE
+> │      /EFI/BOOT/        74 的 shim + 交换位
+> │      /EFI/OC/          71 第 6 节的 OpenCore 布局
+> │      /EFI/CPUDISP/     74 第 3.2 节的 5 份候选 config + STATE.TXT
+> │      /EFI/RESCUE/      ← 新：Alpine 的四个文件（原 p2 的全部内容）
+> └─ p2  Apple APFS              余下全部
+>        本文第 2 节产出的 APFS container
+> ```
+>
+> ESP 从 256 MiB 涨到 **512 MiB**：Alpine 的 `modloop-lts` 一项就 100 MB 量级，四件加起来约 200 MB，加 OpenCore 的 30 MB 与候选 config 的 400 KB，512 MiB 有余量。多出的 256 MiB 对一块 12 GB 的镜像可忽略。
+>
+> **这条改动需要 `76` 分册配合**：它第 C 节按三分区写的布局要改成两分区，Alpine 的引导项要从「p2 的 ext4」改成「ESP 的 `/EFI/RESCUE/`」。`76` 第 C 节本来就评估过「Alpine 完全在 ESP + RAM 里跑，不占独立分区」这个方案并倾向 RAM，所以这是把它已有的倾向落实，不是推翻它。记为给 `76` 的修订工单。
+>
+> #### 单 job 的工具链，全部 macOS 自带
+>
+> | 任务 | 工具 | 在位 |
+> |---|---|---|
+> | 建稀疏 raw 并当块设备挂起 | `hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount` | 自带（1.0 第 2.3.3 节已确证） |
+> | 写 GPT、显式布分区 | `/usr/sbin/gpt create` / `gpt add` | 自带 |
+> | 造 FAT32 | `newfs_msdos -F 32 -v OPENCORE` | 自带 |
+> | 往 FAT 分区写文件 | `diskutil mount` + `ditto` | 自带。**不需要 `mtools`** |
+> | APFS 容器与卷 | `diskutil apfs` / `asr restore` | 自带 |
+> | 修 GPT 备份表到盘尾 | `gpt recover` | 自带（替代 Linux 的 `sgdisk -e`） |
+> | 压缩流出 | `zstd`（brew 有 bottle）或 `gzip`（预装） | 1.0 第 3.4 节已定 |
+>
+> #### 输入侧：上传量为零
+>
+> 这是单 job 方案的附带收益。三类输入各自的来源：
+>
+> | 输入 | 来源 | 上传量 |
+> |---|---|---|
+> | macOS 系统内容 | **运行器自己的 `/`**（R1），或素材的 HTTP Range（R2/R6） | 0 / 按需 |
+> | OpenCore + kext + OcBinaryData | GitHub public release，CI `curl` | 0 |
+> | `config.plist` × 5 | CI 里跑 `74` 的 `make-oc-config.py` 生成 | 0 |
+> | Alpine netboot 四件 | `dl-cdn.alpinelinux.org`，CI `curl` | 0 |
+> | `rescue.apkovl.tar.gz` | CI 里按 `73` 第 2.4 节的清单打包（内容是 `authorized_keys` 与脚本，来自仓库与 secret） | 0 |
+>
+> **所以整条打包是自包含的**：输入全部来自运行器自身或公开 URL，唯一需要外部通道的是把产物推出去。这把 1.0 第 3.3 节「若必须把 25G325 的素材弄上去」那一整节降级为**只在 R2/R6 路径才相关**。
+>
+> #### 可照抄的装配序列（替代 1.0 第 4.3 节的 `assemble-golden.sh`）
+>
+> ```bash
+> #!/usr/bin/env bash
+> # 单 job 装配。全程 macOS 自带工具，不经 Linux，不经 artifact。
+> set -euo pipefail
+>
+> IMG="$1"; SIZE_GB="${2:-16}"
+> ESP_MIB=512
+> SECT=512
+>
+> # --- 1. 稀疏 raw + attach ---
+> dd if=/dev/zero of="$IMG" bs=1 count=0 seek=$((SIZE_GB * 1024 * 1024 * 1024))
+> DEV=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount "$IMG" \
+>       | head -1 | awk '{print $1}')
+> RAW="${DEV/disk/rdisk}"            # 裸设备，写 GPT 要用它
+>
+> # --- 2. GPT：两个分区，起始与长度都显式给 ---
+> ESP_START=2048                                     # 1 MiB 对齐
+> ESP_SIZE=$(( ESP_MIB * 1024 * 1024 / SECT ))
+> APFS_START=$(( ESP_START + ESP_SIZE ))
+> TOTAL_SECT=$(( SIZE_GB * 1024 * 1024 * 1024 / SECT ))
+> APFS_SIZE=$(( TOTAL_SECT - APFS_START - 2048 ))    # 盘尾留 1 MiB 给 GPT 备份表
+>
+> sudo gpt destroy "$RAW" 2>/dev/null || true
+> sudo gpt create -f "$RAW"
+> sudo gpt add -b "$ESP_START"  -s "$ESP_SIZE"  -t efi  "$RAW"
+> sudo gpt add -b "$APFS_START" -s "$APFS_SIZE" \
+>      -t 7C3457EF-0000-11AA-AA11-00306543ECAC "$RAW"
+> sudo gpt show "$RAW"
+>
+> # --- 3. ESP：造 FAT32 并铺内容 ---
+> sudo newfs_msdos -F 32 -v OPENCORE "${RAW}s1"
+> sudo mkdir -p /Volumes/ESP
+> sudo diskutil mount -mountPoint /Volumes/ESP "${DEV}s1"
+> sudo ditto staging/EFI    /Volumes/ESP/EFI          # OpenCore + shim + CPUDISP
+> sudo ditto staging/RESCUE /Volumes/ESP/EFI/RESCUE   # Alpine 四件
+> sudo diskutil unmount /Volumes/ESP
+>
+> # --- 4. APFS：第 2 节的路径（R1 的 asr，或 R6 的 UpdateBrain）写进 s2 ---
+> #     注意 asr --erase 的目标给 "${DEV}s2" 而不是整块 DEV，
+> #     否则它会抹掉我们刚写好的 GPT 与 ESP。
+> #     1.0 第 2.3.3 节的命令里 --target 是整块 DEV，在单 job 方案下必须改成分区。
+> #     ... 见第 2.3.3 节（已据此修订）
+>
+> # --- 5. 收尾 ---
+> sudo gpt recover "$RAW" || true     # 备份表挪到真实盘尾
+> sudo hdiutil detach "$DEV"
+> ```
+>
+> **第 4 步那条注释是本修订最容易出错的地方。** 1.0 第 2.3.3 节的 `asr restore --target "$DEV" --erase` 是在「macOS 段只产裸 APFS container、不碰分区表」的前提下写的；改成单 job 之后分区表先建好了，`--target` 必须是 `${DEV}s2`，否则 `--erase` 会连 GPT 和 ESP 一起抹掉。
+>
+> #### 这条修订不改路径选择
+>
+> R1 仍然先做，R6 仍然等 `77-UPDATEBRAIN-ABI.md` 的 `U-001` 关掉。本修订只改**装配的机械形式**，不改装 macOS 的方法。
+
 ### 0.1 八条结论先行
 
 1. **`startosinstall --volume` 这条路不存在了。** 从 macOS 11 起，在一个完整运行的 macOS 上执行安装器里的 `startosinstall`，`--usage` 里**没有** `--volume`（`KNOWN`，见第 2.1 节）。所以"它算不算走原生安装器"这个问题是空的：它不可用。退一步说，就算可用，它的收尾动作是重启本机进安装环境，而 CI job 一重启就结束。
